@@ -1,0 +1,18 @@
+# Core numerical computing
+numpy>=1.23
+scipy>=1.9
+
+# Machine learning (decoder model)
+tensorflow>=2.10
+
+# Data handling
+pandas>=1.5
+
+# Plotting / visualization
+matplotlib>=3.6
+
+# NeuralFoil (airfoil evaluator)
+neuralfoil
+
+# Optional but useful
+tqdm>=4.64
