@@ -1,0 +1,15 @@
+{
+  "alpha": 6.0,
+  "Re": 500000.0,
+  "n_iters": 500,
+  "k": 2.0,
+  "lam_bounds": 1.0,
+  "lam_geom": 5.0,
+  "min_thickness": 0.005,
+  "best_total": 999.5432158929154,
+  "best_objective": 0.04386210263223617,
+  "best_penalty": 999.4993537902832,
+  "best_CL": -0.7494695629256745,
+  "best_CD": 0.03287331088878312,
+  "best_fix_mode": "raw_fallback"
+}
