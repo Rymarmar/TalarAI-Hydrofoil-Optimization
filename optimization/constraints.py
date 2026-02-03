@@ -1,96 +1,139 @@
+from __future__ import annotations
+
 import numpy as np
 
 
 def relu(x: float) -> float:
-    """ReLU penalty: max(x, 0)."""
-    return float(np.maximum(x, 0.0))
+    return float(max(0.0, x))
 
 
-def bound_penalty(x: float, lo: float, hi: float) -> float:
+def make_default_latent_bounds(latents: np.ndarray, k: float = 2.0) -> tuple[np.ndarray, np.ndarray]:
     """
-    Penalty for lo <= x <= hi:
-      ReLU(x - hi) + ReLU(lo - x)
+    Bounds used for latent 'stay near training distribution' constraint.
+    We use mean ± k*std (simple + explainable).
     """
-    return relu(x - hi) + relu(lo - x)
-
-
-def vector_bounds_penalty(vec, lo_vec, hi_vec) -> float:
-    """
-    Sum of bound penalties across a vector.
-    vec, lo_vec, hi_vec should be same length.
-    """
-    v = np.asarray(vec, dtype=float)
-    lo = np.asarray(lo_vec, dtype=float)
-    hi = np.asarray(hi_vec, dtype=float)
-    if v.shape != lo.shape or v.shape != hi.shape:
-        raise ValueError("vector_bounds_penalty: shape mismatch.")
-    total = 0.0
-    for i in range(len(v)):
-        total += bound_penalty(v[i], lo[i], hi[i])
-    return float(total)
-
-
-def geometry_penalty(coords, min_thickness: float = 0.005) -> float:
-    """
-    Optional geometry penalties.
-    coords is (80,2): first 40 upper (x 0->1), last 40 lower reversed (x 1->0).
-
-    We penalize:
-      - upper below lower at matched x (basic validity)
-      - too-thin airfoil (min thickness constraint)
-    """
-    c = np.asarray(coords, dtype=float)
-    if c.shape[0] < 80 or c.shape[1] != 2:
-        # If you ever change points count, update this.
-        return 0.0
-
-    n = 40
-    upper = c[:n, :]
-    lower = c[n:, :][::-1, :]  # reverse lower back to x 0->1 alignment
-
-    y_upper = upper[:, 1]
-    y_lower = lower[:, 1]
-
-    thickness = y_upper - y_lower  # should be >= 0 ideally
-
-    # Penalize crossings (upper below lower)
-    crossing_pen = float(np.sum(np.maximum(-thickness, 0.0)))
-
-    # Penalize min thickness violation
-    tmin = float(np.min(thickness))
-    thin_pen = relu(min_thickness - tmin)
-
-    return crossing_pen + thin_pen
-
-
-def make_default_latent_bounds(latents: np.ndarray, k: float = 2.0):
-    """
-    Compute dataset-based bounds: mean ± k*std for each parameter.
-    This keeps NOM inside the learned latent distribution.
-    """
-    mu = np.mean(latents, axis=0)
-    sigma = np.std(latents, axis=0) + 1e-9
-    lo = mu - k * sigma
-    hi = mu + k * sigma
+    latents = np.asarray(latents, dtype=float)
+    mu = np.nanmean(latents, axis=0)
+    sig = np.nanstd(latents, axis=0) + 1e-9
+    lo = mu - k * sig
+    hi = mu + k * sig
     return lo, hi
 
 
+def _normalize_coords(coords: np.ndarray) -> np.ndarray:
+    """
+    Normalize decoded coords so chord is ~[0,1] in x.
+    This reduces numeric issues downstream.
+    """
+    c = np.asarray(coords, dtype=float)
+    if c.ndim != 2 or c.shape[1] != 2:
+        raise ValueError(f"coords must be (N,2). got {c.shape}")
+
+    if not np.all(np.isfinite(c)):
+        raise ValueError("coords contain NaN/Inf")
+
+    x = c[:, 0]
+    y = c[:, 1]
+
+    x_min = float(np.min(x))
+    x_max = float(np.max(x))
+    chord = x_max - x_min
+    if chord <= 1e-12:
+        raise ValueError("coords chord length too small/collapsed")
+
+    x_n = (x - x_min) / chord
+    c_n = np.column_stack([x_n, y])
+    return c_n
+
+
+def _min_thickness_estimate(coords_norm: np.ndarray, n_bins: int = 40) -> float:
+    """
+    Rough thickness estimate:
+    - bin by x
+    - thickness in each bin = (max y - min y)
+    - min thickness = min over bins (excluding empty bins)
+
+    Not perfect aero thickness, but good enough as a "geometry sanity" constraint.
+    """
+    x = coords_norm[:, 0]
+    y = coords_norm[:, 1]
+
+    # Ignore points outside chord due to bad decode
+    mask = (x >= 0.0) & (x <= 1.0) & np.isfinite(y)
+    x = x[mask]
+    y = y[mask]
+    if x.size < 10:
+        return 0.0
+
+    bins = np.linspace(0.0, 1.0, n_bins + 1)
+    t_vals = []
+    for i in range(n_bins):
+        m = (x >= bins[i]) & (x < bins[i + 1])
+        if np.any(m):
+            y_max = float(np.max(y[m]))
+            y_min = float(np.min(y[m]))
+            t_vals.append(y_max - y_min)
+
+    if not t_vals:
+        return 0.0
+
+    t_vals = np.asarray(t_vals, dtype=float)
+    t_vals = t_vals[np.isfinite(t_vals)]
+    if t_vals.size == 0:
+        return 0.0
+
+    return float(np.min(t_vals))
+
+
+def latent_bounds_penalty(latent_vec: np.ndarray, lo: np.ndarray, hi: np.ndarray) -> float:
+    """
+    Penalty for leaving latent box constraints.
+    """
+    z = np.asarray(latent_vec, dtype=float).reshape(-1)
+    lo = np.asarray(lo, dtype=float).reshape(-1)
+    hi = np.asarray(hi, dtype=float).reshape(-1)
+    if z.shape != lo.shape or z.shape != hi.shape:
+        raise ValueError("latent_vec and bounds must match shape")
+
+    below = np.maximum(lo - z, 0.0)
+    above = np.maximum(z - hi, 0.0)
+    return float(np.sum(below + above))
+
+
+def geometry_penalty(coords: np.ndarray, min_thickness: float = 0.005) -> tuple[float, dict]:
+    """
+    Geometry sanity penalties:
+    - coords finite
+    - chord not collapsed
+    - min thickness >= threshold
+    """
+    c_n = _normalize_coords(coords)
+    t_min = _min_thickness_estimate(c_n, n_bins=40)
+
+    pen_t = relu(min_thickness - t_min)
+
+    info = {
+        "min_thickness_est": float(t_min),
+    }
+    return float(pen_t), info
+
+
 def total_penalty(
-    latent_vec,
-    coords,
-    lat_lo,
-    lat_hi,
+    latent_vec: np.ndarray,
+    coords: np.ndarray,
+    lat_lo: np.ndarray,
+    lat_hi: np.ndarray,
     lam_bounds: float = 1.0,
-    lam_geom: float = 1.0,
+    lam_geom: float = 5.0,
     min_thickness: float = 0.005,
 ) -> float:
     """
-    Total penalty = λ_bounds * (latent bounds violations) + λ_geom * (geometry violations)
+    Total penalty = λ_bounds * P_bounds + λ_geom * P_geom
 
-    This matches your professor’s board idea:
-      objective + λ1*ReLU(...) + λ2*ReLU(...) + ...
+    P_bounds: latent box constraint
+    P_geom: thickness/geometry sanity
     """
-    p_bounds = vector_bounds_penalty(latent_vec, lat_lo, lat_hi)
-    p_geom = geometry_penalty(coords, min_thickness=min_thickness)
+    p_bounds = latent_bounds_penalty(latent_vec, lat_lo, lat_hi)
+    p_geom, _ = geometry_penalty(coords, min_thickness=min_thickness)
 
     return float(lam_bounds * p_bounds + lam_geom * p_geom)

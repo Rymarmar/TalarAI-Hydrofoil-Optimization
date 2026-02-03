@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import json
 from pathlib import Path
 
@@ -20,29 +22,50 @@ def load_latent_dataset(csv_path: str = "data/airfoil_latent_params.csv") -> np.
     return numeric_df.values.astype(float)
 
 
-def propose_latent(mu, sigma, k: float = 2.0) -> np.ndarray:
+def _as_scalar(x):
+    if isinstance(x, (list, tuple, np.ndarray)):
+        x = np.asarray(x).reshape(-1)
+        if x.size == 0:
+            return float("nan")
+        return float(x[0])
+    return float(x)
+
+
+def safe_eval(pipeline: TalarAIPipeline, latent_vec: np.ndarray, alpha: float, Re: float):
     """
-    Propose a candidate latent vector from a clipped normal distribution.
-    This is a simple black-box NOM baseline (works with NeuralFoil).
+    Evaluate latent -> returns dict or None if invalid.
     """
-    z = np.random.normal(loc=mu, scale=k * sigma)
-    z = np.clip(z, mu - k * sigma, mu + k * sigma)
+    try:
+        out = pipeline.eval_latent_with_neuralfoil(latent_vec, alpha=alpha, Re=Re)
+        CL = _as_scalar(out.get("CL"))
+        CD = _as_scalar(out.get("CD"))
+        coords = np.asarray(out.get("coords"), dtype=float)
+        fix_mode = out.get("fix_mode", "unknown")
+
+        if not np.isfinite(CL) or not np.isfinite(CD):
+            return None
+        if CD <= 0.0 or CD > 10.0:
+            return None
+        if coords.ndim != 2 or coords.shape[1] != 2:
+            return None
+        if not np.all(np.isfinite(coords)):
+            return None
+
+        return {"CL": CL, "CD": CD, "coords": coords, "fix_mode": fix_mode}
+    except Exception:
+        return None
+
+
+def propose_latent(mu: np.ndarray, sigma: np.ndarray, k: float = 2.0, lo=None, hi=None) -> np.ndarray:
+    """
+    NOM proposal step (black-box):
+    - sample Normal(mu, k*sigma)
+    - optionally clip to latent bounds
+    """
+    z = np.random.normal(loc=mu, scale=k * sigma).astype(float)
+    if lo is not None and hi is not None:
+        z = np.clip(z, lo, hi)
     return z.astype(float)
-
-
-def evaluate_candidate(pipeline: TalarAIPipeline, latent_vec, alpha, Re):
-    """
-    Runs the pipeline and returns:
-      CL, CD, coords, fix_mode
-    """
-    out = pipeline.eval_latent_with_neuralfoil(latent_vec, alpha=alpha, Re=Re)
-
-    CL = float(out["CL"])
-    CD = float(out["CD"])
-    coords = out["coords"]
-    fix_mode = out.get("fix_mode", "unknown")
-
-    return CL, CD, coords, fix_mode
 
 
 def nom_optimize(
@@ -50,25 +73,26 @@ def nom_optimize(
     Re: float = 5e5,
     n_iters: int = 500,
     k: float = 2.0,
-    lam_bounds: float = 10.0,
-    lam_geom: float = 50.0,
+    lam_bounds: float = 1.0,
+    lam_geom: float = 5.0,
     min_thickness: float = 0.005,
     out_dir: str = "outputs",
 ):
     """
-    NOM optimizer (black-box version):
-    - propose latent vectors
-    - evaluate via pipeline (NeuralFoil)
-    - compute objective + ReLU penalties
-    - keep best
+    NOM (Neural Optimization Machine) — black-box version:
 
-    This matches your professor’s NOM notes:
-      minimize [ CD/CL ] + Σ λ_i * ReLU(constraint violations)
+      minimize:
+        objective(CL, CD) + penalty(latent bounds + geometry)
+
+    objective defaults to CD/|CL| (sponsor-safe).
+
+    penalty uses ReLU-style constraints:
+      - latent stays near training distribution
+      - geometry is not degenerate (thickness sanity)
     """
     out_path = Path(out_dir)
     out_path.mkdir(parents=True, exist_ok=True)
 
-    # Load dataset distribution for bounds + proposals
     latents = load_latent_dataset()
     mu = latents.mean(axis=0)
     sigma = latents.std(axis=0) + 1e-9
@@ -77,84 +101,94 @@ def nom_optimize(
 
     pipeline = TalarAIPipeline()
 
-    best = None  # dict storing best candidate
+    best = None
     history = []
+    valid = 0
+    skipped = 0
 
     for it in range(1, n_iters + 1):
-        candidate = propose_latent(mu, sigma, k=k)
+        cand = propose_latent(mu, sigma, k=k, lo=lat_lo, hi=lat_hi)
 
-        try:
-            CL, CD, coords, fix_mode = evaluate_candidate(pipeline, candidate, alpha, Re)
-
-            # Objective
-            obj = default_objective(CL, CD)
-
-            # Constraints (ReLU penalties)
-            pen = total_penalty(
-                latent_vec=candidate,
-                coords=coords,
-                lat_lo=lat_lo,
-                lat_hi=lat_hi,
-                lam_bounds=lam_bounds,
-                lam_geom=lam_geom,
-                min_thickness=min_thickness,
-            )
-
-            total = float(obj + pen)
-
-            record = {
-                "iter": it,
-                "CL": float(CL),
-                "CD": float(CD),
-                "objective": float(obj),
-                "penalty": float(pen),
-                "total": float(total),
-                "fix_mode": fix_mode,
-            }
-            history.append(record)
-
-            if (best is None) or (total < best["total"]):
-                best = {
-                    **record,
-                    "latent": candidate.copy(),
-                    "coords": np.asarray(coords).copy(),
-                }
-                print(
-                    f"[{it}/{n_iters}] New BEST total={best['total']:.6f} "
-                    f"(obj={best['objective']:.6f}, pen={best['penalty']:.6f}) "
-                    f"| CL={best['CL']:.4f} CD={best['CD']:.6f} fix={best['fix_mode']}"
-                )
-
-        except Exception as e:
-            # Skip bad evaluations
+        res = safe_eval(pipeline, cand, alpha=alpha, Re=Re)
+        if res is None:
+            skipped += 1
             continue
 
+        valid += 1
+
+        CL = res["CL"]
+        CD = res["CD"]
+        coords = res["coords"]
+        fix_mode = res["fix_mode"]
+
+        obj = default_objective(CL, CD)
+
+        pen = total_penalty(
+            latent_vec=cand,
+            coords=coords,
+            lat_lo=lat_lo,
+            lat_hi=lat_hi,
+            lam_bounds=lam_bounds,
+            lam_geom=lam_geom,
+            min_thickness=min_thickness,
+        )
+
+        total = float(obj + pen)
+
+        rec = {
+            "iter": it,
+            "CL": float(CL),
+            "CD": float(CD),
+            "objective": float(obj),
+            "penalty": float(pen),
+            "total": float(total),
+            "fix_mode": fix_mode,
+        }
+        history.append(rec)
+
+        if best is None or total < best["total"]:
+            best = {
+                **rec,
+                "latent": cand.copy(),
+                "coords": coords.copy(),
+            }
+            print(
+                f"[{it}/{n_iters}] New BEST total={best['total']:.6f} "
+                f"(obj={best['objective']:.6f}, pen={best['penalty']:.6f}) "
+                f"| CL={best['CL']:.4f} CD={best['CD']:.6f} fix={best['fix_mode']}"
+            )
+
     if best is None:
-        raise RuntimeError("NOM failed: no valid candidates were evaluated.")
+        raise RuntimeError(
+            f"NOM failed: 0 valid candidates. Try increasing n_iters, increasing k, "
+            f"or relaxing geometry constraints."
+        )
 
     # Save best artifacts
     np.save(out_path / "best_latent_nom.npy", best["latent"])
     np.savetxt(out_path / "best_coords_nom.csv", best["coords"], delimiter=",", header="x,y", comments="")
 
-    # Save history + summary
     with open(out_path / "nom_history.json", "w", encoding="utf-8") as f:
         json.dump(history, f, indent=2)
 
     summary = {
-        "alpha": alpha,
-        "Re": Re,
-        "n_iters": n_iters,
-        "k": k,
-        "lam_bounds": lam_bounds,
-        "lam_geom": lam_geom,
-        "min_thickness": min_thickness,
-        "best_total": best["total"],
-        "best_objective": best["objective"],
-        "best_penalty": best["penalty"],
-        "best_CL": best["CL"],
-        "best_CD": best["CD"],
-        "best_fix_mode": best["fix_mode"],
+        "alpha": float(alpha),
+        "Re": float(Re),
+        "n_iters": int(n_iters),
+        "k": float(k),
+        "lam_bounds": float(lam_bounds),
+        "lam_geom": float(lam_geom),
+        "min_thickness": float(min_thickness),
+        "valid_evals": int(valid),
+        "skipped": int(skipped),
+        "best_total": float(best["total"]),
+        "best_objective": float(best["objective"]),
+        "best_penalty": float(best["penalty"]),
+        "best_CL": float(best["CL"]),
+        "best_CD": float(best["CD"]),
+        "best_fix_mode": str(best["fix_mode"]),
     }
+
     with open(out_path / "nom_summary.json", "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
 
@@ -168,7 +202,7 @@ def nom_optimize(
 
 
 if __name__ == "__main__":
-    # Default run (meeting-friendly)
+    # Meeting-friendly defaults
     nom_optimize(
         alpha=6.0,
         Re=5e5,

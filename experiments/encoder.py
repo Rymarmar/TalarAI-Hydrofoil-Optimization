@@ -1,35 +1,51 @@
 import os
 import csv
 import numpy as np
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 import tensorflow as tf
-from tensorflow.keras.layers import Input, Conv2D, MaxPooling2D, Flatten, Dense, Lambda, Dropout
+from tensorflow.keras.layers import Input, Conv2D, MaxPooling2D, Flatten, Dense, Dropout
 from tensorflow.keras.models import Model
 from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.preprocessing.image import load_img, img_to_array
-from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau, ModelCheckpoint
 
-# -----------------------------
-# SETTINGS
-# -----------------------------
+# ============================================================
+# Paths (match YOUR repo)
+# ============================================================
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+
+ENCODE_DIR = os.path.join(REPO_ROOT, "airfoils_png")
+TXT_DIR = os.path.join(REPO_ROOT, "airfoils_txt")
+
+DATA_DIR = os.path.join(REPO_ROOT, "data")
+PIPELINE_DIR = os.path.join(REPO_ROOT, "pipeline")
+os.makedirs(DATA_DIR, exist_ok=True)
+os.makedirs(PIPELINE_DIR, exist_ok=True)
+
+# Outputs (match final pipeline expectations)
+OUT_CSV = os.path.join(DATA_DIR, "airfoil_latent_params.csv")
+OUT_NPY = os.path.join(DATA_DIR, "airfoil_latent_params.npy")
+
+# IMPORTANT: Keras requires save_weights filenames to end with ".weights.h5"
+AUTOENCODER_WEIGHTS = os.path.join(PIPELINE_DIR, "autoencoder_6params.weights.h5")
+ENCODER_WEIGHTS = os.path.join(PIPELINE_DIR, "encoder_6params.weights.h5")
+
+# Safety checkpoint (saves best weights during training)
+CHECKPOINT_PATH = os.path.join(PIPELINE_DIR, "autoencoder_6params_best.weights.h5")
+
+# ============================================================
+# Settings
+# ============================================================
 IMG_SIZE = 256
 BATCH_SIZE = 32
-EPOCHS = 50
-X_SAMPLES = np.linspace(0.0, 1.0, 40).astype(np.float32)  # 40 x-values
-WEIGHTS_PATH = "encoder.weights.h5"
-ENCODE_DIR = "airfoils_png"  # folder with PNGs
-TXT_DIR = "airfoils_txt"     # folder with 80-point y-values
-OUT_CSV = "airfoil_latent_params.csv"
-OUT_NPY = "airfoil_latent_params.npy"
+EPOCHS = 80
+N_PARAMS = 6
 
 np.random.seed(42)
 tf.random.set_seed(42)
 
-# -----------------------------
-# LOAD PNG FOLDER
-# -----------------------------
+# ============================================================
+# Load data
+# ============================================================
 def load_png_folder(folder, img_size=IMG_SIZE):
     files = [f for f in os.listdir(folder) if f.lower().endswith(".png")]
     files.sort()
@@ -43,84 +59,84 @@ def load_png_folder(folder, img_size=IMG_SIZE):
         X.append(arr)
     return np.array(X, dtype="float32"), files
 
-X_imgs, file_list = load_png_folder(ENCODE_DIR)
-print("Loaded PNGs. Shape:", X_imgs.shape)
 
-# -----------------------------
-# ANALYTIC DECODER
-# -----------------------------
-def decoder_from_conics(args):
-    params6, x_grid = args
-    A = params6[:, 0:1]; B = params6[:, 1:2]; C = params6[:, 2:3]
-    D = params6[:, 3:4]; E = params6[:, 4:5]; F = params6[:, 5:6]
-
-    Xg = tf.expand_dims(x_grid, axis=0)
-    Xg = tf.tile(Xg, [tf.shape(params6)[0], 1])
-
-    b_lin = B * Xg + E
-    c_const = A * (Xg**2) + D * Xg + F
-    disc = tf.maximum(0.0, b_lin**2 - 4.0 * C * c_const)
-    sqrt_disc = tf.sqrt(disc + 1e-12)
-    denom = 2.0 * C + 1e-12
-
-    y_top = (-b_lin + sqrt_disc) / denom
-    y_bot = (-b_lin - sqrt_disc) / denom
-    return tf.concat([y_top, y_bot], axis=1)
-
-# -----------------------------
-# BUILD CNN ENCODER + DECODER
-# -----------------------------
-inp = Input(shape=(IMG_SIZE, IMG_SIZE, 1), name="image")
-
-x = Conv2D(32, (3,3), activation='relu', padding='valid')(inp)
-x = MaxPooling2D((2,2))(x)
-x = Conv2D(64, (3,3), activation='relu', padding='valid')(x)
-x = MaxPooling2D((2,2))(x)
-x = Conv2D(128, (3,3), activation='relu', padding='valid')(x)
-x = MaxPooling2D((3,3))(x)
-x = Conv2D(256, (3,3), activation='relu', padding='valid')(x)
-x = MaxPooling2D((3,3))(x)
-x = Flatten()(x)
-x = Dense(128, activation='relu')(x)
-x = Dropout(0.05)(x)
-
-params_pred = Dense(6, activation='linear', name="params6")(x)
-x_grid_const = tf.constant(X_SAMPLES, dtype=tf.float32)
-y80_pred = Lambda(decoder_from_conics)([params_pred, x_grid_const])
-
-model = Model(inp, outputs={"y80": y80_pred, "p6": params_pred})
-model.compile(optimizer=Adam(5e-4),
-              loss={"y80":"mse","p6":"mse"},
-              loss_weights={"y80":1.0,"p6":0.1})
-model.summary()
-
-# -----------------------------
-# TRAIN IF WEIGHTS DO NOT EXIST
-# -----------------------------
-if os.path.exists(WEIGHTS_PATH):
-    # Simpler load for Keras 3 – no by_name / skip_mismatch
-    model.load_weights(WEIGHTS_PATH)
-    print("Loaded encoder weights from", WEIGHTS_PATH)
-else:
-    print("No encoder weights found. Training encoder from scratch...")
-
-    # Load corresponding 80-point airfoils
-    y80_list = []
+def load_y_values(file_list, txt_dir, n_points=80):
+    y_data = []
     for fname in file_list:
         fname_txt = os.path.splitext(fname)[0] + ".txt"
-        data = np.loadtxt(os.path.join(TXT_DIR, fname_txt), skiprows=1)[:,1]
-        y80_list.append(data)
-    y80 = np.array(y80_list, dtype=np.float32)
-    params = np.zeros((len(file_list),6), dtype=np.float32)  # placeholder for multi-target
+        txt_path = os.path.join(txt_dir, fname_txt)
+        if not os.path.exists(txt_path):
+            raise FileNotFoundError(f"Missing {txt_path}")
+        data = np.loadtxt(txt_path, skiprows=1)[:, 1]
+        if len(data) != n_points:
+            raise ValueError(f"{fname}: expected {n_points} points, got {len(data)}")
+        y_data.append(data)
+    return np.array(y_data, dtype=np.float32)
+
+
+print("Loading PNGs...")
+X_imgs, file_list = load_png_folder(ENCODE_DIR)
+print(f"Loaded PNGs: {X_imgs.shape}")
+
+print("Loading y-values...")
+y_values = load_y_values(file_list, TXT_DIR, n_points=80)
+print(f"Loaded y-values: {y_values.shape}")
+
+# ============================================================
+# Build autoencoder: PNG -> 6 -> 80
+# ============================================================
+inp_img = Input(shape=(IMG_SIZE, IMG_SIZE, 1), name="image")
+
+# Encoder
+x = Conv2D(32, (3, 3), activation="relu", padding="valid")(inp_img)
+x = MaxPooling2D((2, 2))(x)
+x = Conv2D(64, (3, 3), activation="relu", padding="valid")(x)
+x = MaxPooling2D((2, 2))(x)
+x = Conv2D(128, (3, 3), activation="relu", padding="valid")(x)
+x = MaxPooling2D((3, 3))(x)
+x = Conv2D(256, (3, 3), activation="relu", padding="valid")(x)
+x = MaxPooling2D((3, 3))(x)
+x = Flatten()(x)
+x = Dense(1000, activation="relu")(x)
+x = Dense(100, activation="relu")(x)
+x = Dropout(0.05)(x)
+
+latent = Dense(N_PARAMS, activation="linear", name="latent")(x)
+
+# Decoder (latent -> y80)
+x_dec = Dense(100, activation="relu")(latent)
+x_dec = Dense(1000, activation="relu")(x_dec)
+y_out = Dense(80, activation="linear", name="y_reconstructed")(x_dec)
+
+autoencoder = Model(inp_img, y_out)
+autoencoder.compile(optimizer=Adam(5e-4), loss="mse")
+
+encoder = Model(inp_img, latent)
+
+# ============================================================
+# Train or load
+# ============================================================
+if os.path.exists(AUTOENCODER_WEIGHTS):
+    autoencoder.load_weights(AUTOENCODER_WEIGHTS)
+    print(f"✓ Loaded autoencoder weights from {AUTOENCODER_WEIGHTS}")
+else:
+    print("🔄 Training autoencoder...")
 
     cbs = [
-        EarlyStopping(monitor="val_loss", patience=5, restore_best_weights=True, verbose=1),
-        ReduceLROnPlateau(monitor="val_loss", factor=0.5, patience=2, min_lr=1e-6, verbose=1),
+        EarlyStopping(monitor="val_loss", patience=15, restore_best_weights=True, verbose=1),
+        ReduceLROnPlateau(monitor="val_loss", factor=0.5, patience=5, min_lr=1e-6, verbose=1),
+        # Saves the best weights DURING training (so you never lose progress again)
+        ModelCheckpoint(
+            filepath=CHECKPOINT_PATH,
+            monitor="val_loss",
+            save_best_only=True,
+            save_weights_only=True,
+            verbose=1
+        ),
     ]
 
-    history = model.fit(
-        X_imgs,
-        {"y80": y80, "p6": params},
+    autoencoder.fit(
+        X_imgs, y_values,
         validation_split=0.1,
         epochs=EPOCHS,
         batch_size=BATCH_SIZE,
@@ -129,37 +145,29 @@ else:
         verbose=1
     )
 
-    # Sanity-check plots for first 3 airfoils
-    y_pred = model.predict(X_imgs[:5], verbose=0)["y80"]
-    N_X = 40
-    for i in range(3):
-        yp = y_pred[i]; yt = y80[i]
-        plt.figure(figsize=(5,4))
-        plt.plot(X_SAMPLES, yt[:N_X], label="top true")
-        plt.plot(X_SAMPLES, yt[N_X:], label="bot true")
-        plt.plot(X_SAMPLES, yp[:N_X], '--', label="top pred")
-        plt.plot(X_SAMPLES, yp[N_X:], '--', label="bot pred")
-        plt.title(f"Sample {i}: pred vs true"); plt.legend()
-        plt.xlabel("x"); plt.ylabel("y"); plt.grid(True)
-        plt.tight_layout()
-        plt.savefig(f"compare_{i}.png", dpi=150); plt.close()
+    # Save final weights safely
+    autoencoder.save_weights(AUTOENCODER_WEIGHTS)
+    print(f"✓ Saved final autoencoder weights to {AUTOENCODER_WEIGHTS}")
 
-    model.save_weights(WEIGHTS_PATH)
-    print("Saved encoder weights to", WEIGHTS_PATH)
+# ============================================================
+# Encode all PNGs -> latent params
+# ============================================================
+print("📊 Encoding all airfoils...")
+params_out = encoder.predict(X_imgs, batch_size=BATCH_SIZE, verbose=1)
+print(f"✓ Encoded {len(params_out)} airfoils into {N_PARAMS}-D latent space")
 
-# -----------------------------
-# ENCODE PNGs → 6 PARAMETERS
-# -----------------------------
-encoder = Model(inp, params_pred)
-params6 = encoder.predict(X_imgs, batch_size=BATCH_SIZE, verbose=1)
-print("Encoded params shape:", params6.shape)
-
-# Save CSV and NPY
-np.save(OUT_NPY, params6)
+# ============================================================
+# Save outputs to data/
+# ============================================================
+np.save(OUT_NPY, params_out)
 with open(OUT_CSV, "w", newline="") as f:
-    w = csv.writer(f)
-    w.writerow(["filename","p1","p2","p3","p4","p5","p6"])
-    for fname, vec in zip(file_list, params6):
-        w.writerow([fname]+list(map(float, vec)))
+    writer = csv.writer(f)
+    writer.writerow(["filename"] + [f"p{i+1}" for i in range(N_PARAMS)])
+    for fname, vec in zip(file_list, params_out):
+        writer.writerow([fname] + vec.tolist())
 
-print(f"Saved: {OUT_CSV} and {OUT_NPY}")
+encoder.save_weights(ENCODER_WEIGHTS)
+print(f"✓ Saved encoder weights to {ENCODER_WEIGHTS}")
+
+print(f"✓ Saved latents to:\n  {OUT_CSV}\n  {OUT_NPY}")
+print("✅ ENCODER COMPLETE")

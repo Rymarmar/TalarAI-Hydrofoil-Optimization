@@ -6,10 +6,12 @@
   "lam_bounds": 1.0,
   "lam_geom": 5.0,
   "min_thickness": 0.005,
-  "best_total": 999.5432158929154,
-  "best_objective": 0.04386210263223617,
-  "best_penalty": 999.4993537902832,
-  "best_CL": -0.7494695629256745,
-  "best_CD": 0.03287331088878312,
-  "best_fix_mode": "raw_fallback"
+  "valid_evals": 438,
+  "skipped": 62,
+  "best_total": 0.013750904684074257,
+  "best_objective": 0.012436505292661522,
+  "best_penalty": 0.0013143993914127355,
+  "best_CL": 2.3265351696432885,
+  "best_CD": 0.02893396695083193,
+  "best_fix_mode": "raw"
 }

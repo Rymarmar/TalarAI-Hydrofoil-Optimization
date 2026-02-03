@@ -1,111 +1,132 @@
+from __future__ import annotations
+
 import numpy as np
 import pandas as pd
+from pathlib import Path
 
 from pipeline.talarai_pipeline import TalarAIPipeline
+from optimization.objective import default_objective
 
 
-def _is_finite(x: float) -> bool:
-    return np.isfinite(x) and not np.isnan(x)
+def load_latents(csv_path: str = "data/airfoil_latent_params.csv") -> np.ndarray:
+    df = pd.read_csv(csv_path)
+    numeric = df.select_dtypes(include=[np.number])
+    if numeric.shape[1] != 6:
+        raise ValueError(f"Expected 6 numeric columns in {csv_path}, got {numeric.shape[1]}")
+    return numeric.values.astype(float)
 
 
-def _score_cd_over_abscl(CL: float, CD: float, eps: float = 1e-9) -> float:
-    """Objective: minimize CD/|CL| (robust if CL sign flips)."""
-    return CD / max(abs(CL), eps)
+def _as_scalar(x):
+    # Handles cases where pipeline returns np arrays (shape (1,) etc.)
+    if isinstance(x, (list, tuple, np.ndarray)):
+        x = np.asarray(x).reshape(-1)
+        if x.size == 0:
+            return float("nan")
+        return float(x[0])
+    return float(x)
 
 
-def _basic_sanity(CL: float, CD: float, cd_max: float = 5.0) -> bool:
+def safe_eval(pipeline: TalarAIPipeline, latent: np.ndarray, alpha: float, Re: float):
     """
-    Loose sanity filter to avoid complete nonsense while still allowing the script to run.
-    - finite values
-    - CD positive
-    - CD not astronomically huge (default 5.0 is very loose)
-    - |CL| not tiny
+    Evaluate a latent; return dict or None if invalid.
     """
-    if not (_is_finite(CL) and _is_finite(CD)):
-        return False
-    if CD <= 0 or CD > cd_max:
-        return False
-    if abs(CL) < 1e-6:
-        return False
-    return True
+    try:
+        out = pipeline.eval_latent_with_neuralfoil(latent, alpha=alpha, Re=Re)
+        CL = _as_scalar(out.get("CL"))
+        CD = _as_scalar(out.get("CD"))
+        coords = np.asarray(out.get("coords"), dtype=float)
+        fix_mode = out.get("fix_mode", "unknown")
+
+        # basic numeric checks
+        if not np.isfinite(CL) or not np.isfinite(CD):
+            return None
+        if CD <= 0.0 or CD > 10.0:
+            return None
+        if coords.ndim != 2 or coords.shape[1] != 2:
+            return None
+        if not np.all(np.isfinite(coords)):
+            return None
+
+        return {"CL": CL, "CD": CD, "coords": coords, "fix_mode": fix_mode}
+    except Exception:
+        return None
 
 
-def _load_latents() -> np.ndarray:
-    df = pd.read_csv("data/airfoil_latent_params.csv")
-    numeric_df = df.select_dtypes(include=[np.number])
-
-    if numeric_df.shape[1] != 6:
-        raise ValueError(
-            f"Expected 6 numeric latent columns, found {numeric_df.shape[1]}. "
-            "Check data/airfoil_latent_params.csv format."
-        )
-
-    return numeric_df.values.astype(float)
-
-
-def _select_baseline_best_available(
+def choose_baseline(
     pipeline: TalarAIPipeline,
     latents: np.ndarray,
     alpha: float,
     Re: float,
-    max_checks: int = 500,
-    cd_max_sanity: float = 5.0,
+    max_checks: int = 800,
 ):
     """
-    Always selects a baseline by scanning candidates and taking the BEST score (CD/|CL|)
-    among valid finite outputs. Prefers CL>0 if possible, but will fall back to CL<0 if needed.
-
-    Returns: (latent, out, idx, stats_dict)
+    Scan dataset rows and pick a baseline that:
+    - evaluates cleanly
+    - prefers positive CL (designer-friendly)
+    - otherwise falls back to best objective regardless of sign
     """
-    checks = min(max_checks, len(latents))
+    max_checks = min(max_checks, latents.shape[0])
 
-    best_any = None  # (score, latent, out, idx)
-    best_posCL = None
+    best_pos = None
+    best_any = None
 
     valid = 0
     skipped = 0
 
-    for i in range(checks):
-        latent = latents[i]
-        try:
-            out = pipeline.eval_latent_with_neuralfoil(latent, alpha=alpha, Re=Re)
-            CL = float(out["CL"])
-            CD = float(out["CD"])
-
-            if not _basic_sanity(CL, CD, cd_max=cd_max_sanity):
-                skipped += 1
-                continue
-
-            valid += 1
-            score = _score_cd_over_abscl(CL, CD)
-
-            if (best_any is None) or (score < best_any[0]):
-                best_any = (score, latent, out, i)
-
-            if CL > 0 and ((best_posCL is None) or (score < best_posCL[0])):
-                best_posCL = (score, latent, out, i)
-
-        except Exception:
+    for i in range(max_checks):
+        res = safe_eval(pipeline, latents[i], alpha, Re)
+        if res is None:
             skipped += 1
             continue
 
-    stats = {"scanned": checks, "valid": valid, "skipped": skipped}
+        valid += 1
+        obj = default_objective(res["CL"], res["CD"])
 
-    if best_posCL is not None:
-        score, latent, out, idx = best_posCL
-        stats["baseline_choice"] = "best_positive_CL"
-        return latent, out, idx, score, stats
+        cand = {
+            "idx": i,
+            "latent": latents[i].copy(),
+            "CL": res["CL"],
+            "CD": res["CD"],
+            "obj": float(obj),
+            "coords": res["coords"].copy(),
+            "fix_mode": res["fix_mode"],
+        }
 
-    if best_any is not None:
-        score, latent, out, idx = best_any
-        stats["baseline_choice"] = "best_any_sign"
-        return latent, out, idx, score, stats
+        if best_any is None or cand["obj"] < best_any["obj"]:
+            best_any = cand
 
-    raise RuntimeError(
-        f"No valid baselines found in first {checks} candidates. "
-        "This usually means NeuralFoil is returning non-finite values for everything. "
-        "Check geometry validity / coordinate convention."
-    )
+        if cand["CL"] > 0:
+            if best_pos is None or cand["obj"] < best_pos["obj"]:
+                best_pos = cand
+
+    # Prefer positive CL if we found one
+    baseline = best_pos if best_pos is not None else best_any
+    if baseline is None:
+        raise RuntimeError("Could not find any valid baseline in dataset scan.")
+
+    baseline["scan_stats"] = {"scanned": max_checks, "valid": valid, "skipped": skipped}
+    baseline["baseline_choice"] = "best_positive_CL" if best_pos is not None else "best_any_sign"
+    return baseline
+
+
+def propose_around(baseline: np.ndarray, sigma: np.ndarray, k: float = 2.0) -> np.ndarray:
+    """
+    Distribution-based random search:
+    z = baseline + Normal(0, k*sigma)
+    """
+    z = baseline + np.random.normal(loc=0.0, scale=k * sigma)
+    return z.astype(float)
+
+
+def save_outputs(out_dir: str, baseline, best):
+    out_path = Path(out_dir)
+    out_path.mkdir(parents=True, exist_ok=True)
+
+    np.save(out_path / "baseline_latent.npy", baseline["latent"])
+    np.savetxt(out_path / "baseline_coords.csv", baseline["coords"], delimiter=",", header="x,y", comments="")
+
+    np.save(out_path / "best_latent_random.npy", best["latent"])
+    np.savetxt(out_path / "best_coords_random.csv", best["coords"], delimiter=",", header="x,y", comments="")
 
 
 def main():
@@ -114,91 +135,71 @@ def main():
     alpha_deg = 6.0
     Re = 5e5
 
-    pipeline = TalarAIPipeline()
-
-    latents = _load_latents()
+    latents = load_latents("data/airfoil_latent_params.csv")
     print(f"Loaded latent dataset: {latents.shape[0]} rows, {latents.shape[1]} params")
 
-    # Distribution sampling setup
     mu = latents.mean(axis=0)
     sigma = latents.std(axis=0) + 1e-9
-    k = 2.0
 
-    # Baseline selection that ALWAYS works (best available)
-    baseline_latent, baseline_out, baseline_idx, baseline_score, stats = _select_baseline_best_available(
-        pipeline, latents, alpha=alpha_deg, Re=Re, max_checks=800, cd_max_sanity=5.0
-    )
+    pipeline = TalarAIPipeline()
 
-    bCL = float(baseline_out["CL"])
-    bCD = float(baseline_out["CD"])
+    baseline = choose_baseline(pipeline, latents, alpha=alpha_deg, Re=Re, max_checks=800)
 
+    ss = baseline["scan_stats"]
     print("\nBaseline (auto-selected):")
-    print(f"  scanned = {stats['scanned']} | valid = {stats['valid']} | skipped = {stats['skipped']}")
-    print(f"  baseline_choice = {stats['baseline_choice']}")
-    print(f"  baseline_row = {baseline_idx}")
-    print(f"  fix_mode = {baseline_out.get('fix_mode', 'unknown')}")
-    print(f"  CL = {bCL:.6f}")
-    print(f"  CD = {bCD:.8f}")
-    print(f"  CD/|CL| = {baseline_score:.8f}")
+    print(f"  scanned = {ss['scanned']} | valid = {ss['valid']} | skipped = {ss['skipped']}")
+    print(f"  baseline_choice = {baseline['baseline_choice']}")
+    print(f"  baseline_row = {baseline['idx']}")
+    print(f"  fix_mode = {baseline['fix_mode']}")
+    print(f"  CL = {baseline['CL']:.6f}")
+    print(f"  CD = {baseline['CD']:.8f}")
+    print(f"  CD/|CL| = {baseline['obj']:.8f}")
 
-    # Random search sampling (still sanity filtered)
-    n_samples = 300
-    cd_max_sanity = 5.0
+    # Random search params
+    n = 300
+    k = 2.0
+    print(f"\nRunning distribution-based random search: n={n}, k={k:.1f} std\n")
 
-    best_latent = baseline_latent
-    best_out = baseline_out
-    best_score = baseline_score
+    best = baseline.copy()
+    valid_evals = 0
+    skipped = 0
 
-    valid_count = 0
-    skipped_count = 0
-
-    print(f"\nRunning distribution-based random search: n={n_samples}, k={k} std\n")
-
-    for i in range(n_samples):
-        z = np.random.normal(loc=mu, scale=k * sigma)
-        z = np.clip(z, mu - k * sigma, mu + k * sigma)
-
-        try:
-            out = pipeline.eval_latent_with_neuralfoil(z, alpha=alpha_deg, Re=Re)
-            CL = float(out["CL"])
-            CD = float(out["CD"])
-
-            if not _basic_sanity(CL, CD, cd_max=cd_max_sanity):
-                skipped_count += 1
-                continue
-
-            valid_count += 1
-            score = _score_cd_over_abscl(CL, CD)
-
-            if score < best_score:
-                best_score = score
-                best_latent = z
-                best_out = out
-                print(f"[{i+1}/{n_samples}] New best! CD/|CL| = {best_score:.8f} | CL={CL:.4f} CD={CD:.6f}")
-
-        except Exception:
-            skipped_count += 1
+    for i in range(1, n + 1):
+        cand_lat = propose_around(baseline["latent"], sigma=sigma, k=k)
+        res = safe_eval(pipeline, cand_lat, alpha=alpha_deg, Re=Re)
+        if res is None:
+            skipped += 1
             continue
 
-    best_CL = float(best_out["CL"])
-    best_CD = float(best_out["CD"])
+        valid_evals += 1
+        obj = default_objective(res["CL"], res["CD"])
+
+        if obj < best["obj"]:
+            best = {
+                "idx": None,
+                "latent": cand_lat.copy(),
+                "CL": res["CL"],
+                "CD": res["CD"],
+                "obj": float(obj),
+                "coords": res["coords"].copy(),
+                "fix_mode": res["fix_mode"],
+            }
+            print(
+                f"[{i}/{n}] New best! CD/|CL|={best['obj']:.8f} | "
+                f"CL={best['CL']:.4f} CD={best['CD']:.6f}"
+            )
 
     print("\n=== Summary ===")
-    print(f"Valid evals: {valid_count} | Skipped: {skipped_count}")
+    print(f"Valid evals: {valid_evals} | skipped: {skipped}")
 
     print("\n=== Best Result ===")
-    print(f"fix_mode = {best_out.get('fix_mode', 'unknown')}")
-    print(f"Best latent params: {best_latent}")
-    print(f"CL = {best_CL:.6f}")
-    print(f"CD = {best_CD:.8f}")
-    print(f"CD/|CL| = {best_score:.8f}")
+    print(f"fix_mode = {best['fix_mode']}")
+    print(f"Best latent params: {best['latent']}")
+    print(f"CL = {best['CL']:.6f}")
+    print(f"CD = {best['CD']:.8f}")
+    print(f"CD/|CL| = {best['obj']:.8f}")
 
-    # Save outputs
-    np.save("outputs/baseline_latent.npy", baseline_latent)
-    np.savetxt("outputs/baseline_coords.csv", baseline_out["coords"], delimiter=",", header="x,y", comments="")
-
-    np.save("outputs/best_latent_random.npy", best_latent)
-    np.savetxt("outputs/best_coords_random.csv", best_out["coords"], delimiter=",", header="x,y", comments="")
+    save_outputs("outputs", baseline, best)
 
     print("\nSaved outputs:")
     print("  outputs/baseline_latent.npy")

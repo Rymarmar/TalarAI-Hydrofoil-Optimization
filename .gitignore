@@ -1,9 +1,33 @@
-.venv/
+# Python
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
+
+# Virtual env
+.venv/
+venv/
+
+# OS / editor
 .DS_Store
-.ipynb_checkpoints/
+.vscode/
+.idea/
+
+# Outputs (keep your summaries if you want)
+outputs/*
+!outputs/nom_summary.json
+!outputs/nom_history.json
+!outputs/*.png
+!outputs/*coords*.csv
+!outputs/*latent*.npy
+
+# Big datasets / generated folders (don’t push these)
+airfoils_png/
+airfoils_txt/
+data/coord_*
+
+# Model checkpoints (these can be huge; push only if your team wants them in repo)
 *.h5
-*.npz
-*.npy
-*.csv
+*.keras
+*.ckpt
+*.weights.h5
