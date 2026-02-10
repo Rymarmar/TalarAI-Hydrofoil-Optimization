@@ -1,3 +1,5 @@
+# python -m optimization.demo_random_search
+
 from __future__ import annotations
 
 import numpy as np

@@ -1,3 +1,5 @@
+# python -m optimization.nom_driver
+
 from __future__ import annotations
 
 import json
@@ -213,3 +215,31 @@ if __name__ == "__main__":
         min_thickness=0.005,
         out_dir="outputs",
     )
+
+# #alpha → “Angle of attack used during evaluation”
+
+# Re → “Reynolds number used during evaluation”
+
+# n_iters → “Number of optimization iterations”
+
+# k → “Controls how far NOM samples around the baseline distribution”
+
+# lam_bounds → “Penalty weight for leaving the latent design space”
+
+# lam_geom → “Penalty weight for violating geometric constraints”
+
+# min_thickness → “Minimum allowable foil thickness”
+
+# valid_evals → “Number of candidates that produced valid evaluations”
+
+# skipped → “Candidates discarded due to invalid geometry or outputs”
+
+# best_total → “Objective plus penalties for the best solution”
+
+# best_objective → “Aerodynamic objective value only”
+
+# best_penalty → “Constraint violation penalty (zero means fully valid)”
+
+# best_CL / best_CD → “Predicted lift and drag for the optimized foil”
+
+# best_fix_mode → “Internal geometry orientation correction”

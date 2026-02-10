@@ -11,7 +11,6 @@ OUT = ROOT / "outputs"
 
 BASELINE_CSV = OUT / "baseline_coords.csv"
 NOM_CSV = OUT / "best_coords_nom.csv"
-RANDOM_CSV = OUT / "best_coords_random.csv"  # optional
 NOM_SUMMARY = OUT / "nom_summary.json"
 
 
@@ -68,11 +67,6 @@ def main():
     plt.figure()
     plt.plot(baseline[:, 0], baseline[:, 1], label="Baseline")
     plt.plot(nom[:, 0], nom[:, 1], label="NOM Optimized")
-
-    # Optional: include random search result if it exists
-    if RANDOM_CSV.exists():
-        rs = load_coords(RANDOM_CSV)
-        plt.plot(rs[:, 0], rs[:, 1], label="Random Search (optional)", linestyle="--")
 
     plt.title("Hydrofoil Cross-Section: Baseline vs NOM Optimized")
     plt.xlabel("x (chordwise)")
