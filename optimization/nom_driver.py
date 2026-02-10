@@ -27,8 +27,8 @@ from optimization.constraints import make_default_latent_bounds, total_penalty
 
 def load_latent_dataset(csv_path: str = "data/airfoil_latent_params.csv") -> np.ndarray:
     """
-    Load the existing latent dataset (training distribution reference).
-    We use this ONLY to compute mean/std and bounds — not to "train" in NOM.
+    Load the existing latent dataset (training distribution reference)
+    use this ONLY to compute mean/std and bounds, not to "train" in NOM
     """
     df = pd.read_csv(csv_path)
     numeric_df = df.select_dtypes(include=[np.number])
@@ -46,7 +46,7 @@ def _as_scalar(x):
         return float(x[0])
     return float(x)
 
-
+# Rejects invalid candidates early (Non-Numbers, invalid CD rangem broken coordinates)
 def safe_eval(pipeline: TalarAIPipeline, latent_vec: np.ndarray, alpha: float, Re: float):
     """
     Evaluate a candidate latent design safely.
@@ -73,7 +73,7 @@ def safe_eval(pipeline: TalarAIPipeline, latent_vec: np.ndarray, alpha: float, R
     except Exception:
         return None
 
-
+# two proposal modes: global (explore) and local (exploit/refine)
 def propose_latent_global(mu: np.ndarray, sigma: np.ndarray, k: float, lo: np.ndarray, hi: np.ndarray) -> np.ndarray:
     """
     GLOBAL proposal:

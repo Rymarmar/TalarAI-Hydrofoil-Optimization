@@ -11,9 +11,9 @@ import numpy as np
 
 def cd_over_abscl(CL: float, CD: float, eps: float = 1e-9) -> float:
     """
-    Sponsor-safe / sign-invariant objective.
-    Minimizes CD / |CL| so negative CL doesn't crash the objective.
-    We keep this around for debugging/comparison.
+    Sponsor-safe / sign-invariant objective
+    Minimizes CD / |CL| so negative CL doesn't crash the objective
+    Now for debugging/comparison
     """
     return float(CD) / max(float(abs(CL)), eps)
 
@@ -21,9 +21,9 @@ def cd_over_abscl(CL: float, CD: float, eps: float = 1e-9) -> float:
 def cd_over_cl(CL: float, CD: float, eps: float = 1e-9) -> float:
     """
     Physical objective:
-      minimize CD/CL (maximize CL/CD).
+      minimize CD/CL (maximize CL/CD)
     If CL <= 0, we return a huge value because it's not physically acceptable
-    for the chosen coordinate convention (positive lift only).
+    for the chosen coordinate convention (positive lift only)
     """
     CL = float(CL)
     CD = float(CD)
@@ -41,7 +41,7 @@ def cd_over_cl(CL: float, CD: float, eps: float = 1e-9) -> float:
 
 def default_objective(CL: float, CD: float) -> float:
     """
-    This is the objective used by NOM.
-    We use CD/CL because constraints.py now enforces a valid CL range.
+    This is the objective used by NOM
+    We use CD/CL because constraints.py now enforces a valid CL range
     """
     return cd_over_cl(CL, CD)

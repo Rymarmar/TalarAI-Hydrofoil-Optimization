@@ -14,12 +14,13 @@ import numpy as np
 from tensorflow.keras.models import load_model
 import neuralfoil as nf
 
-
+# decoder model and scaler params are loaded from disk
 BASE_DIR = Path(__file__).resolve().parent
 DECODER_MODEL_PATH = BASE_DIR / "decoder_model_6x100x1000x80.h5"
 SCALER_PATH = BASE_DIR / "scaler_params.npz"
+# feeds the decoder latents in the same normalized scale it was trained on
 
-
+#  helper that standardizes outputs into Python floats 
 def _to_scalar(x):
     """Convert numpy scalars/arrays to a normal Python float."""
     if x is None:
@@ -37,7 +38,7 @@ class TalarAIPipeline:
         # number of points per surface (upper 40 + lower 40 = 80 total y-values)
         self.n_points = int(n_points)
 
-        # common x-grid from LE (0) to TE (1)
+        # common x-grid from LE (0) to TE (1) (to match the decoder model and scaler arrays)
         self.x_common = np.linspace(0.0, 1.0, self.n_points).astype(np.float32)
 
         # load decoder and scaler
@@ -74,14 +75,14 @@ class TalarAIPipeline:
 
     def latent_to_coordinates(self, latent_vec):
         """
-        Build airfoil coordinates in a single, consistent convention.
+        Build foil coordinates in a single, consistent convention
 
         Convention used:
           - upper surface: x 0→1
           - lower surface: x 1→0 (reverse x)
           - lower y is reversed to match x reversal
 
-        This produces one closed-ish loop around the airfoil.
+        This produces one closed-ish loop around the airfoil
         """
         y80 = self.latent_to_y80(latent_vec)
 
@@ -98,6 +99,7 @@ class TalarAIPipeline:
         coords = np.stack([x_coords, y_coords], axis=1).astype(np.float32)
         return coords
 
+    # Two functions for evaluation steps
     def _eval_coords_neuralfoil(self, coords, alpha, Re, model_size):
         """
         Run NeuralFoil on coordinates at a single operating point (alpha, Re).
@@ -112,6 +114,7 @@ class TalarAIPipeline:
         out["coords"] = coords
         return out
 
+    # Pass coordinates through NF with alpha and Re, and extract CL/CD for use later
     def eval_latent_with_neuralfoil(
         self,
         latent_vec,

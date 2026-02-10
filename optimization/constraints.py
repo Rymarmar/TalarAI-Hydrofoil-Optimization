@@ -4,7 +4,7 @@ import numpy as np
 # Purpose:
 #   Convert "design requirements" into penalty terms that NOM can minimize
 #
-# NOM philosophy (matches whiteboard):
+# From NOM reference:
 #   total_cost = objective + λ1*ReLU(constraint1_violation) + λ2*ReLU(constraint2_violation) + ...
 #
 # Here we implement three types:
@@ -12,16 +12,16 @@ import numpy as np
 #   2) geometry thickness (manufacturability sanity)
 #   3) CL bounds (keep lift in a physically realistic / target range)
 
-
+# ReLu means only violations get penalized; if constraints are satisfied, penalty = 0
 def relu(x: float) -> float:
     """ReLU = max(0, x). Only penalize when constraint is violated."""
     return float(max(0.0, x))
 
-
+# Some latent vectors can decode into unrealistic shapes and unstable aero predictions
 def make_default_latent_bounds(latents: np.ndarray, k: float = 2.0) -> tuple[np.ndarray, np.ndarray]:
     """
-    Build latent bounds from dataset: mean ± k*std.
-    This keeps the optimizer from wandering too far from training data.
+    Build latent bounds from dataset: mean ± k*std
+    keeps the optimizer from wandering too far from training data
     """
     latents = np.asarray(latents, dtype=float)
     mu = np.nanmean(latents, axis=0)
@@ -30,11 +30,11 @@ def make_default_latent_bounds(latents: np.ndarray, k: float = 2.0) -> tuple[np.
     hi = mu + k * sig
     return lo, hi
 
-
+# fast proxy constraints used during optimization
 def _normalize_coords(coords: np.ndarray) -> np.ndarray:
     """
-    Normalize coords so chord is ~[0,1] in x.
-    This makes thickness checks consistent across shapes.
+    Normalize coords so chord is ~[0,1] in x (proxy constraint)
+    This makes thickness checks consistent across shapes
     """
     c = np.asarray(coords, dtype=float)
     if c.ndim != 2 or c.shape[1] != 2:
@@ -60,7 +60,7 @@ def _min_thickness_estimate(coords_norm: np.ndarray, n_bins: int = 40) -> float:
       bin x into segments
       thickness in bin = max(y) - min(y)
       return the minimum thickness across bins
-    This catches ultra-thin / degenerate shapes.
+    This catches ultra-thin / degenerate shapes
     """
     x = coords_norm[:, 0]
     y = coords_norm[:, 1]
@@ -88,7 +88,7 @@ def _min_thickness_estimate(coords_norm: np.ndarray, n_bins: int = 40) -> float:
 
     return float(np.min(t_vals))
 
-
+# adds penaly if any latent component violates the box bounds
 def latent_bounds_penalty(latent_vec: np.ndarray, lo: np.ndarray, hi: np.ndarray) -> float:
     """
     Penalize leaving the latent box constraints:
@@ -104,7 +104,7 @@ def latent_bounds_penalty(latent_vec: np.ndarray, lo: np.ndarray, hi: np.ndarray
     above = np.maximum(z - hi, 0.0)
     return float(np.sum(below + above))
 
-
+# Turns thickness into a ReLU penalty
 def geometry_penalty(coords: np.ndarray, min_thickness: float = 0.005) -> tuple[float, dict]:
     """
     Geometry constraint:
@@ -120,7 +120,7 @@ def geometry_penalty(coords: np.ndarray, min_thickness: float = 0.005) -> tuple[
 
     return float(pen_t), {"min_thickness_est": float(t_min)}
 
-
+# Bounds CL to keep designs in a realistic operating envelope for physical testing
 def cl_bounds_penalty(CL: float, cl_min: float | None = None, cl_max: float | None = None) -> float:
     """
     Lift coefficient constraint:
@@ -134,7 +134,7 @@ def cl_bounds_penalty(CL: float, cl_min: float | None = None, cl_max: float | No
         pen += relu(float(CL) - float(cl_max))
     return float(pen)
 
-
+# Adds lambda weights to all constraints
 def total_penalty(
     latent_vec: np.ndarray,
     coords: np.ndarray,
