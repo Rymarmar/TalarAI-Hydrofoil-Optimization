@@ -1,16 +1,27 @@
 from __future__ import annotations
-
 import numpy as np
+
+# Purpose:
+#   Convert "design requirements" into penalty terms that NOM can minimize
+#
+# NOM philosophy (matches whiteboard):
+#   total_cost = objective + λ1*ReLU(constraint1_violation) + λ2*ReLU(constraint2_violation) + ...
+#
+# Here we implement three types:
+#   1) latent bounds (stay near training distribution)
+#   2) geometry thickness (manufacturability sanity)
+#   3) CL bounds (keep lift in a physically realistic / target range)
 
 
 def relu(x: float) -> float:
+    """ReLU = max(0, x). Only penalize when constraint is violated."""
     return float(max(0.0, x))
 
 
 def make_default_latent_bounds(latents: np.ndarray, k: float = 2.0) -> tuple[np.ndarray, np.ndarray]:
     """
-    Bounds used for latent 'stay near training distribution' constraint.
-    We use mean ± k*std (simple + explainable).
+    Build latent bounds from dataset: mean ± k*std.
+    This keeps the optimizer from wandering too far from training data.
     """
     latents = np.asarray(latents, dtype=float)
     mu = np.nanmean(latents, axis=0)
@@ -22,19 +33,17 @@ def make_default_latent_bounds(latents: np.ndarray, k: float = 2.0) -> tuple[np.
 
 def _normalize_coords(coords: np.ndarray) -> np.ndarray:
     """
-    Normalize decoded coords so chord is ~[0,1] in x.
-    This reduces numeric issues downstream.
+    Normalize coords so chord is ~[0,1] in x.
+    This makes thickness checks consistent across shapes.
     """
     c = np.asarray(coords, dtype=float)
     if c.ndim != 2 or c.shape[1] != 2:
         raise ValueError(f"coords must be (N,2). got {c.shape}")
-
     if not np.all(np.isfinite(c)):
         raise ValueError("coords contain NaN/Inf")
 
     x = c[:, 0]
     y = c[:, 1]
-
     x_min = float(np.min(x))
     x_max = float(np.max(x))
     chord = x_max - x_min
@@ -42,23 +51,20 @@ def _normalize_coords(coords: np.ndarray) -> np.ndarray:
         raise ValueError("coords chord length too small/collapsed")
 
     x_n = (x - x_min) / chord
-    c_n = np.column_stack([x_n, y])
-    return c_n
+    return np.column_stack([x_n, y])
 
 
 def _min_thickness_estimate(coords_norm: np.ndarray, n_bins: int = 40) -> float:
     """
     Rough thickness estimate:
-    - bin by x
-    - thickness in each bin = (max y - min y)
-    - min thickness = min over bins (excluding empty bins)
-
-    Not perfect aero thickness, but good enough as a "geometry sanity" constraint.
+      bin x into segments
+      thickness in bin = max(y) - min(y)
+      return the minimum thickness across bins
+    This catches ultra-thin / degenerate shapes.
     """
     x = coords_norm[:, 0]
     y = coords_norm[:, 1]
 
-    # Ignore points outside chord due to bad decode
     mask = (x >= 0.0) & (x <= 1.0) & np.isfinite(y)
     x = x[mask]
     y = y[mask]
@@ -70,9 +76,7 @@ def _min_thickness_estimate(coords_norm: np.ndarray, n_bins: int = 40) -> float:
     for i in range(n_bins):
         m = (x >= bins[i]) & (x < bins[i + 1])
         if np.any(m):
-            y_max = float(np.max(y[m]))
-            y_min = float(np.min(y[m]))
-            t_vals.append(y_max - y_min)
+            t_vals.append(float(np.max(y[m])) - float(np.min(y[m])))
 
     if not t_vals:
         return 0.0
@@ -87,7 +91,8 @@ def _min_thickness_estimate(coords_norm: np.ndarray, n_bins: int = 40) -> float:
 
 def latent_bounds_penalty(latent_vec: np.ndarray, lo: np.ndarray, hi: np.ndarray) -> float:
     """
-    Penalty for leaving latent box constraints.
+    Penalize leaving the latent box constraints:
+      sum( ReLU(lo - z) + ReLU(z - hi) )
     """
     z = np.asarray(latent_vec, dtype=float).reshape(-1)
     lo = np.asarray(lo, dtype=float).reshape(-1)
@@ -102,38 +107,68 @@ def latent_bounds_penalty(latent_vec: np.ndarray, lo: np.ndarray, hi: np.ndarray
 
 def geometry_penalty(coords: np.ndarray, min_thickness: float = 0.005) -> tuple[float, dict]:
     """
-    Geometry sanity penalties:
-    - coords finite
-    - chord not collapsed
-    - min thickness >= threshold
+    Geometry constraint:
+      penalize if estimated min thickness < min_thickness
+    Returns:
+      (penalty_value, info_dict)
     """
     c_n = _normalize_coords(coords)
     t_min = _min_thickness_estimate(c_n, n_bins=40)
 
+    # ReLU violation: only positive when thickness is too small
     pen_t = relu(min_thickness - t_min)
 
-    info = {
-        "min_thickness_est": float(t_min),
-    }
-    return float(pen_t), info
+    return float(pen_t), {"min_thickness_est": float(t_min)}
+
+
+def cl_bounds_penalty(CL: float, cl_min: float | None = None, cl_max: float | None = None) -> float:
+    """
+    Lift coefficient constraint:
+      if cl_min: ReLU(cl_min - CL)
+      if cl_max: ReLU(CL - cl_max)
+    """
+    pen = 0.0
+    if cl_min is not None:
+        pen += relu(float(cl_min) - float(CL))
+    if cl_max is not None:
+        pen += relu(float(CL) - float(cl_max))
+    return float(pen)
 
 
 def total_penalty(
     latent_vec: np.ndarray,
     coords: np.ndarray,
+    CL: float | None,
     lat_lo: np.ndarray,
     lat_hi: np.ndarray,
     lam_bounds: float = 1.0,
     lam_geom: float = 5.0,
+    lam_cl: float = 10.0,
     min_thickness: float = 0.005,
-) -> float:
+    cl_min: float | None = None,
+    cl_max: float | None = None,
+) -> tuple[float, dict]:
     """
-    Total penalty = λ_bounds * P_bounds + λ_geom * P_geom
-
-    P_bounds: latent box constraint
-    P_geom: thickness/geometry sanity
+    Combine all constraints into one penalty:
+      P = λ_bounds*P_bounds + λ_geom*P_geom + λ_cl*P_cl
     """
+    # 1) stay near training distribution
     p_bounds = latent_bounds_penalty(latent_vec, lat_lo, lat_hi)
-    p_geom, _ = geometry_penalty(coords, min_thickness=min_thickness)
 
-    return float(lam_bounds * p_bounds + lam_geom * p_geom)
+    # 2) manufacturability sanity
+    p_geom, geom_info = geometry_penalty(coords, min_thickness=min_thickness)
+
+    # 3) keep lift in realistic / desired range
+    p_cl = 0.0
+    if CL is not None:
+        p_cl = cl_bounds_penalty(CL, cl_min=cl_min, cl_max=cl_max)
+
+    total = float(lam_bounds * p_bounds + lam_geom * p_geom + lam_cl * p_cl)
+
+    info = {
+        **geom_info,
+        "p_bounds": float(p_bounds),
+        "p_geom": float(p_geom),
+        "p_cl": float(p_cl),
+    }
+    return total, info

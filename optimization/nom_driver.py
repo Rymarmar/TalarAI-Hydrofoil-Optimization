@@ -1,7 +1,19 @@
-# python -m optimization.nom_driver
+# Run:
+#   python -m optimization.nom_driver
+#
+# Purpose:
+#   Implement NOM (Neural Optimization Machine) loop:
+#     - propose a latent design (6 params)
+#     - decode + evaluate via NeuralFoil
+#     - compute objective (performance)
+#     - compute penalties (constraints)
+#     - keep best design found
+#     - save best latent + best coordinates + history
+#
+#   This is BLACK-BOX optimization (NeuralFoil isn't differentiable here),
+#   so "learning rate" is a step size used for local proposals in latent space
 
 from __future__ import annotations
-
 import json
 from pathlib import Path
 
@@ -14,17 +26,19 @@ from optimization.constraints import make_default_latent_bounds, total_penalty
 
 
 def load_latent_dataset(csv_path: str = "data/airfoil_latent_params.csv") -> np.ndarray:
+    """
+    Load the existing latent dataset (training distribution reference).
+    We use this ONLY to compute mean/std and bounds — not to "train" in NOM.
+    """
     df = pd.read_csv(csv_path)
     numeric_df = df.select_dtypes(include=[np.number])
-
     if numeric_df.shape[1] != 6:
-        raise ValueError(
-            f"Expected 6 numeric latent columns, found {numeric_df.shape[1]} in {csv_path}"
-        )
+        raise ValueError(f"Expected 6 numeric latent columns, found {numeric_df.shape[1]} in {csv_path}")
     return numeric_df.values.astype(float)
 
 
 def _as_scalar(x):
+    """Convert numpy/array outputs to a float."""
     if isinstance(x, (list, tuple, np.ndarray)):
         x = np.asarray(x).reshape(-1)
         if x.size == 0:
@@ -35,7 +49,8 @@ def _as_scalar(x):
 
 def safe_eval(pipeline: TalarAIPipeline, latent_vec: np.ndarray, alpha: float, Re: float):
     """
-    Evaluate latent -> returns dict or None if invalid.
+    Evaluate a candidate latent design safely.
+    Returns None if invalid (NaNs, weird values, broken coords).
     """
     try:
         out = pipeline.eval_latent_with_neuralfoil(latent_vec, alpha=alpha, Re=Re)
@@ -44,6 +59,7 @@ def safe_eval(pipeline: TalarAIPipeline, latent_vec: np.ndarray, alpha: float, R
         coords = np.asarray(out.get("coords"), dtype=float)
         fix_mode = out.get("fix_mode", "unknown")
 
+        # basic validity checks
         if not np.isfinite(CL) or not np.isfinite(CD):
             return None
         if CD <= 0.0 or CD > 10.0:
@@ -58,49 +74,88 @@ def safe_eval(pipeline: TalarAIPipeline, latent_vec: np.ndarray, alpha: float, R
         return None
 
 
-def propose_latent(mu: np.ndarray, sigma: np.ndarray, k: float = 2.0, lo=None, hi=None) -> np.ndarray:
+def propose_latent_global(mu: np.ndarray, sigma: np.ndarray, k: float, lo: np.ndarray, hi: np.ndarray) -> np.ndarray:
     """
-    NOM proposal step (black-box):
-    - sample Normal(mu, k*sigma)
-    - optionally clip to latent bounds
+    GLOBAL proposal:
+      sample around the dataset mean with spread k*sigma
+      then clip to bounds
+    This explores the overall design space.
     """
     z = np.random.normal(loc=mu, scale=k * sigma).astype(float)
-    if lo is not None and hi is not None:
-        z = np.clip(z, lo, hi)
-    return z.astype(float)
+    return np.clip(z, lo, hi).astype(float)
+
+
+def propose_latent_local(center: np.ndarray, lr: float, lo: np.ndarray, hi: np.ndarray) -> np.ndarray:
+    """
+    LOCAL proposal:
+      z = center + lr * random_step
+    This exploits/refines around the current best.
+    Here lr is the "learning rate" / step size in latent space.
+    """
+    step = np.random.normal(loc=0.0, scale=1.0, size=center.shape).astype(float)
+    z = np.asarray(center, dtype=float) + float(lr) * step
+    return np.clip(z, lo, hi).astype(float)
+
+
+def _save_latent_csv(path: Path, latent: np.ndarray, pretty_sigfigs: int | None = None):
+    """
+    Save the 6 optimized latent parameters.
+    We keep full precision internally; "pretty" is for reporting.
+    """
+    z = np.asarray(latent, dtype=float).reshape(-1)
+    if z.size != 6:
+        raise ValueError(f"Expected 6 latent params, got {z.size}")
+
+    if pretty_sigfigs is None:
+        vals = z
+    else:
+        vals = np.array([float(f"{v:.{pretty_sigfigs}g}") for v in z], dtype=float)
+
+    df = pd.DataFrame([vals], columns=[f"p{i+1}" for i in range(6)])
+    df.to_csv(path, index=False)
+
+
+def _save_coords_csv(path: Path, coords: np.ndarray, pretty_decimals: int | None = None):
+    """
+    Save decoded airfoil coordinates.
+    Again: full precision for real use, rounded for reporting.
+    """
+    c = np.asarray(coords, dtype=float)
+    if pretty_decimals is not None:
+        c = np.round(c, int(pretty_decimals))
+    np.savetxt(path, c, delimiter=",", header="x,y", comments="")
 
 
 def nom_optimize(
     alpha: float = 6.0,
     Re: float = 5e5,
-    n_iters: int = 500,
+    n_iters: int = 2000,
     k: float = 2.0,
+    learning_rate_init: float = 0.25,
+    lr_decay: float = 0.999,
+    p_local: float = 0.75,
     lam_bounds: float = 1.0,
     lam_geom: float = 5.0,
+    lam_cl: float = 10.0,
     min_thickness: float = 0.005,
+    cl_min: float | None = 0.2,
+    cl_max: float | None = 1.2,
     out_dir: str = "outputs",
 ):
     """
-    NOM (Neural Optimization Machine) — black-box version:
-
-      minimize:
-        objective(CL, CD) + penalty(latent bounds + geometry)
-
-    objective defaults to CD/|CL| (sponsor-safe).
-
-    penalty uses ReLU-style constraints:
-      - latent stays near training distribution
-      - geometry is not degenerate (thickness sanity)
+    Main NOM loop:
+      minimize total = objective(CL,CD) + penalty(constraints)
     """
     out_path = Path(out_dir)
     out_path.mkdir(parents=True, exist_ok=True)
 
+    # 1) Load dataset to define bounds / distribution reference
     latents = load_latent_dataset()
     mu = latents.mean(axis=0)
     sigma = latents.std(axis=0) + 1e-9
-
     lat_lo, lat_hi = make_default_latent_bounds(latents, k=k)
 
+    # 2) Create evaluation pipeline
     pipeline = TalarAIPipeline()
 
     best = None
@@ -108,79 +163,107 @@ def nom_optimize(
     valid = 0
     skipped = 0
 
-    for it in range(1, n_iters + 1):
-        cand = propose_latent(mu, sigma, k=k, lo=lat_lo, hi=lat_hi)
+    # "learning rate" = local step size in latent space
+    lr = float(learning_rate_init)
 
+    for it in range(1, n_iters + 1):
+        # 3) Propose a candidate latent design
+        use_local = (best is not None) and (np.random.rand() < float(p_local))
+        if use_local:
+            cand = propose_latent_local(best["latent"], lr=lr, lo=lat_lo, hi=lat_hi)
+            mode = "local"
+        else:
+            cand = propose_latent_global(mu, sigma, k=k, lo=lat_lo, hi=lat_hi)
+            mode = "global"
+
+        # 4) Evaluate candidate with NeuralFoil
         res = safe_eval(pipeline, cand, alpha=alpha, Re=Re)
         if res is None:
             skipped += 1
+            lr *= float(lr_decay)
             continue
 
         valid += 1
-
         CL = res["CL"]
         CD = res["CD"]
         coords = res["coords"]
-        fix_mode = res["fix_mode"]
 
+        # 5) Compute performance objective (no constraints here)
         obj = default_objective(CL, CD)
 
-        pen = total_penalty(
+        # 6) Compute constraint penalties (NOM-style ReLU penalties)
+        pen, pen_info = total_penalty(
             latent_vec=cand,
             coords=coords,
+            CL=CL,
             lat_lo=lat_lo,
             lat_hi=lat_hi,
             lam_bounds=lam_bounds,
             lam_geom=lam_geom,
+            lam_cl=lam_cl,
             min_thickness=min_thickness,
+            cl_min=cl_min,
+            cl_max=cl_max,
         )
 
         total = float(obj + pen)
 
+        # record this iteration (for plotting later)
         rec = {
-            "iter": it,
+            "iter": int(it),
             "CL": float(CL),
             "CD": float(CD),
             "objective": float(obj),
             "penalty": float(pen),
             "total": float(total),
-            "fix_mode": fix_mode,
+            "tmin": float(pen_info.get("min_thickness_est", 0.0)),
+            "lr": float(lr),
+            "mode": str(mode),
         }
         history.append(rec)
 
+        # 7) Keep best solution seen so far (simple greedy best-so-far)
         if best is None or total < best["total"]:
-            best = {
-                **rec,
-                "latent": cand.copy(),
-                "coords": coords.copy(),
-            }
+            best = {**rec, "latent": cand.copy(), "coords": coords.copy()}
             print(
-                f"[{it}/{n_iters}] New BEST total={best['total']:.6f} "
-                f"(obj={best['objective']:.6f}, pen={best['penalty']:.6f}) "
-                f"| CL={best['CL']:.4f} CD={best['CD']:.6f} fix={best['fix_mode']}"
+                f"[{it}/{n_iters}] BEST total={best['total']:.6f} (obj={best['objective']:.6f}, pen={best['penalty']:.6f}) "
+                f"| CL={best['CL']:.4f} CD={best['CD']:.6f} | tmin={best['tmin']:.5f} | lr={best['lr']:.4f} mode={best['mode']}"
             )
 
+        # 8) Decay step size to refine search over time
+        lr *= float(lr_decay)
+
     if best is None:
-        raise RuntimeError(
-            f"NOM failed: 0 valid candidates. Try increasing n_iters, increasing k, "
-            f"or relaxing geometry constraints."
-        )
+        raise RuntimeError("NOM failed: 0 valid candidates.")
 
-    # Save best artifacts
+    # 9) Save best artifacts for downstream use (CAD/rebuild/plots)
     np.save(out_path / "best_latent_nom.npy", best["latent"])
-    np.savetxt(out_path / "best_coords_nom.csv", best["coords"], delimiter=",", header="x,y", comments="")
+    _save_latent_csv(out_path / "best_latent_nom.csv", best["latent"], pretty_sigfigs=None)
+    _save_coords_csv(out_path / "best_coords_nom.csv", best["coords"], pretty_decimals=None)
 
+    # Pretty versions for reporting/printing
+    _save_latent_csv(out_path / "best_latent_nom_pretty.csv", best["latent"], pretty_sigfigs=3)
+    _save_coords_csv(out_path / "best_coords_nom_pretty.csv", best["coords"], pretty_decimals=6)
+
+    # Save full history
     with open(out_path / "nom_history.json", "w", encoding="utf-8") as f:
         json.dump(history, f, indent=2)
 
+    # Save summary (easy to cite in presentations)
     summary = {
         "alpha": float(alpha),
         "Re": float(Re),
         "n_iters": int(n_iters),
         "k": float(k),
+        "learning_rate_init": float(learning_rate_init),
+        "lr_decay": float(lr_decay),
+        "p_local": float(p_local),
         "lam_bounds": float(lam_bounds),
         "lam_geom": float(lam_geom),
+        "lam_cl": float(lam_cl),
         "min_thickness": float(min_thickness),
+        "cl_min": None if cl_min is None else float(cl_min),
+        "cl_max": None if cl_max is None else float(cl_max),
         "valid_evals": int(valid),
         "skipped": int(skipped),
         "best_total": float(best["total"]),
@@ -188,7 +271,8 @@ def nom_optimize(
         "best_penalty": float(best["penalty"]),
         "best_CL": float(best["CL"]),
         "best_CD": float(best["CD"]),
-        "best_fix_mode": str(best["fix_mode"]),
+        "best_min_thickness_est": float(best["tmin"]),
+        "best_latent_params": [float(x) for x in np.asarray(best["latent"], dtype=float).reshape(-1)],
     }
 
     with open(out_path / "nom_summary.json", "w", encoding="utf-8") as f:
@@ -196,50 +280,8 @@ def nom_optimize(
 
     print("\n=== NOM Finished ===")
     print(json.dumps(summary, indent=2))
-    print("\nSaved outputs:")
-    print("  outputs/best_latent_nom.npy")
-    print("  outputs/best_coords_nom.csv")
-    print("  outputs/nom_history.json")
-    print("  outputs/nom_summary.json")
+    print("\nSaved outputs in outputs/ (latent params, coords, history, summary).")
 
 
 if __name__ == "__main__":
-    # Meeting-friendly defaults
-    nom_optimize(
-        alpha=6.0,
-        Re=5e5,
-        n_iters=500,
-        k=2.0,
-        lam_bounds=1.0,
-        lam_geom=5.0,
-        min_thickness=0.005,
-        out_dir="outputs",
-    )
-
-# #alpha → “Angle of attack used during evaluation”
-
-# Re → “Reynolds number used during evaluation”
-
-# n_iters → “Number of optimization iterations”
-
-# k → “Controls how far NOM samples around the baseline distribution”
-
-# lam_bounds → “Penalty weight for leaving the latent design space”
-
-# lam_geom → “Penalty weight for violating geometric constraints”
-
-# min_thickness → “Minimum allowable foil thickness”
-
-# valid_evals → “Number of candidates that produced valid evaluations”
-
-# skipped → “Candidates discarded due to invalid geometry or outputs”
-
-# best_total → “Objective plus penalties for the best solution”
-
-# best_objective → “Aerodynamic objective value only”
-
-# best_penalty → “Constraint violation penalty (zero means fully valid)”
-
-# best_CL / best_CD → “Predicted lift and drag for the optimized foil”
-
-# best_fix_mode → “Internal geometry orientation correction”
+    nom_optimize()
