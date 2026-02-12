@@ -1,33 +1,88 @@
-# Python
+# ============================================================
+# Python cache / compiled files
+# ============================================================
 __pycache__/
-*.pyc
+*.py[cod]
 *.pyo
 *.pyd
 
-# Virtual env
+# ============================================================
+# Virtual environments
+# ============================================================
 .venv/
 venv/
+env/
 
-# OS / editor
+# ============================================================
+# Jupyter
+# ============================================================
+.ipynb_checkpoints/
+
+# ============================================================
+# OS / Editor
+# ============================================================
 .DS_Store
+Thumbs.db
 .vscode/
 .idea/
 
-# Outputs (keep your summaries if you want)
-outputs/*
-!outputs/nom_summary.json
-!outputs/nom_history.json
-!outputs/*.png
-!outputs/*coords*.csv
-!outputs/*latent*.npy
+# ============================================================
+# Logs / temporary files
+# ============================================================
+*.log
+*.tmp
 
-# Big datasets / generated folders (don’t push these)
-airfoils_png/
-airfoils_txt/
-data/coord_*
+# ============================================================
+# Testing / coverage
+# ============================================================
+.pytest_cache/
+.coverage
+htmlcov/
 
-# Model checkpoints (these can be huge; push only if your team wants them in repo)
+# ============================================================
+# Build / packaging
+# ============================================================
+build/
+dist/
+*.egg-info/
+
+# ============================================================
+# Model weights / checkpoints (usually large)
+# Only track if team explicitly agrees
+# ============================================================
 *.h5
 *.keras
 *.ckpt
 *.weights.h5
+*.pth
+*.pt
+*.onnx
+
+# ============================================================
+# Large datasets / generated geometry
+# ============================================================
+airfoils_png/
+airfoils_txt/
+data/coord_*
+
+# ============================================================
+# NOM / Optimization outputs
+# Ignore everything in outputs by default,
+# but keep useful summary + final design artifacts
+# ============================================================
+outputs/*
+
+# Allow summaries
+!outputs/nom_summary.json
+!outputs/nom_history.json
+
+# Allow best geometry artifacts
+!outputs/*coords*.csv
+!outputs/*latent*.npy
+!outputs/*.png
+
+# ============================================================
+# Optional: If you generate plots in root directory
+# ============================================================
+*.svg
+*.pdf
