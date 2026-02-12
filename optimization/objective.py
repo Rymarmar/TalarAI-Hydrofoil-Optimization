@@ -1,47 +1,40 @@
-import numpy as np
+"""
+objective.py
 
-# Purpose:
-#   Define "what we are trying to optimize" (performance only)
-#   Constraints are NOT handled here. Constraints live in constraints.py
-#
-# Key idea:
-#   We want good L/D. Minimizing CD/CL is equivalent to maximizing CL/CD
-#   We avoid abs(CL) now because we explicitly constrain CL with penalties
+Performance objective ONLY (no constraints here).
 
+What we optimize:
+  minimize  CD / CL
+This is equivalent to maximizing CL / CD, but writing it as CD/CL keeps the
+"minimize" direction consistent with our NOM loop.
 
-def cd_over_abscl(CL: float, CD: float, eps: float = 1e-9) -> float:
-    """
-    Sponsor-safe / sign-invariant objective
-    Minimizes CD / |CL| so negative CL doesn't crash the objective
-    Now for debugging/comparison
-    """
-    return float(CD) / max(float(abs(CL)), eps)
+Why no huge penalties here?
+- Constraints belong in constraints.py (NOM style: objective + lambdas*ReLU(violations))
+- If CL <= 0, CD/CL stops making physical sense for "positive lift" designs,
+  so we return +inf and let constraints/optimizer reject it naturally.
+"""
+
+from __future__ import annotations
+
+import math
 
 
 def cd_over_cl(CL: float, CD: float, eps: float = 1e-9) -> float:
-    """
-    Physical objective:
-      minimize CD/CL (maximize CL/CD)
-    If CL <= 0, we return a huge value because it's not physically acceptable
-    for the chosen coordinate convention (positive lift only)
-    """
     CL = float(CL)
     CD = float(CD)
 
-    # basic safety checks
-    if not np.isfinite(CL) or not np.isfinite(CD):
+    # Keep this file lightweight: we only need finiteness checks.
+    if not (math.isfinite(CL) and math.isfinite(CD)):
         return float("inf")
 
-    # if CL is negative/near zero, this is "bad", so make objective huge
-    if CL <= eps:
-        return 1e9
+    # Meeting note (Objective action item):
+    # The core objective should stay as CD/(CL+eps). No other hidden terms.
+    # We only require CL > 0 so the ratio is physically meaningful.
+    if CL <= 0.0:
+        return float("inf")
 
-    return CD / max(CL, eps)
+    return CD / (CL + eps)
 
 
 def default_objective(CL: float, CD: float) -> float:
-    """
-    This is the objective used by NOM
-    We use CD/CL because constraints.py now enforces a valid CL range
-    """
     return cd_over_cl(CL, CD)

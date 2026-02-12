@@ -1,151 +1,144 @@
 """
-Purpose:
-  Define how a 6-parameter latent design becomes a physical airfoil coordinate set,
-  and how we evaluate it using NeuralFoil (CL/CD).
+pipeline/talarai_pipeline.py
 
-Key flow:
-  latent(6) → scale → decoder → y80 (upper40 + lower40)
-  y80 + fixed x-grid → (x,y) coordinates
-  coords → NeuralFoil → CL, CD
+latent(6) -> decoder -> y80 (upper40 + lower40) -> coords(80x2) -> NeuralFoil -> CL, CD
+
+Meeting fixes:
+  - No scaler
+  - Coordinate orientation matches .dat loop: 1 -> 0 -> 1
+  - Optional debug prints
 """
+
+from __future__ import annotations
 
 from pathlib import Path
 import numpy as np
 from tensorflow.keras.models import load_model
 import neuralfoil as nf
 
-# decoder model and scaler params are loaded from disk
-BASE_DIR = Path(__file__).resolve().parent
-DECODER_MODEL_PATH = BASE_DIR / "decoder_model_6x100x1000x80.h5"
-SCALER_PATH = BASE_DIR / "scaler_params.npz"
-# feeds the decoder latents in the same normalized scale it was trained on
 
-#  helper that standardizes outputs into Python floats 
-def _to_scalar(x):
-    """Convert numpy scalars/arrays to a normal Python float."""
-    if x is None:
-        raise ValueError("Got None where a numeric value was expected.")
-    if isinstance(x, (int, float)):
-        return float(x)
+BASE_DIR = Path(__file__).resolve().parent
+
+CANDIDATE_DECODER_FILES = [
+    BASE_DIR / "decoder_model_6x100x1000x80.weights.h5",
+    BASE_DIR / "decoder_model_6x100x1000x80.h5",
+]
+
+
+def _to_float(x) -> float:
     arr = np.asarray(x)
-    if arr.ndim == 0:
-        return float(arr)
-    return float(arr.ravel()[0])
+    return float(arr.reshape(-1)[0])
 
 
 class TalarAIPipeline:
-    def __init__(self, n_points: int = 40):
-        # number of points per surface (upper 40 + lower 40 = 80 total y-values)
+    def __init__(self, n_points: int = 40, decoder_model_path: str | Path | None = None):
         self.n_points = int(n_points)
+        if self.n_points <= 1:
+            raise ValueError("n_points must be >= 2")
 
-        # common x-grid from LE (0) to TE (1) (to match the decoder model and scaler arrays)
-        self.x_common = np.linspace(0.0, 1.0, self.n_points).astype(np.float32)
+        # .dat loop convention:
+        # upper surface TE->LE (x: 1 -> 0)
+        # lower surface LE->TE (x: 0 -> 1)
+        self.x_grid = np.linspace(0.0, 1.0, self.n_points).astype(np.float32)
+        self.x_upper = self.x_grid[::-1]
+        self.x_lower = self.x_grid
 
-        # load decoder and scaler
-        if not DECODER_MODEL_PATH.exists():
-            raise FileNotFoundError(f"Decoder model not found at: {DECODER_MODEL_PATH}")
-        if not SCALER_PATH.exists():
-            raise FileNotFoundError(f"Scaler params not found at: {SCALER_PATH}")
+        # Load decoder model
+        if decoder_model_path is not None:
+            model_path = Path(decoder_model_path)
+            if not model_path.exists():
+                raise FileNotFoundError(f"Decoder model not found at: {model_path}")
+            found = model_path
+        else:
+            found = None
+            for p in CANDIDATE_DECODER_FILES:
+                if p.exists():
+                    found = p
+                    break
+            if found is None:
+                raise FileNotFoundError(
+                    "Decoder model not found. Tried:\n  - " + "\n  - ".join(str(p) for p in CANDIDATE_DECODER_FILES)
+                )
 
-        self.decoder = load_model(str(DECODER_MODEL_PATH), compile=False)
+        self.decoder_path = found
+        self.decoder = load_model(str(found), compile=False)
 
-        scaler_data = np.load(str(SCALER_PATH))
-        self.scaler_mean = scaler_data["mean"].astype(np.float32)
-        self.scaler_scale = scaler_data["scale"].astype(np.float32)
-        self.scaler_scale = np.where(self.scaler_scale == 0, 1.0, self.scaler_scale)
-
-    def latent_to_y80(self, latent_vec):
+    def latent_to_y(self, latent_vec: np.ndarray, debug: bool = False) -> np.ndarray:
         """
-        6D latent → normalized → decoder → y80
+        latent -> decoder -> y (2*n_points,)
 
-        y80 layout:
-          first 40 values = upper surface y(x)
-          next  40 values = lower surface y(x)
+        Layout from training:
+          y[:n_points] = upper y values (stored in 0->1 direction)
+          y[n_points:] = lower y values (stored in 0->1 direction)
+
+        When making coords, we flip the UPPER y to match x_upper (1->0).
         """
-        latent_vec = np.asarray(latent_vec, dtype=np.float32).reshape(1, -1)
-        if latent_vec.shape[1] != 6:
-            raise ValueError(f"Expected latent vector length 6, got {latent_vec.shape}")
+        z = np.asarray(latent_vec, dtype=np.float32).reshape(1, -1)
+        if z.shape[1] != 6:
+            raise ValueError(f"Expected latent length 6, got {z.shape}")
 
-        # match training normalization
-        latent_scaled = (latent_vec - self.scaler_mean) / self.scaler_scale
+        y = self.decoder.predict(z, verbose=0)[0].astype(np.float32)
+        expected = (2 * self.n_points,)
+        if y.shape != expected:
+            raise ValueError(f"Decoder returned {y.shape}, expected {expected}")
 
-        # decoder outputs shape (80,)
-        y80 = self.decoder.predict(latent_scaled, verbose=0)[0].astype(np.float32)
-        return y80
+        if debug:
+            print("Decoder output length:", len(y))
+        return y
 
-    def latent_to_coordinates(self, latent_vec):
+    def latent_to_coordinates(self, latent_vec: np.ndarray, debug: bool = False) -> np.ndarray:
         """
-        Build foil coordinates in a single, consistent convention
+        coords shape: (2*n_points, 2)
 
-        Convention used:
-          - upper surface: x 0→1
-          - lower surface: x 1→0 (reverse x)
-          - lower y is reversed to match x reversal
-
-        This produces one closed-ish loop around the airfoil
+        Upper: x = 1->0, y = reverse(y_upper)
+        Lower: x = 0->1, y = y_lower
         """
-        y80 = self.latent_to_y80(latent_vec)
+        y = self.latent_to_y(latent_vec, debug=debug)
+        y_upper = y[: self.n_points]
+        y_lower = y[self.n_points :]
 
-        y_upper = y80[: self.n_points]
-        y_lower = y80[self.n_points :]
+        y_upper_rev = y_upper[::-1]
 
-        x_upper = self.x_common
-        x_lower = self.x_common[::-1]
-        y_lower_rev = y_lower[::-1]
+        if debug:
+            print("\n--- Coordinate Construction ---")
+            print("x_upper (1→0):", self.x_upper[:5], "...", self.x_upper[-5:])
+            print("y_upper (1→0):", y_upper_rev[:5], "...", y_upper_rev[-5:])
+            print("x_lower (0→1):", self.x_lower[:5], "...", self.x_lower[-5:])
+            print("y_lower (0→1):", y_lower[:5], "...", y_lower[-5:])
 
-        x_coords = np.concatenate([x_upper, x_lower])
-        y_coords = np.concatenate([y_upper, y_lower_rev])
-
+        x_coords = np.concatenate([self.x_upper, self.x_lower])
+        y_coords = np.concatenate([y_upper_rev, y_lower])
         coords = np.stack([x_coords, y_coords], axis=1).astype(np.float32)
+
+        if debug:
+            print(f"Coordinates shape: {coords.shape} (should be {(2*self.n_points,2)})")
+
         return coords
 
-    # Two functions for evaluation steps
-    def _eval_coords_neuralfoil(self, coords, alpha, Re, model_size):
-        """
-        Run NeuralFoil on coordinates at a single operating point (alpha, Re).
-        """
-        aero = nf.get_aero_from_coordinates(
-            coordinates=coords,
-            alpha=alpha,
-            Re=Re,
-            model_size=model_size,
-        )
-        out = dict(aero)
-        out["coords"] = coords
-        return out
-
-    # Pass coordinates through NF with alpha and Re, and extract CL/CD for use later
     def eval_latent_with_neuralfoil(
         self,
-        latent_vec,
-        alpha=6.0,
-        Re=5e5,
-        model_size="xlarge",
-    ):
-        """
-        Main evaluation function used by NOM:
+        latent_vec: np.ndarray,
+        alpha: float = 6.0,
+        Re: float = 5e5,
+        model_size: str = "xlarge",
+        debug: bool = False,
+    ) -> dict:
+        coords = self.latent_to_coordinates(latent_vec, debug=debug)
 
-          latent → coords → NeuralFoil → CL, CD
+        # NeuralFoil API notes (for meeting):
+        #   nf.get_aero_from_coordinates(coordinates=Nx2, alpha=..., Re=...) returns a dict-like
+        #   object with keys including: "CL", "CD", and "analysis_confidence".
+        #   See NeuralFoil README for example usage and returned keys.
+        aero = nf.get_aero_from_coordinates(
+            coordinates=coords,
+            alpha=float(alpha),
+            Re=float(Re),
+            model_size=model_size,
+        )
 
-        We do NOT auto-flip/mirror to force positive CL anymore.
-        If CL comes out negative, that indicates a real convention/shape issue
-        that should be handled by constraints or data/representation.
-        """
-        coords = self.latent_to_coordinates(latent_vec)
-        out = self._eval_coords_neuralfoil(coords, alpha, Re, model_size)
-
-        out["CL"] = float(_to_scalar(out.get("CL")))
-        out["CD"] = float(_to_scalar(out.get("CD")))
+        # Copy output so we don’t mutate whatever NeuralFoil returns.
+        out = aero if isinstance(aero, dict) else dict(aero)
         out["coords"] = coords
-
-        # for compatibility with older code
-        out["fix_mode"] = "none"
+        out["CL"] = _to_float(out.get("CL"))
+        out["CD"] = _to_float(out.get("CD"))
         return out
-
-
-if __name__ == "__main__":
-    # quick smoke test
-    pipeline = TalarAIPipeline()
-    latent = np.zeros(6, dtype=np.float32)
-    out = pipeline.eval_latent_with_neuralfoil(latent, alpha=6.0, Re=5e5)
-    print("CL:", out["CL"], "CD:", out["CD"])

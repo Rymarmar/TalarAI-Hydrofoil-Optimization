@@ -1,50 +1,36 @@
 import os
 import csv
 import numpy as np
+import matplotlib
+matplotlib.use("Agg")
 import tensorflow as tf
 from tensorflow.keras.layers import Input, Conv2D, MaxPooling2D, Flatten, Dense, Dropout
 from tensorflow.keras.models import Model
 from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.preprocessing.image import load_img, img_to_array
-from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau, ModelCheckpoint
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
+import winsound
 
 # ============================================================
-# Paths (match YOUR repo)
-# ============================================================
-REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-
-ENCODE_DIR = os.path.join(REPO_ROOT, "airfoils_png")
-TXT_DIR = os.path.join(REPO_ROOT, "airfoils_txt")
-
-DATA_DIR = os.path.join(REPO_ROOT, "data")
-PIPELINE_DIR = os.path.join(REPO_ROOT, "pipeline")
-os.makedirs(DATA_DIR, exist_ok=True)
-os.makedirs(PIPELINE_DIR, exist_ok=True)
-
-# Outputs (match final pipeline expectations)
-OUT_CSV = os.path.join(DATA_DIR, "airfoil_latent_params.csv")
-OUT_NPY = os.path.join(DATA_DIR, "airfoil_latent_params.npy")
-
-# IMPORTANT: Keras requires save_weights filenames to end with ".weights.h5"
-AUTOENCODER_WEIGHTS = os.path.join(PIPELINE_DIR, "autoencoder_6params.weights.h5")
-ENCODER_WEIGHTS = os.path.join(PIPELINE_DIR, "encoder_6params.weights.h5")
-
-# Safety checkpoint (saves best weights during training)
-CHECKPOINT_PATH = os.path.join(PIPELINE_DIR, "autoencoder_6params_best.weights.h5")
-
-# ============================================================
-# Settings
+# SETTINGS
 # ============================================================
 IMG_SIZE = 256
 BATCH_SIZE = 32
 EPOCHS = 80
 N_PARAMS = 6
 
+AUTOENCODER_WEIGHTS = f"autoencoder_{N_PARAMS}params.weights.h5"
+ENCODER_WEIGHTS = f"encoder_{N_PARAMS}params.weights.h5"
+ENCODE_DIR = "airfoils_png"
+TXT_DIR = "airfoils_txt"
+OUT_CSV = f"airfoil_latent_params_{N_PARAMS}.csv"
+OUT_NPY = f"airfoil_latent_params_{N_PARAMS}.npy"
+
 np.random.seed(42)
 tf.random.set_seed(42)
 
 # ============================================================
-# Load data
+# LOAD DATA
 # ============================================================
 def load_png_folder(folder, img_size=IMG_SIZE):
     files = [f for f in os.listdir(folder) if f.lower().endswith(".png")]
@@ -59,7 +45,6 @@ def load_png_folder(folder, img_size=IMG_SIZE):
         X.append(arr)
     return np.array(X, dtype="float32"), files
 
-
 def load_y_values(file_list, txt_dir, n_points=80):
     y_data = []
     for fname in file_list:
@@ -73,69 +58,64 @@ def load_y_values(file_list, txt_dir, n_points=80):
         y_data.append(data)
     return np.array(y_data, dtype=np.float32)
 
-
 print("Loading PNGs...")
 X_imgs, file_list = load_png_folder(ENCODE_DIR)
-print(f"Loaded PNGs: {X_imgs.shape}")
+print(f"Loaded PNGs. Shape: {X_imgs.shape}")
 
 print("Loading y-values...")
 y_values = load_y_values(file_list, TXT_DIR, n_points=80)
-print(f"Loaded y-values: {y_values.shape}")
+print(f"Loaded y-values. Shape: {y_values.shape}")
 
 # ============================================================
-# Build autoencoder: PNG -> 6 -> 80
+# BUILD FULL AUTOENCODER: PNG → 6 → 80
 # ============================================================
+print("\nBuilding full autoencoder (encoder + decoder)...")
 inp_img = Input(shape=(IMG_SIZE, IMG_SIZE, 1), name="image")
 
-# Encoder
-x = Conv2D(32, (3, 3), activation="relu", padding="valid")(inp_img)
-x = MaxPooling2D((2, 2))(x)
-x = Conv2D(64, (3, 3), activation="relu", padding="valid")(x)
-x = MaxPooling2D((2, 2))(x)
-x = Conv2D(128, (3, 3), activation="relu", padding="valid")(x)
-x = MaxPooling2D((3, 3))(x)
-x = Conv2D(256, (3, 3), activation="relu", padding="valid")(x)
-x = MaxPooling2D((3, 3))(x)
+# --- ENCODER
+x = Conv2D(32, (3,3), activation='relu', padding='valid')(inp_img)
+x = MaxPooling2D((2,2))(x)
+x = Conv2D(64, (3,3), activation='relu', padding='valid')(x)
+x = MaxPooling2D((2,2))(x)
+x = Conv2D(128, (3,3), activation='relu', padding='valid')(x)
+x = MaxPooling2D((3,3))(x)
+x = Conv2D(256, (3,3), activation='relu', padding='valid')(x)
+x = MaxPooling2D((3,3))(x)
 x = Flatten()(x)
-x = Dense(1000, activation="relu")(x)
-x = Dense(100, activation="relu")(x)
+x = Dense(1000, activation='relu')(x)
+x = Dense(100, activation='relu')(x)
 x = Dropout(0.05)(x)
 
-latent = Dense(N_PARAMS, activation="linear", name="latent")(x)
+latent = Dense(N_PARAMS, activation='linear', name=f"latent_{N_PARAMS}")(x)
 
-# Decoder (latent -> y80)
-x_dec = Dense(100, activation="relu")(latent)
-x_dec = Dense(1000, activation="relu")(x_dec)
-y_out = Dense(80, activation="linear", name="y_reconstructed")(x_dec)
+# --- DECODER
+x_dec = Dense(100, activation='relu')(latent)
+x_dec = Dense(1000, activation='relu')(x_dec)
+y_out = Dense(80, activation='linear', name="y_reconstructed")(x_dec)
 
+# Full autoencoder
 autoencoder = Model(inp_img, y_out)
 autoencoder.compile(optimizer=Adam(5e-4), loss="mse")
+autoencoder.summary()
 
+# Extract encoder for later
 encoder = Model(inp_img, latent)
 
 # ============================================================
-# Train or load
+# TRAIN OR LOAD
 # ============================================================
 if os.path.exists(AUTOENCODER_WEIGHTS):
     autoencoder.load_weights(AUTOENCODER_WEIGHTS)
-    print(f"✓ Loaded autoencoder weights from {AUTOENCODER_WEIGHTS}")
+    print(f"\n✓ Loaded autoencoder from {AUTOENCODER_WEIGHTS}")
 else:
-    print("🔄 Training autoencoder...")
+    print("\n🔄 Training autoencoder (PNG → 6 params → 80 y-values)...")
 
     cbs = [
         EarlyStopping(monitor="val_loss", patience=15, restore_best_weights=True, verbose=1),
         ReduceLROnPlateau(monitor="val_loss", factor=0.5, patience=5, min_lr=1e-6, verbose=1),
-        # Saves the best weights DURING training (so you never lose progress again)
-        ModelCheckpoint(
-            filepath=CHECKPOINT_PATH,
-            monitor="val_loss",
-            save_best_only=True,
-            save_weights_only=True,
-            verbose=1
-        ),
     ]
 
-    autoencoder.fit(
+    history = autoencoder.fit(
         X_imgs, y_values,
         validation_split=0.1,
         epochs=EPOCHS,
@@ -145,19 +125,31 @@ else:
         verbose=1
     )
 
-    # Save final weights safely
     autoencoder.save_weights(AUTOENCODER_WEIGHTS)
-    print(f"✓ Saved final autoencoder weights to {AUTOENCODER_WEIGHTS}")
+    print(f"\n✓ Saved autoencoder to {AUTOENCODER_WEIGHTS}")
+
+    full_loss = autoencoder.evaluate(X_imgs, y_values, batch_size=BATCH_SIZE, verbose=0)
+    print(f"✓ Final loss: {full_loss:.6f}")
+
+    log_csv = "training_log.csv"
+    best_val_loss = min(history.history["val_loss"])
+    file_exists = os.path.exists(log_csv)
+
+    with open(log_csv, "a", newline="") as f:
+        writer = csv.writer(f)
+        if not file_exists:
+            writer.writerow(["N_PARAMS", "final_loss", "best_val_loss"])
+        writer.writerow([N_PARAMS, full_loss, best_val_loss])
 
 # ============================================================
-# Encode all PNGs -> latent params
+# EXTRACT ENCODER: PNG → 6 PARAMS
 # ============================================================
-print("📊 Encoding all airfoils...")
+print("\n📊 Encoding all airfoils with encoder...")
 params_out = encoder.predict(X_imgs, batch_size=BATCH_SIZE, verbose=1)
-print(f"✓ Encoded {len(params_out)} airfoils into {N_PARAMS}-D latent space")
+print(f"✓ Encoded {len(params_out)} airfoils into {N_PARAMS}-D space")
 
 # ============================================================
-# Save outputs to data/
+# SAVE OUTPUTS
 # ============================================================
 np.save(OUT_NPY, params_out)
 with open(OUT_CSV, "w", newline="") as f:
@@ -166,8 +158,13 @@ with open(OUT_CSV, "w", newline="") as f:
     for fname, vec in zip(file_list, params_out):
         writer.writerow([fname] + vec.tolist())
 
-encoder.save_weights(ENCODER_WEIGHTS)
-print(f"✓ Saved encoder weights to {ENCODER_WEIGHTS}")
+print(f"✓ Saved to {OUT_CSV} and {OUT_NPY}")
 
-print(f"✓ Saved latents to:\n  {OUT_CSV}\n  {OUT_NPY}")
-print("✅ ENCODER COMPLETE")
+encoder.save_weights(ENCODER_WEIGHTS)
+print(f"✓ Saved encoder to {ENCODER_WEIGHTS}")
+
+print("\n" + "="*50)
+print("✓ ENCODER COMPLETE")
+print("="*50)
+
+winsound.MessageBeep()
