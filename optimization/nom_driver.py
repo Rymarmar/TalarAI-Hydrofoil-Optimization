@@ -109,6 +109,7 @@ def nom_optimize(
     #   - CL_min_flying ~ 0.697
     #   - CL_vmax ~ 0.11
     # A reasonable first window for early NOM runs is [0.10, 0.80].
+    # BEFORE CL REQUIREMENTS CALCULATIONS
     cl_min: float | None = 0.10,
     cl_max: float | None = 0.80,
     out_dir: str = "outputs",
