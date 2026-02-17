@@ -66,7 +66,7 @@ def main():
     upper_decreasing = bool(np.all(np.diff(x_upper) <= 1e-8))
     lower_increasing = bool(np.all(np.diff(x_lower) >= -1e-8))
 
-    y_upper_expected = y80_direct[:40][::-1]
+    y_upper_expected = y80_direct[:40]#[::-1]
     y_lower_expected = y80_direct[40:]
 
     y_upper_from_coords = y[:40]

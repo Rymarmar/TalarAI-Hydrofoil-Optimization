@@ -50,14 +50,32 @@ HOW THE BOUNDS WORK (professor's action item):
 ---------------------------------------------------------------------------
 WHY WE DO A "SEED SEARCH" BEFORE THE MAIN LOOP:
 ---------------------------------------------------------------------------
-  In a previous run, the optimizer's very FIRST "best" was already a bad foil
-  with surfaces crossing (tmin < 0). Because 75% of subsequent proposals
-  are LOCAL refinements around the current best, all 800 iterations explored
-  the same invalid region of latent space and the output was garbage.
-
-  FIX: Before the main loop, try n_seed_tries random foils from the TRAINING
+  Before the main loop, we try n_seed_tries random foils from the TRAINING
   DATASET (these are known real foils). Use the best valid one as the
   starting point. This guarantees local refinement begins from a good foil.
+---------------------------------------------------------------------------
+
+---------------------------------------------------------------------------
+NOTE ON min_thickness (CRITICAL -- why it changed from 0.04 to 0.006):
+---------------------------------------------------------------------------
+  The training dataset is the UIUC Airfoil Database (~1600 foils).
+  This includes thin glider, RC aircraft, and sailplane foils -- NOT just
+  thick hydrofoil sections. Running diagnose_seed_failure.py revealed that
+  100% of the training foils fail the too_thin check when min_thickness=0.04,
+  because the actual dataset minimum interior thickness is only 0.0071.
+
+  Setting min_thickness=0.04 meant the seed search rejected every single
+  known-good training foil, leaving the main loop with no starting point
+  and 100% global exploration from iteration 1.
+
+  FIX: Set min_thickness = 0.006 (slightly below the dataset minimum of 0.0071).
+  This was computed by diagnose_seed_failure.py:
+      Raw interior min_thickness: min=0.0071, mean=0.0142
+      Suggested: 0.0071 * 0.9 = 0.0064 --> rounded to 0.006
+
+  Physical meaning: any foil thinner than 0.6% chord in the interior
+  is rejected. This is a genuine structural impossibility -- no real foil
+  in our training data is that thin.
 ---------------------------------------------------------------------------
 """
 
@@ -282,13 +300,10 @@ def find_valid_seed(pipeline: TalarAIPipeline,
       geometry checks and has a finite CD/CL score).
 
     WHY THIS IS CRITICAL:
-      In the old run, the first "best" foil was actually physically impossible
-      (surfaces crossed, tmin < 0). Since 75% of proposals after that were
-      LOCAL refinements around the "best", all 800 iterations explored the
-      same invalid region. The output was a nonsense foil shape.
-
-      By starting from a KNOWN VALID training foil, we guarantee that local
-      refinement begins from somewhere good.
+      Without a valid seed, the first "best" could be a physically impossible
+      foil (e.g. surfaces crossed). Since 75% of proposals after that are LOCAL
+      refinements around the "best", all iterations would explore the same
+      invalid region. This guarantees local refinement begins from a good foil.
 
     HOW IT CONNECTS:
       Called once at the start of nom_optimize(), before the main loop.
@@ -369,10 +384,10 @@ def find_valid_seed(pipeline: TalarAIPipeline,
 def nom_optimize(
     *,
     # --- Operating conditions (fixed for the entire run) ---
-    alpha: float = 6.0,    # Angle of attack in degrees
-                            # 6° is a reasonable cruise AoA for hydrofoils
-    Re:    float = 5e5,    # Reynolds number (Re = V * chord / nu)
-                            # 5e5 corresponds to 1/15 scale model test conditions
+    alpha: float = 6.0,    # Angle of attack in degrees.
+                            # 6° is a reasonable cruise AoA for hydrofoils.
+    Re:    float = 5e5,    # Reynolds number (Re = V * chord / nu).
+                            # 5e5 corresponds to 1/15 scale model test conditions.
 
     # --- How many iterations to run ---
     n_iters: int = 3000,   # Total number of candidate foils to try.
@@ -380,12 +395,21 @@ def nom_optimize(
                             # 3000 is enough to converge in most cases.
 
     # --- Learning rate for local proposals ---
-    learning_rate_init: float = 5e-3,   # Initial step size for local nudges.
-                                         # 5e-3 gives bigger early steps so the
-                                         # optimizer actually explores after seeding.
-    lr_decay:           float = 0.999,  # Multiply lr by this each iteration.
-                                         # 0.999 means lr shrinks slowly so
-                                         # early steps explore, late steps refine.
+    # ACTION ITEM (meeting): "Learning Rate: 1e-3 or less"
+    # The learning rate controls how BIG each local step is when we nudge the
+    # current best latent vector to try nearby shapes.
+    #
+    # What it physically means:
+    #   - Large lr (e.g. 0.1): big jumps in latent space --> very different foil shapes
+    #   - Small lr (e.g. 0.001): tiny tweaks --> almost the same foil shape
+    #
+    # We use 1e-3 (0.001) as requested. This keeps local proposals close to the
+    # current best, which is appropriate once the seed search gives us a good
+    # starting foil to refine from.
+    learning_rate_init: float = 1e-3,   # Starting step size. 1e-3 = 0.001 (as requested).
+    lr_decay:           float = 0.999,  # Each iteration: lr = lr * 0.999.
+                                         # After 1000 iters: lr ~= 0.000368
+                                         # After 3000 iters: lr ~= 0.000050
 
     # --- Global vs local proposal balance ---
     # p_local: fraction of iterations that use local refinement (vs global).
@@ -398,69 +422,76 @@ def nom_optimize(
     # These control how strongly each constraint pulls against the CD/CL objective.
     # Think of them as "how many units of CD/CL improvement does it take to
     # justify violating this constraint by 1 unit?"
-    lam_bounds: float = 1.0,    # Penalty weight for latent out-of-bounds
-                                  # (keeps optimizer in decoder's trained range)
+    lam_bounds: float = 1.0,    # Penalty weight for latent out-of-bounds.
+                                  # Keeps optimizer in decoder's trained range.
     lam_geom:   float = 25.0,   # Penalty weight for soft geometry violations
                                   # (TE/LE gaps). Hard violations always return inf.
-    lam_cl:     float = 50.0,   # Penalty weight for CL outside designer's window
-                                  # (enforces minimum lift and avoids cavitation)
-                                  # Raised from 10 -> 50 so CL violations actually
-                                  # hurt enough to push the optimizer back in bounds
+    lam_cl:     float = 10.0,   # Penalty weight for CL outside designer's window.
+                                  # 10.0 means a CL miss of 0.1 adds 1.0 to the score,
+                                  # which is significant relative to CD/CL ~ 0.02-0.05.
+                                  # Kept at 10 (not 50) to avoid over-constraining CL
+                                  # and driving up CD unnecessarily.
 
     # --- Geometry hard limits ---
     # These define what counts as a "real" foil shape. Violations are hard rejects.
-    min_thickness:  float = 0.04,   # Minimum allowed foil thickness (chord fraction)
-                                     # Set from the MINIMUM thickness observed across
-                                     # ALL training airfoils in the dataset.
-    max_thickness:  float = 0.14,   # Maximum allowed thickness (chord fraction)
+    # All values derived from actual dataset statistics (diagnose_seed_failure.py).
+    #
+    # CRITICAL FIX: min_thickness changed from 0.04 to 0.006.
+    # WHY: diagnose_seed_failure.py showed 100% of training foils fail at 0.04.
+    # The UIUC dataset contains thin glider/RC foils where min interior thickness
+    # is as low as 0.0071 chord. The dataset-minimum * 0.9 = 0.0064 ~ 0.006.
+    # Using 0.04 was rejecting every known-good training foil in the seed search,
+    # leaving the optimizer with no valid starting point.
+    min_thickness:  float = 0.006,  # Minimum interior thickness (chord fraction).
+                                     # Derived from dataset min (0.0071) * 0.9.
+                                     # Rejects only truly impossible paper-thin shapes.
+
+    max_thickness:  float = 0.157,  # Maximum interior thickness (chord fraction).
+                                     # Derived from dataset max (0.1427) * 1.1.
                                      # Prevents unrealistic "blob" shapes.
-    camber_max_abs: float = 0.05,   # Maximum mean camber line deviation
-                                     # Real airfoils rarely exceed ~0.12 camber.
-    te_gap_max:     float = 0.01,   # Max allowed trailing edge gap (soft penalty)
-    le_gap_max:     float = 0.01,   # Max allowed leading edge gap (soft penalty)
+
+    camber_max_abs: float = 0.076,  # Maximum mean camber line deviation.
+                                     # Derived from dataset max (0.0693) * 1.1.
+                                     # Real airfoils in our dataset stay below this.
+
+    te_gap_max:     float = 0.01,   # Max allowed trailing edge gap (soft penalty).
+    le_gap_max:     float = 0.01,   # Max allowed leading edge gap (soft penalty).
 
     # --- CL operating window ---
-    # The foil must generate enough lift (cl_min) without risking cavitation (cl_max).
-    # Set to None to disable either bound (e.g., cl_min=None means any CL is ok).
-    cl_min: float | None = 0.30,   # Minimum CL -- foil must generate this much lift
-    cl_max: float | None = 0.85,   # Maximum CL -- above this risks cavitation
-                                    # Raised from 0.70: previous run best CL=0.745
-                                    # was being penalized for exceeding 0.70, causing
-                                    # optimizer to diverge. 0.85 gives real headroom.
+    # ACTION ITEM (meeting): "Cl_min, cl_max - change the numbers"
+    #
+    # cl_min = 0.30: minimum lift required to fly the boat at Re=5e5.
+    #   Below 0.3, the foil generates too little force at our operating speed.
+    #
+    # cl_max = 0.85: maximum safe lift before cavitation risk at Re=5e5.
+    #   Above ~0.85, vapor bubbles form on the suction surface and can
+    #   damage the foil. Also: very high CL usually means very high CD.
+    #
+    # Set either to None to disable that bound entirely.
+    cl_min: float | None = 0.30,
+    cl_max: float | None = 0.85,
 
-    # --- Seed search: how many real training foils to try before the main loop ---
+    # --- Seed search ---
     n_seed_tries: int = 200,   # Number of dataset foils to test before starting.
                                 # Higher = better chance of a good starting point.
 
-    out_dir: str = "outputs",   # Directory where all output files are saved
+    out_dir: str = "outputs",
 ):
     """
-    Run the full NOM (Neural Optimization Machine) optimization loop and
-    save the best foil shape found.
+    Run the full NOM optimization loop and save the best foil shape found.
 
     OUTPUTS SAVED TO out_dir/:
       best_latent_nom.npy    -- the 6 best latent parameters as numpy array
-      best_latent_nom.csv    -- same, in CSV format (for use in other scripts)
+      best_latent_nom.csv    -- same, in CSV format
       best_coords_nom.csv    -- the 80x2 foil coordinates of the best shape
       nom_history.json       -- log of every valid iteration (CL, CD, scores)
       nom_summary.json       -- final summary (best CL, CD, L/D, constraints used)
-
-    HOW THE LOOP WORKS:
-      iter 1..n_iters:
-        1. Propose candidate latent vector (global or local)
-        2. Evaluate: latent -> decoder -> coords -> NeuralFoil -> CL, CD
-        3. If pipeline fails (safe_eval returns None): skip, continue
-        4. Compute objective = CD/CL
-        5. Compute penalty   = total_penalty() from constraints.py
-        6. If penalty = inf (hard geometry reject): skip, continue
-        7. If obj + penalty < best so far: update best, print progress
-        8. Decay learning rate: lr *= lr_decay
     """
     out_path = Path(out_dir)
     out_path.mkdir(parents=True, exist_ok=True)
 
     # -----------------------------------------------------------------------
-    # Load the training dataset and compute latent parameter bounds
+    # Load training dataset and compute latent parameter bounds
     # -----------------------------------------------------------------------
     # These bounds define the valid search box for the optimizer.
     # They come from the actual min/max of each parameter across all training foils.
@@ -517,8 +548,8 @@ def nom_optimize(
         print("         Starting main loop with 100% global exploration.")
         print("         If the main loop also finds nothing, try:")
         print("           cl_min=None, cl_max=None   (remove CL constraint)")
-        print("           max_thickness=0.25")
-        print("           camber_max_abs=0.20")
+        print("           min_thickness=0.001")
+        print("           camber_max_abs=0.15")
 
     # -----------------------------------------------------------------------
     # Main NOM optimization loop
@@ -526,7 +557,7 @@ def nom_optimize(
     history = []   # list of dicts: one entry per valid (non-rejected) iteration
     valid   = 0    # count of iterations where the candidate passed all checks
     skipped = 0    # count of iterations where the candidate was rejected
-    lr      = float(learning_rate_init)   # current learning rate (decays each iter)
+    lr      = float(learning_rate_init)
 
     for it in range(1, n_iters + 1):
 
@@ -536,25 +567,22 @@ def nom_optimize(
         use_local = (best is not None) and (np.random.rand() < float(p_local))
 
         if use_local:
-            # LOCAL: nudge the current best latent by a small random step
             cand = propose_local(best["latent"], lr=lr, lat_lo=lat_lo, lat_hi=lat_hi)
             mode = "local"
         else:
-            # GLOBAL: completely random point in the valid latent bounds box
             cand = propose_global(lat_lo, lat_hi)
             mode = "global"
 
         # --- EVALUATE: run through decoder + NeuralFoil ---
         res = safe_eval(pipeline, cand, alpha=alpha, Re=Re)
         if res is None:
-            # Pipeline failed (bad latent, NeuralFoil crash, etc.) -- skip
             skipped += 1
-            lr *= float(lr_decay)   # still decay lr to keep pacing consistent
+            lr *= float(lr_decay)
             continue
 
         CL, CD, coords = res["CL"], res["CD"], res["coords"]
 
-        # --- OBJECTIVE: CD/CL (we want to minimize this = maximize L/D) ---
+        # --- OBJECTIVE: CD/CL (minimize = maximize L/D) ---
         obj = default_objective(CL, CD)
 
         # --- PENALTY: physical and geometric constraints ---
@@ -564,19 +592,17 @@ def nom_optimize(
         )
 
         # --- HARD REJECT: skip if penalty or objective is infinite ---
-        # pen = inf means a hard geometry violation (crossing, too thin/thick, camber)
-        # obj = inf means CL <= 0 (foil generates no positive lift)
-        # Either way, this candidate can NEVER be accepted as the best result.
+        # pen=inf: hard geometry violation (crossing, too thin/thick, camber)
+        # obj=inf: CL <= 0 (foil generates no positive lift)
         if not (np.isfinite(pen) and np.isfinite(obj)):
             skipped += 1
             lr *= float(lr_decay)
             continue
 
-        # --- This candidate is valid -- count it and score it ---
+        # --- This candidate is valid -- count and score it ---
         valid += 1
         total = float(obj + pen)
 
-        # Record this iteration in the history log
         rec = {
             "iter":               int(it),
             "mode":               mode,
@@ -594,7 +620,7 @@ def nom_optimize(
         }
         history.append(rec)
 
-        # --- UPDATE BEST: if this is the best total score so far, keep it ---
+        # --- UPDATE BEST ---
         if best is None or total < best["total"]:
             best = {**rec, "latent": cand.copy(), "coords": coords.copy()}
             print(
@@ -607,7 +633,7 @@ def nom_optimize(
                 f"lr={best['lr']:.2e}  mode={best['mode']}"
             )
 
-        # --- DECAY learning rate each iteration (local steps get smaller over time) ---
+        # --- DECAY learning rate ---
         lr *= float(lr_decay)
 
     # -----------------------------------------------------------------------
@@ -618,13 +644,12 @@ def nom_optimize(
         print("NOM found 0 valid candidates after all checks.")
         print("Try loosening these parameters in nom_optimize():")
         print("  cl_min=None, cl_max=None     (remove the CL window constraint)")
-        print("  max_thickness=0.30           (allow thicker foils)")
-        print("  camber_max_abs=0.20          (allow more camber)")
+        print("  min_thickness=0.001          (allow thinner foils)")
+        print("  camber_max_abs=0.15          (allow more camber)")
         print("  n_iters=5000                 (more iterations)")
         print("=" * 60)
         return
 
-    # Save the best latent vector (the 6 optimized parameters)
     np.save(out_path / "best_latent_nom.npy", best["latent"])
     np.savetxt(
         out_path / "best_latent_nom.csv",
@@ -634,7 +659,6 @@ def nom_optimize(
         comments=""
     )
 
-    # Save the best foil coordinates (80 x 2 array of [x, y] points)
     np.savetxt(
         out_path / "best_coords_nom.csv",
         best["coords"],
@@ -643,11 +667,9 @@ def nom_optimize(
         comments=""
     )
 
-    # Save the full iteration history (for plotting convergence)
     with open(out_path / "nom_history.json", "w", encoding="utf-8") as f:
         json.dump(history, f, indent=2)
 
-    # Save a human-readable summary of this run
     summary = {
         "alpha":               float(alpha),
         "Re":                  float(Re),

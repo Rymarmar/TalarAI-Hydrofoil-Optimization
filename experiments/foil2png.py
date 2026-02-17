@@ -65,8 +65,17 @@ for file_path in dat_files:
         # Here we store 80 points as:
         #   x = [x_common reversed (1->0), x_common (0->1)]
         #   y = [yl reversed (lower), yu (upper)]
-        x = np.concatenate([x_common[::-1], x_common])
-        y = np.concatenate([yl[::-1], yu])
+        # Upper: 1 → 0
+        x_upper = x_common[::-1]
+        y_upper = yu[::-1]
+
+        # Lower: 0 → 1
+        x_lower = x_common
+        y_lower = yl
+
+        x = np.concatenate([x_upper, x_lower])
+        y = np.concatenate([y_upper, y_lower])
+
 
         # normalize x to [0,1]
         x = (x - np.min(x)) / (np.max(x) - np.min(x) + 1e-12)

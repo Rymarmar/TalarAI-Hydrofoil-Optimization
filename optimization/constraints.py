@@ -131,9 +131,18 @@ def latent_minmax_bounds(latents: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
       lo -- shape (6,): the minimum value each parameter is allowed to have
       hi -- shape (6,): the maximum value each parameter is allowed to have
 
-    NOTE:
-      lo and hi are named to represent LOWER bound and UPPER bound.
-      These names are intentional: lo = lower bound, hi = upper bound.
+    NOTE on naming -- lo and hi:
+      ACTION ITEM (meeting): "change lo and hi (we kept lo and hi to represent
+      the upper and lower bounds of the LATENT PARAMETER RANGE, not airfoil surfaces)"
+      lo = lower bound of the allowed range  (the MINIMUM value each param can be)
+      hi = upper bound of the allowed range  (the MAXIMUM value each param can be)
+
+      Example: if p3 ranged from -0.09 to 3.32 across training data,
+        lo[2] = -0.09   (p3 cannot go below this)
+        hi[2] =  3.32   (p3 cannot go above this)
+
+      These have NOTHING to do with the upper/lower surfaces of the airfoil.
+      They are purely the allowed numeric range for each of the 6 latent parameters.
     """
     Z = np.asarray(latents, dtype=float)
 
@@ -405,6 +414,34 @@ def geometry_penalty(coords: np.ndarray,
     thickness = yu - yl
     camber    = 0.5 * (yu + yl)
 
+    # --- HARD REJECT: Surface crossing ANYWHERE (including LE and TE) ---
+    #
+    # WHY THIS MUST COME BEFORE THE INTERIOR MASK:
+    #   The interior mask (below) only checks x in [0.05, 0.90] for
+    #   min/max thickness. This is intentional -- TE naturally tapers thin.
+    #   BUT a surface crossing (lower y > upper y) is ALWAYS physically
+    #   impossible regardless of where it occurs. A foil with lower above
+    #   upper at x=0 is not a foil at all.
+    #
+    #   Without this check, a foil where the surfaces just barely cross at
+    #   the leading edge point (e.g. lower[0].y > upper[0].y by 0.0001)
+    #   passes the interior mask check entirely and produces a pathological
+    #   shape with a sharp kink at the nose.
+    #
+    #   We use a small tolerance (-1e-4) to avoid rejecting numerically
+    #   near-perfect foils where floating-point gives thickness = -0.000001.
+    if np.any(thickness < -1e-4):
+        min_t_full = float(np.min(thickness))
+        x_cross    = float(xg[np.argmin(thickness)])
+        return float("inf"), {
+            "reason": (
+                f"HARD_REJECT surface_crossing: min_thickness={min_t_full:.6f} "
+                f"at x={x_cross:.4f} (checked full range, including LE/TE)"
+            ),
+            "min_thickness_full": min_t_full,
+            "crossing_x": x_cross,
+        }
+
     # --- Interior mask: only check thickness/camber in x = [x_min, x_max] ---
     # We deliberately EXCLUDE near the leading edge (x < 0.05) and near the
     # trailing edge (x > 0.90) because:
@@ -423,12 +460,14 @@ def geometry_penalty(coords: np.ndarray,
     max_t   = float(np.max(t_int))
     max_cam = float(np.max(np.abs(c_int)))
 
-    # --- HARD REJECT 1: Surface crossing ---
-    # thickness < 0 means the upper surface dipped BELOW the lower surface.
-    # This is geometrically impossible for a real foil. Hard reject.
+    # --- HARD REJECT: Interior surface crossing (redundant safety check) ---
+    # The full-range crossing check above already catches any crossing.
+    # This check is kept as a belt-and-suspenders guard for the interior
+    # region specifically, in case floating point produces a small negative
+    # value that slipped past the -1e-4 tolerance above.
     if min_t < 0.0:
         return float("inf"), {
-            "reason": f"HARD_REJECT surface_crossing: min_t={min_t:.5f} < 0",
+            "reason": f"HARD_REJECT surface_crossing_interior: min_t={min_t:.5f} < 0",
             "min_thickness_int": min_t,
             "max_thickness_int": max_t,
         }
@@ -546,18 +585,47 @@ def total_penalty(*,
                   lat_lo: np.ndarray,
                   lat_hi: np.ndarray,
 
-                  # lam_bounds: how strongly we penalize going outside the
-                  # decoder's trained latent range. Higher = optimizer stays
-                  # closer to foil shapes it has seen in training data.
+                  # ---------------------------------------------------------------
+                  # ACTION ITEM (meeting): "Comment the lambdas to what they mean"
+                  #
+                  # Lambda (lam_*) weights are MULTIPLIERS on each penalty term.
+                  # Think of them as: "how bad is violating this constraint
+                  # compared to having a slightly worse CD/CL?"
+                  #
+                  # The total score each iteration is:
+                  #   score = CD/CL  +  lam_bounds * p_bounds
+                  #                  +  lam_geom   * p_geom
+                  #                  +  lam_cl     * p_cl
+                  #
+                  # A higher lambda = that constraint matters MORE to the optimizer.
+                  # ---------------------------------------------------------------
+
+                  # lam_bounds = 1.0
+                  # Penalty weight for the latent parameters going OUTSIDE the range
+                  # we saw in training data. If the optimizer tries p3=5.0 when the
+                  # training data only ever had p3 up to 3.32, the decoder will
+                  # produce nonsense shapes it was never taught. We penalize this
+                  # mildly (weight=1) -- it is a soft warning, not a hard block.
                   lam_bounds: float = 1.0,
 
-                  # lam_geom: how strongly we penalize soft geometry issues
-                  # (TE/LE gaps). Hard geometry violations (crossing, thickness,
-                  # camber) always return inf regardless of this weight.
+                  # lam_geom = 25.0
+                  # Penalty weight for SOFT geometry issues (leading edge and trailing
+                  # edge gaps that are slightly too large). Hard geometry violations
+                  # (surfaces crossing, too thin, too thick, too much camber) always
+                  # return float("inf") regardless of this weight -- they are always
+                  # completely rejected. lam_geom only applies to the "almost fine"
+                  # cases like TE gap = 0.012 when limit is 0.010.
                   lam_geom: float = 25.0,
 
-                  # lam_cl: how strongly we penalize CL being outside the
-                  # designer's desired lift window [cl_min, cl_max].
+                  # lam_cl = 10.0
+                  # Penalty weight for CL being OUTSIDE the [cl_min, cl_max] window.
+                  # We need CL in a specific range so the foil actually works on the
+                  # boat at the design speed. cl_min ensures enough lift to fly;
+                  # cl_max prevents cavitation (bubbles forming on the foil surface
+                  # which causes violent vibration and loss of lift).
+                  # Weight=10 means a CL violation of 0.1 adds 10*0.1=1.0 to the score,
+                  # which is much larger than a typical CD/CL of 0.02 -- so the
+                  # optimizer strongly prefers to stay in the CL window.
                   lam_cl: float = 10.0,
 
                   min_thickness: float = 0.02,

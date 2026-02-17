@@ -54,7 +54,7 @@ if not os.path.exists(model_path):
     decoder.save(model_path)
 else:
     print("\n Found trained model. Loading it instead...")
-    decoder = load_model(model_path)
+    decoder = load_model(model_path,compile=False)
 
 # -----------------------------
 # Step 3: Predict and plot every 500th airfoil
