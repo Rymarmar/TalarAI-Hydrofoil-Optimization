@@ -26,13 +26,47 @@ def _load_history(outputs_dir="outputs"):
     return json.load(open(p)) if os.path.exists(p) else None
 
 
-def naca0012_y(x):
-    """NACA 0012 half-thickness at chord positions x (0..1)."""
-    return 0.12 * (0.2969 * np.sqrt(x + 1e-9)
-                   - 0.1260 * x
-                   - 0.3516 * x**2
-                   + 0.2843 * x**3
-                   - 0.1015 * x**4)
+def load_naca0012(dat_path: str | None = None):
+    """
+    Load NACA 0012 coords from the project's actual n0012.txt file.
+    Returns (x_upper, y_upper, x_lower, y_lower) all in LE->TE order.
+
+    n0012.txt is in standard Selig format:
+      - rows 0..39  = lower surface, TE->LE  (x: 1->0, y negative)
+      - rows 40..79 = upper surface, LE->TE  (x: 0->1, y positive)
+    """
+    # Search common locations relative to this script
+    candidates = []
+    if dat_path:
+        candidates.append(dat_path)
+
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    candidates += [
+        os.path.join(script_dir, "airfoils_txt", "n0012.txt"),
+        os.path.join(script_dir, "n0012.txt"),
+        os.path.join(script_dir, "..", "airfoils_txt", "n0012.txt"),
+    ]
+
+    data = None
+    for p in candidates:
+        if os.path.exists(p):
+            data = np.loadtxt(p, skiprows=1)
+            break
+
+    if data is None:
+        # Fallback: analytical NACA 0012 (only used if file not found)
+        print("WARNING: n0012.txt not found, using analytical NACA 0012")
+        x = np.linspace(0, 1, 40)
+        yt = 0.12*(0.2969*np.sqrt(x+1e-9)-0.126*x-0.3516*x**2+0.2843*x**3-0.1015*x**4)
+        return x, yt, x, -yt
+
+    # n0012.txt: rows 0-39 = lower TE->LE, rows 40-79 = upper LE->TE
+    lower_te2le = data[:40]   # x: 1->0, y: negative
+    upper_le2te = data[40:]   # x: 0->1, y: positive
+    lower_le2te = lower_te2le[::-1]  # flip to LE->TE for consistent plotting
+
+    return (upper_le2te[:, 0], upper_le2te[:, 1],
+            lower_le2te[:, 0], lower_le2te[:, 1])
 
 
 def main(
@@ -41,6 +75,7 @@ def main(
     n_points=40,
     show_naca=True,
     show_convergence=True,
+    naca_dat_path=None,   # path to n0012.txt; if None, auto-searched
 ):
     if not os.path.exists(coords_path):
         raise FileNotFoundError(f"Could not find: {coords_path}")
@@ -102,12 +137,11 @@ def main(
     ylf = np.interp(xf, lower_le2te[:,0], lower_le2te[:,1])
     ax_foil.fill_between(xf, ylf, yuf, alpha=0.15, color="#4fc3f7")
 
-    # -- NACA 0012 overlay --
+    # -- NACA 0012 overlay (loaded from actual n0012.txt) --
     if show_naca:
-        xn = np.linspace(0, 1, 300)
-        yt = naca0012_y(xn)
-        ax_foil.plot(xn,  yt, color="#ff7043", lw=1.4, ls=":", alpha=0.85, label="NACA 0012")
-        ax_foil.plot(xn, -yt, color="#ff7043", lw=1.4, ls=":", alpha=0.85)
+        xu_n, yu_n, xl_n, yl_n = load_naca0012(naca_dat_path)
+        ax_foil.plot(xu_n, yu_n, color="#ff7043", lw=1.4, ls=":", alpha=0.85, label="NACA 0012")
+        ax_foil.plot(xl_n, yl_n, color="#ff7043", lw=1.4, ls=":", alpha=0.85)
 
     ax_foil.axhline(0, color="#444466", lw=0.8)
 

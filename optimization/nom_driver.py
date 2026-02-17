@@ -380,9 +380,9 @@ def nom_optimize(
                             # 3000 is enough to converge in most cases.
 
     # --- Learning rate for local proposals ---
-    learning_rate_init: float = 1e-3,   # Initial step size for local nudges.
-                                         # 1e-3 means a small fraction of the
-                                         # latent space range per step.
+    learning_rate_init: float = 5e-3,   # Initial step size for local nudges.
+                                         # 5e-3 gives bigger early steps so the
+                                         # optimizer actually explores after seeding.
     lr_decay:           float = 0.999,  # Multiply lr by this each iteration.
                                          # 0.999 means lr shrinks slowly so
                                          # early steps explore, late steps refine.
@@ -402,8 +402,10 @@ def nom_optimize(
                                   # (keeps optimizer in decoder's trained range)
     lam_geom:   float = 25.0,   # Penalty weight for soft geometry violations
                                   # (TE/LE gaps). Hard violations always return inf.
-    lam_cl:     float = 10.0,   # Penalty weight for CL outside designer's window
+    lam_cl:     float = 50.0,   # Penalty weight for CL outside designer's window
                                   # (enforces minimum lift and avoids cavitation)
+                                  # Raised from 10 -> 50 so CL violations actually
+                                  # hurt enough to push the optimizer back in bounds
 
     # --- Geometry hard limits ---
     # These define what counts as a "real" foil shape. Violations are hard rejects.
@@ -421,7 +423,10 @@ def nom_optimize(
     # The foil must generate enough lift (cl_min) without risking cavitation (cl_max).
     # Set to None to disable either bound (e.g., cl_min=None means any CL is ok).
     cl_min: float | None = 0.30,   # Minimum CL -- foil must generate this much lift
-    cl_max: float | None = 0.70,   # Maximum CL -- above this risks cavitation
+    cl_max: float | None = 0.85,   # Maximum CL -- above this risks cavitation
+                                    # Raised from 0.70: previous run best CL=0.745
+                                    # was being penalized for exceeding 0.70, causing
+                                    # optimizer to diverge. 0.85 gives real headroom.
 
     # --- Seed search: how many real training foils to try before the main loop ---
     n_seed_tries: int = 200,   # Number of dataset foils to test before starting.

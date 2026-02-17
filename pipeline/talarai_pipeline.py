@@ -114,8 +114,10 @@ class TalarAIPipeline:
         y = self.latent_to_y(latent_vec, debug=debug)
 
         # Two candidate surfaces (both are x=0->1)
-        y_a = y[: self.n_points]
-        y_b = y[self.n_points :]
+        # y_a = y[: self.n_points] THIS IS WHAT CAUSES LOWER TO BE FLIPPED
+        y_a = y[: self.n_points][::-1]
+        y_b = y[self.n_points :] 
+        
 
         surf_a_01 = np.column_stack([self.x_grid, y_a]).astype(np.float32)
         surf_b_01 = np.column_stack([self.x_grid, y_b]).astype(np.float32)
