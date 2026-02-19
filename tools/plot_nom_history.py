@@ -158,15 +158,16 @@ def main(
         CL = summary.get("best_CL", 0)
         CD = summary.get("best_CD", 0)
         LD = CL / CD if CD > 0 else 0
-        ax_foil.text(0.97, 0.05,
-                     f"CL = {CL:.4f}   CD = {CD:.5f}\n"
-                     f"L/D = {LD:.1f}   α={summary.get('alpha','?')}°"
-                     f"   Re={summary.get('Re',0):.0e}",
-                     transform=ax_foil.transAxes,
-                     fontsize=8, va="bottom", ha="right", color="#e0e0ff",
-                     bbox=dict(boxstyle="round,pad=0.4",
-                               facecolor="#0a0a1a", alpha=0.85,
-                               edgecolor="#555588"))
+        # Stats bar placed below both subplots in figure coordinates.
+        # y=0.02 sits in the bottom margin created by subplots_adjust(bottom=0.12).
+        # x=0.5 + ha='center' centers it across the full figure width.
+        fig.text(0.5, 0.02,
+                 f"CL = {CL:.4f}     CD = {CD:.5f}     L/D = {LD:.1f}     "
+                 f"α={summary.get('alpha','?')}°     Re={summary.get('Re',0):.0e}",
+                 fontsize=9, va="bottom", ha="center", color="#e0e0ff",
+                 bbox=dict(boxstyle="round,pad=0.5",
+                           facecolor="#0a0a1a", alpha=0.85,
+                           edgecolor="#555588"))
 
     ax_foil.set_title("TalarAI Optimized Hydrofoil vs NACA 0012",
                       color="#c5cae9", fontsize=11, pad=8)
@@ -205,6 +206,8 @@ def main(
                                    edgecolor="#333366"))
 
     out_png = os.path.join(outputs_dir, "nom_plot.png")
+    # Add bottom margin so the stats bar below the plots has room
+    plt.subplots_adjust(bottom=0.12)
     plt.savefig(out_png, dpi=150, bbox_inches="tight",
                 facecolor=fig.get_facecolor())
     print(f"Plot saved to {out_png}")

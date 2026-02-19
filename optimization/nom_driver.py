@@ -171,7 +171,7 @@ def nom_optimize(
     *,
     # --- Operating conditions (PROF ACTION ITEM: alpha=4 instead of 6) ---
     alpha: float = 1.0,   # per physical testing conditions (slides: alpha~1 deg at max speed)
-    Re: float = 440000,     # ACTION ITEM: "5e5 also for reynolds"
+    Re: float = 440000,     # design point from Ski Cat spreadsheet (max speed 25.32 ft/s, chord 2.25in, water)
     
     # --- Iterations ---
     n_iters: int = 3000,
@@ -194,12 +194,18 @@ def nom_optimize(
     te_gap_max: float = 0.01,  # ACTION ITEM: only TE, no LE
     
     # --- CL window ---
-    cl_min: float | None = 0.08,
+    cl_min: float | None = 0.15,
     cl_max: float | None = None,   # no ceiling: baseline CL=1.067 >> 0.20, would hard-reject everything
     
     # --- Paths ---
     csv_path: str = "data/airfoil_latent_params_6.csv",
-    lookup_baseline_path: str = "outputs/best_baseline_foil_alpha1_Re4e+05.json",
+    lookup_baseline_path: str | None = 'outputs/best_baseline_foil_averaged.json', # Currently on the average option
+    # Options:
+    #   None (default) → auto-loads best_baseline_foil_alpha{a}_Re{Re}.json
+    #                     (best foil specifically at your chosen alpha + Re)
+    #   'outputs/best_baseline_foil_averaged.json'
+    #                     (best foil averaged across all 12 conditions -- 
+    #                      good all-around starting point regardless of alpha/Re)
     out_path: str | Path = "outputs",
 ):
     """
@@ -261,16 +267,40 @@ def nom_optimize(
     print("LOADING BEST BASELINE (from lookup table)")
     print("=" * 70)
     
+    # Auto-construct lookup path from alpha/Re if not explicitly provided.
+    # This means nom_driver always finds the right JSON no matter what
+    # conditions you run at, as long as build_lookup_table.py was run first.
+    if lookup_baseline_path is None:
+        # Auto-construct path from alpha/Re so you never have to update it manually.
+        # Valid Re values (from Ski Cat spreadsheet):
+        #   Re=150000  slow speed / takeoff  (V=8.44 ft/s)
+        #   Re=440000  max speed / design    (V=25.32 ft/s)
+        # To use the best ALL-AROUND foil averaged across all 12 conditions:
+        #   lookup_baseline_path='outputs/best_baseline_foil_averaged.json'
+        tag = f"alpha{alpha:.1f}_Re{Re:.0e}"
+        lookup_baseline_path = f"outputs/best_baseline_foil_{tag}.json"
     baseline = load_best_baseline(lookup_baseline_path)
     
     best = None
     
     if baseline is not None:
         print(f"Baseline foil: {baseline['filename']}")
-        print(f"  CL:        {baseline['CL']:.4f}")
-        print(f"  CD:        {baseline['CD']:.6f}")
-        print(f"  L/D:       {baseline['L_over_D']:.2f}")
-        print(f"  CD/CL:     {baseline['CD_over_CL']:.6f}")
+        # NOTE: Handle both standard JSON format (single alpha/Re, has CL/CD keys)
+        # and averaged JSON format (multi-condition, has mean_L_over_D instead).
+        # The averaged JSON from build_lookup_table_averaged.py does NOT have CL/CD
+        # because those are averaged across conditions -- only latent + L/D stats.
+        # In both cases, the latent vector is what actually matters for optimization.
+        if 'CL' in baseline:
+            # Standard single-condition baseline (e.g. best_baseline_foil_alpha1_Re4e+05.json)
+            print(f"  CL:        {baseline['CL']:.4f}")
+            print(f"  CD:        {baseline['CD']:.6f}")
+            print(f"  L/D:       {baseline['L_over_D']:.2f}")
+            print(f"  CD/CL:     {baseline['CD_over_CL']:.6f}")
+        else:
+            # Averaged multi-condition baseline (e.g. best_baseline_foil_averaged.json)
+            print(f"  Mean L/D:  {baseline.get('mean_L_over_D', 'N/A'):.2f}  (averaged across {baseline.get('n_conditions_valid','?')} conditions)")
+            print(f"  Min L/D:   {baseline.get('min_L_over_D', 'N/A'):.2f}  (worst-case condition)")
+            print(f"  NOTE: No single CL/CD -- this foil was selected for robustness across alpha/Re range")
         print()
         
         # Verify baseline is valid with current constraints
