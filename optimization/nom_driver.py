@@ -77,7 +77,7 @@ def load_best_baseline(json_path: str | Path) -> dict | None:
     100 foils. Now we use the guaranteed best foil from the full lookup table.
     
     INPUTS:
-      json_path -- path to best_baseline_foil_alpha4_Re5e5.json
+      json_path -- path to best_baseline_foil_alpha1_Re4e5.json
     
     OUTPUT:
       dict with keys: filename, alpha, Re, CL, CD, L_over_D, latent
@@ -170,8 +170,8 @@ def propose_local(best_latent: np.ndarray,
 def nom_optimize(
     *,
     # --- Operating conditions (PROF ACTION ITEM: alpha=4 instead of 6) ---
-    alpha: float = 4.0,  # ACTION ITEM: "6 is too harsh" → changed to 4
-    Re: float = 5e5,     # ACTION ITEM: "5e5 also for reynolds"
+    alpha: float = 1.0,   # per physical testing conditions (slides: alpha~1 deg at max speed)
+    Re: float = 440000,     # ACTION ITEM: "5e5 also for reynolds"
     
     # --- Iterations ---
     n_iters: int = 3000,
@@ -194,12 +194,12 @@ def nom_optimize(
     te_gap_max: float = 0.01,  # ACTION ITEM: only TE, no LE
     
     # --- CL window ---
-    cl_min: float | None = 0.5,
-    cl_max: float | None = 1.6,   # was 0.85 -- too tight! best foil has CL=1.39
+    cl_min: float | None = 0.08,
+    cl_max: float | None = None,   # no ceiling: baseline CL=1.067 >> 0.20, would hard-reject everything
     
     # --- Paths ---
     csv_path: str = "data/airfoil_latent_params_6.csv",
-    lookup_baseline_path: str = "outputs/best_baseline_foil_alpha4_Re5e+05.json",
+    lookup_baseline_path: str = "outputs/best_baseline_foil_alpha1_Re4e+05.json",
     out_path: str | Path = "outputs",
 ):
     """

@@ -68,7 +68,7 @@ OUTPUT_DIR.mkdir(exist_ok=True)
 
 # Target operating conditions (from prof feedback)
 ALPHA = 1.0   # Prof: "6 is too harsh" → use 4 or 5
-RE = 5e5      # Prof: "5e5 also for reynolds number"
+RE = 440000      # Prof: "5e5 also for reynolds number"
 
 # Output filenames include conditions for clarity
 LOOKUP_FILE = OUTPUT_DIR / f"lookup_table_alpha{ALPHA:.0f}_Re{RE:.0e}.csv"
