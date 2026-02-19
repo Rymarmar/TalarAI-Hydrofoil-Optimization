@@ -11,7 +11,7 @@ from tensorflow.keras.optimizers import Adam
 # -----------------------------
 # Step 1: Load dataset
 # -----------------------------
-df = pd.read_csv("airfoil_latent_params_6.csv")  # columns: filename, p1..p6
+df = pd.read_csv("data/airfoil_latent_params_6.csv")  # columns: filename, p1..p6
 params6 = df[['p1','p2','p3','p4','p5','p6']].values.astype(np.float32)
 
 scaling_factor = 1

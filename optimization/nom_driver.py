@@ -390,7 +390,7 @@ def nom_optimize(
                             # 5e5 corresponds to 1/15 scale model test conditions.
 
     # --- How many iterations to run ---
-    n_iters: int = 3000,   # Total number of candidate foils to try.
+    n_iters: int = 500,   # Total number of candidate foils to try.
                             # Higher = more exploration, longer runtime.
                             # 3000 is enough to converge in most cases.
 

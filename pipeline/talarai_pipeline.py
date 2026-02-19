@@ -30,7 +30,6 @@ BASE_DIR = Path(__file__).resolve().parent
 
 CANDIDATE_DECODER_FILES = [
     BASE_DIR / "decoder_model_6x100x1000x80.weights.h5",
-    BASE_DIR / "decoder_model_6x100x1000x80.h5",
 ]
 
 
