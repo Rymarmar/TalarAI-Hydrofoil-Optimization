@@ -105,7 +105,7 @@ except ModuleNotFoundError:
 # STEP 0: Load the dataset of latent parameters
 # ===========================================================================
 
-def load_latent_dataset(csv_path: str = "data/airfoil_latent_params.csv") -> np.ndarray:
+def load_latent_dataset(csv_path: str = "data/airfoil_latent_params_6.csv") -> np.ndarray:
     """
     PURPOSE:
       Load the CSV file that contains the 6 latent parameters (p1..p6) for
@@ -284,97 +284,87 @@ def propose_local(best_latent: np.ndarray,
 # STEP 3: Smart seed search -- start from a real training foil
 # ===========================================================================
 
+import pandas as pd
+import numpy as np
+
 def find_valid_seed(pipeline: TalarAIPipeline,
-                    all_latents: np.ndarray,
-                    *,
-                    alpha: float,
-                    Re: float,
-                    lat_lo: np.ndarray,
-                    lat_hi: np.ndarray,
-                    penalty_kwargs: dict,
-                    n_seed_tries: int = 100) -> dict | None:
+                    all_latents=None,   # keep for compatibility
+                    alpha: float = None,
+                    Re: float = None,
+                    lat_lo: np.ndarray = None,
+                    lat_hi: np.ndarray = None,
+                    penalty_kwargs: dict = None,
+                    n_seed_tries: int = 100,
+                    csv_path: str = "outputs/top_200_best_foils.csv") -> dict | None:
+
     """
-    PURPOSE:
-      Before the main optimization loop, try a random sample of REAL training
-      airfoils to find a valid starting point (a foil that passes all hard
-      geometry checks and has a finite CD/CL score).
-
-    WHY THIS IS CRITICAL:
-      Without a valid seed, the first "best" could be a physically impossible
-      foil (e.g. surfaces crossed). Since 75% of proposals after that are LOCAL
-      refinements around the "best", all iterations would explore the same
-      invalid region. This guarantees local refinement begins from a good foil.
-
-    HOW IT CONNECTS:
-      Called once at the start of nom_optimize(), before the main loop.
-      If a valid seed is found, it becomes the initial "best" for the loop.
-      If no seed is found, the main loop starts with pure global exploration.
-
-    INPUTS:
-      pipeline       -- TalarAIPipeline (decoder + NeuralFoil)
-      all_latents    -- shape (N, 6): full dataset of latent vectors
-      alpha, Re      -- fixed operating conditions for this optimization run
-      lat_lo, lat_hi -- bounds from latent_minmax_bounds()
-      penalty_kwargs -- constraint parameters (same dict used in main loop)
-      n_seed_tries   -- how many random training foils to try (default 100)
-
-    OUTPUT:
-      dict with keys {iter, mode, lr, CL, CD, objective, penalty, total,
-                      tmin_int, tmax_int, camber_max_abs_int, te_gap, le_gap,
-                      latent, coords}
-      or None if no valid seed was found.
+    Iterates through ranked CSV (best → worst)
+    and returns the first foil that passes all checks.
     """
-    n       = len(all_latents)
-    # Pick n_seed_tries random foils from the training dataset (no repeats)
-    indices = np.random.choice(n, size=min(n_seed_tries, n), replace=False)
 
-    best_seed = None
+    df = pd.read_csv(csv_path)
 
-    for idx in indices:
-        cand = all_latents[idx].copy()
+    for _, row in df.iterrows():
+
+        # Extract latent vector from p1–p6
+        cand = np.array([
+            row["p1"], row["p2"], row["p3"],
+            row["p4"], row["p5"], row["p6"]
+        ], dtype=float)
 
         # Evaluate through full pipeline
         res = safe_eval(pipeline, cand, alpha=alpha, Re=Re)
         if res is None:
-            continue   # pipeline crashed or returned bad values -- skip
+            continue
 
         CL, CD, coords = res["CL"], res["CD"], res["coords"]
 
-        # Score the candidate
         obj = default_objective(CL, CD)
 
         pen, pen_info = total_penalty(
-            latent_vec=cand, coords=coords, CL=CL,
-            lat_lo=lat_lo, lat_hi=lat_hi, **penalty_kwargs
+            latent_vec=cand,
+            coords=coords,
+            CL=CL,
+            lat_lo=lat_lo,
+            lat_hi=lat_hi,
+            **penalty_kwargs
         )
 
-        # Skip hard rejects and non-finite objectives
-        if not (np.isfinite(pen) and np.isfinite(obj)):
+        if not (np.isfinite(obj) and np.isfinite(pen)):
             continue
+
+        # Reject anything with nonzero penalty
+        # Reject only hard geometry failures
+        if pen_info.get("reason") == "surfaces crossing":
+            continue
+
+        # Reject if geometry penalty exploded
+        if pen_info.get("p_geom", 0.0) >= 1000:
+            continue
+
 
         total = float(obj + pen)
 
-        # Keep the seed with the lowest total score
-        if best_seed is None or total < best_seed["total"]:
-            best_seed = {
-                "iter": 0,
-                "mode": "seed",
-                "lr":   0.0,
-                "CL":   float(CL),
-                "CD":   float(CD),
-                "objective": float(obj),
-                "penalty":   float(pen),
-                "total":     total,
-                "tmin_int":           float(pen_info.get("min_thickness_int", 0.0)),
-                "tmax_int":           float(pen_info.get("max_thickness_int", 0.0)),
-                "camber_max_abs_int": float(pen_info.get("max_abs_camber_int", 0.0)),
-                "te_gap":             float(pen_info.get("te_gap", 0.0)),
-                "le_gap":             float(pen_info.get("le_gap", 0.0)),
-                "latent": cand.copy(),
-                "coords": coords.copy(),
-            }
+        return {
 
-    return best_seed
+
+            "iter": 0,
+            "mode": "seed_from_list",
+            "lr": 0.0,
+            "CL": float(CL),
+            "CD": float(CD),
+            "objective": float(obj),
+            "penalty": float(pen),
+            "total": total,
+            "tmin_int": float(pen_info.get("t_min", 0.0)),
+            "tmax_int": float(pen_info.get("t_max", 0.0)),
+            "te_gap": float(pen_info.get("te_gap", 0.0)),
+            "latent": cand.copy(),
+            "coords": coords.copy(),
+        }
+
+    return None
+
 
 
 # ===========================================================================
@@ -390,7 +380,7 @@ def nom_optimize(
                             # 5e5 corresponds to 1/15 scale model test conditions.
 
     # --- How many iterations to run ---
-    n_iters: int = 500,   # Total number of candidate foils to try.
+    n_iters: int = 2000,   # Total number of candidate foils to try.
                             # Higher = more exploration, longer runtime.
                             # 3000 is enough to converge in most cases.
 
@@ -450,12 +440,7 @@ def nom_optimize(
                                      # Derived from dataset max (0.1427) * 1.1.
                                      # Prevents unrealistic "blob" shapes.
 
-    camber_max_abs: float = 0.076,  # Maximum mean camber line deviation.
-                                     # Derived from dataset max (0.0693) * 1.1.
-                                     # Real airfoils in our dataset stay below this.
-
     te_gap_max:     float = 0.01,   # Max allowed trailing edge gap (soft penalty).
-    le_gap_max:     float = 0.01,   # Max allowed leading edge gap (soft penalty).
 
     # --- CL operating window ---
     # ACTION ITEM (meeting): "Cl_min, cl_max - change the numbers"
@@ -470,10 +455,6 @@ def nom_optimize(
     # Set either to None to disable that bound entirely.
     cl_min: float | None = 0.30,
     cl_max: float | None = 0.85,
-
-    # --- Seed search ---
-    n_seed_tries: int = 200,   # Number of dataset foils to test before starting.
-                                # Higher = better chance of a good starting point.
 
     out_dir: str = "outputs",
 ):
@@ -515,9 +496,7 @@ def nom_optimize(
         lam_cl=lam_cl,
         min_thickness=min_thickness,
         max_thickness=max_thickness,
-        camber_max_abs=camber_max_abs,
         te_gap_max=te_gap_max,
-        le_gap_max=le_gap_max,
         cl_min=cl_min,
         cl_max=cl_max,
     )
@@ -525,14 +504,16 @@ def nom_optimize(
     # -----------------------------------------------------------------------
     # Seed search: try actual training foils to get a valid starting point
     # -----------------------------------------------------------------------
-    print(f"Seed search: testing {n_seed_tries} random training airfoils first...")
     best = find_valid_seed(
         pipeline, latents,
         alpha=alpha, Re=Re,
+
         lat_lo=lat_lo, lat_hi=lat_hi,
         penalty_kwargs=penalty_kwargs,
-        n_seed_tries=n_seed_tries,
     )
+    print("Chosen latent vector:")
+    print(best["latent"])
+
 
     if best is not None:
         print(
@@ -541,7 +522,6 @@ def nom_optimize(
             f"(obj={best['objective']:.5f}, pen={best['penalty']:.5f}) | "
             f"CL={best['CL']:.4f}  CD={best['CD']:.6f} | "
             f"tmin={best['tmin_int']:.4f}  tmax={best['tmax_int']:.4f}  "
-            f"camber={best['camber_max_abs_int']:.4f}"
         )
     else:
         print("WARNING: No valid seed found from training dataset foils.")
@@ -549,7 +529,6 @@ def nom_optimize(
         print("         If the main loop also finds nothing, try:")
         print("           cl_min=None, cl_max=None   (remove CL constraint)")
         print("           min_thickness=0.001")
-        print("           camber_max_abs=0.15")
 
     # -----------------------------------------------------------------------
     # Main NOM optimization loop
@@ -614,9 +593,7 @@ def nom_optimize(
             "total":              float(total),
             "tmin_int":           float(pen_info.get("min_thickness_int", 0.0)),
             "tmax_int":           float(pen_info.get("max_thickness_int", 0.0)),
-            "camber_max_abs_int": float(pen_info.get("max_abs_camber_int", 0.0)),
             "te_gap":             float(pen_info.get("te_gap", 0.0)),
-            "le_gap":             float(pen_info.get("le_gap", 0.0)),
         }
         history.append(rec)
 
@@ -629,7 +606,6 @@ def nom_optimize(
                 f"(obj={best['objective']:.5f}, pen={best['penalty']:.5f}) | "
                 f"CL={best['CL']:.4f}  CD={best['CD']:.6f} | "
                 f"tmin={best['tmin_int']:.4f}  tmax={best['tmax_int']:.4f}  "
-                f"camber={best['camber_max_abs_int']:.4f} | "
                 f"lr={best['lr']:.2e}  mode={best['mode']}"
             )
 
@@ -645,7 +621,6 @@ def nom_optimize(
         print("Try loosening these parameters in nom_optimize():")
         print("  cl_min=None, cl_max=None     (remove the CL window constraint)")
         print("  min_thickness=0.001          (allow thinner foils)")
-        print("  camber_max_abs=0.15          (allow more camber)")
         print("  n_iters=5000                 (more iterations)")
         print("=" * 60)
         return
@@ -682,12 +657,9 @@ def nom_optimize(
         "lam_cl":              float(lam_cl),
         "min_thickness":       float(min_thickness),
         "max_thickness":       float(max_thickness),
-        "camber_max_abs":      float(camber_max_abs),
         "te_gap_max":          float(te_gap_max),
-        "le_gap_max":          float(le_gap_max),
         "cl_min":              None if cl_min is None else float(cl_min),
         "cl_max":              None if cl_max is None else float(cl_max),
-        "n_seed_tries":        int(n_seed_tries),
         "valid_evals":         int(valid),
         "skipped":             int(skipped),
         "best_total":          float(best["total"]),
