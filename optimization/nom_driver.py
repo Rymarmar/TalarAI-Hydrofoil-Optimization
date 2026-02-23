@@ -199,7 +199,7 @@ def nom_optimize(
     
     # --- Paths ---
     csv_path: str = "data/airfoil_latent_params_6.csv",
-    lookup_baseline_path: str | None = 'outputs/best_baseline_foil_averaged.json', # Currently on the average option
+    lookup_baseline_path: str | None = None,
     # Options:
     #   None (default) → auto-loads best_baseline_foil_alpha{a}_Re{Re}.json
     #                     (best foil specifically at your chosen alpha + Re)
@@ -237,13 +237,13 @@ def nom_optimize(
     print()
     
     # -----------------------------------------------------------------------
-    # Load dataset and compute latent bounds
+    # Load dataset and compute latent bounds REVISIT
     # -----------------------------------------------------------------------
     
     print("Loading training dataset...")
     all_latents = load_latent_dataset(csv_path)
     lat_lo, lat_hi = latent_minmax_bounds(all_latents)
-    
+    # revisit
     print(f"✓ Loaded {len(all_latents)} foils")
     print(f"  Latent bounds:")
     for i in range(6):
@@ -394,14 +394,15 @@ def nom_optimize(
     for it in range(1, n_iters + 1):
         
         # --- PROPOSE ---
-        use_local = (best is not None) and (np.random.rand() < float(p_local))
+        # use_local = (best is not None) and (np.random.rand() < float(p_local))
+        # #not needed
         
-        if use_local:
-            cand = propose_local(best['latent'], lr=lr, lat_lo=lat_lo, lat_hi=lat_hi)
-            mode = "local"
-        else:
-            cand = propose_global(lat_lo, lat_hi)
-            mode = "global"
+        # if use_local:
+        cand = propose_local(best['latent'], lr=lr, lat_lo=lat_lo, lat_hi=lat_hi)
+        #     mode = "local"
+        # else:
+        #     cand = propose_global(lat_lo, lat_hi)
+        #     mode = "global"
         
         # --- EVALUATE ---
         res = safe_eval(pipeline, cand, alpha=alpha, Re=Re)
@@ -431,7 +432,7 @@ def nom_optimize(
         )
         
         # --- HARD REJECT (prof: using 1000 not inf) ---
-        if not (np.isfinite(pen) and np.isfinite(obj)) or pen >= 1000.0:
+        if not (np.isfinite(pen) and np.isfinite(obj)) or pen > 1000.0:
             skip_reasons["pen_ge_1000"] += 1
             skipped += 1
             if diag_printed < 10:
@@ -448,7 +449,7 @@ def nom_optimize(
         
         rec = {
             'iter': int(it),
-            'mode': mode,
+            # 'mode': mode,
             'lr': float(lr),
             'CL': float(CL),
             'CD': float(CD),
@@ -471,8 +472,10 @@ def nom_optimize(
                 f"CL={CL:.4f} CD={CD:.6f} | "
                 f"L/D={CL/CD:.1f} | "
                 f"tmin={pen_info.get('t_min', 0):.4f} tmax={pen_info.get('t_max', 0):.4f} | "
-                f"lr={lr:.2e} {mode}"
+                # f"lr={lr:.2e} {mode}"
             )
+        
+# INSERT TRAINING HERE
         
         # --- DECAY LR ---
         lr *= float(lr_decay)

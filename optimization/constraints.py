@@ -175,39 +175,40 @@ def geometry_penalty(coords: np.ndarray,
     
     xu, yu = upper_le2te[:, 0], upper_le2te[:, 1]
     xl, yl = lower_le2te[:, 0], lower_le2te[:, 1]
-    
-    # Interpolate onto shared grid for comparison
-    xg = np.linspace(0.0, 1.0, 120)
-    yu_g = np.interp(xg, xu, yu)
-    yl_g = np.interp(xg, xl, yl)
-    
-    # Check: upper must be above lower in the INTERIOR (x >= 0.05) only.
-    # We skip x < 0.05 because at x=0 (the leading edge), linear interpolation
-    # onto the shared xg grid produces a tiny negative thickness artifact on
-    # otherwise-valid foils. This is a numerical artifact of interpolating a
-    # sharp LE onto a uniform grid -- NOT a real surface crossing. Checking
-    # from x=0.05 onward (same region as the thickness checks) is sufficient
-    # to catch all genuine crossings while eliminating this false rejection.
+
+    # ACTION ITEM #9: "Line 408 no need for interpolation"
+    # The decoder outputs both surfaces on the SAME x-grid (linspace 0->1, 40 pts).
+    # So upper and lower share x-values point-for-point -- no interpolation needed.
+    # We can subtract y values directly at each shared x point.
+    #
+    # The old code interpolated onto a new 120-point grid which was:
+    #   1) unnecessary (same x-grid already)
+    #   2) causing false surface-crossing rejects at LE (x=0) due to
+    #      interpolation artifacts on the sharp leading edge
+    # Both problems are eliminated by using the decoder grid directly.
+
+    # Both surfaces are already on linspace(0,1,40) -- use directly
+    xg = xu  # shape (40,) -- same x values for both surfaces
+    thickness = yu - yl  # shape (40,) -- point-by-point, no interpolation
+
+    # --- CHECK 2: Upper above lower in INTERIOR only ---
+    # Skip near LE (x < 0.05) where foil tapers to a point --
+    # thickness naturally approaches 0 there and is not meaningful.
     interior_mask = xg >= 0.05
-    if np.any(yu_g[interior_mask] < yl_g[interior_mask] - 1e-6):
+    if np.any(thickness[interior_mask] < -1e-6):
         return 1000.0, {"reason": "surfaces crossing"}
-    
-    # --- CHECK 3 & 4: Thickness in INTERIOR only (prof: x ∈ [0.05, 0.90]) ---
+
+    # --- CHECK 3 & 4: Thickness in INTERIOR only (prof: x in [0.05, 0.90]) ---
     # ACTION ITEM #10: "Instead of 0 to 1, from .1 to .9 or .05 to .9"
     # ACTION ITEM #11: "Line 433, not negative -1e-4 make positive"
     # ACTION ITEM #12: "Find min thickness from dataset between .1 and .9"
-    # 
-    # LOGIC: We check thickness only in the INTERIOR of the foil, not at
-    # LE or TE. Near x=0 (LE) and x=1 (TE), real foils taper to near-zero
-    # thickness. If we checked min thickness all the way to x=0 or x=1,
-    # EVERY valid foil would fail. So we only check the middle portion
-    # where the foil should maintain structural thickness.
-    
-    thickness_g = yu_g - yl_g
-    
-    # Prof: "Instead of 0 to 1, from .05 to .9"
+    #
+    # LOGIC: We only check thickness in the middle of the foil.
+    # Near LE (x~0) and TE (x~1) every real foil tapers thin -- checking
+    # there would reject all valid foils. The interior [0.05, 0.90] is
+    # where structural thickness actually matters.
     mask = (xg >= thickness_x_min) & (xg <= thickness_x_max)
-    t_interior = thickness_g[mask]
+    t_interior = thickness[mask]
     
     if len(t_interior) == 0:
         return 1000.0, {"reason": "no interior points"}
