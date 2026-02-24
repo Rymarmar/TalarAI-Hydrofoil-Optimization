@@ -102,7 +102,25 @@ def geometry_penalty(coords: np.ndarray,
                      max_thickness: float = 0.14,
                      te_gap_max: float = 0.01,
                      thickness_x_min: float = 0.05,
-                     thickness_x_max: float = 0.90) -> tuple[float, dict]:
+                     thickness_x_max: float = 0.90,
+                     # ACTION ITEM (2/19 meeting): "ADD Minimum thickness of the maximum
+                     # thickness of the foil -- at least this for the max thickness"
+                     # Hard rejects foils whose peak thickness is too thin (e.g. slivers
+                     # that pass the local min_thickness check but have no structural depth).
+                     min_max_thickness: float = 0.06,
+                     # ACTION ITEM (2/19 meeting): "No cambered foils please -- NACA foils
+                     # easier to 3D print / hard to manufacture cambered foils"
+                     # INTERPRETATION A (confirmed 2/23): not "zero camber only", but
+                     # "no extreme camber that's hard to 3D print."
+                     # Threshold set to 0.04 (4%c) based on NACA family reference:
+                     #   NACA 0012 = 0.00  (symmetric, easiest)
+                     #   NACA 2412 = 0.02  (slight camber, fine)
+                     #   NACA 4412 = 0.04  ← cutoff here
+                     #   NACA 6412 = 0.06  (harder to print, warping risk)
+                     #   Eppler 61 = 0.07+ (too cambered, blocked)
+                     # The current best foil (7.4%c) will now be correctly rejected.
+                     max_camber: float = 0.04,
+                     ) -> tuple[float, dict]:
     """
     Check foil geometry. SIMPLIFIED per prof feedback.
     
@@ -111,10 +129,13 @@ def geometry_penalty(coords: np.ndarray,
       2) Upper above lower everywhere (hard reject if crossing)
       3) Min thickness in interior (hard reject if too thin)
       4) Max thickness (hard reject if too fat)
-      5) TE gap (soft penalty if slightly open)
+      5) Min-max thickness (hard reject if peak thickness < min_max_thickness)  ← ACTION ITEM 2/19
+      6) Max camber (hard reject if cambered foil)                              ← ACTION ITEM 2/19
+      7) TE gap (soft penalty if slightly open)
     
     REMOVED (per prof):
-      - ACTION ITEM #16: Camber checks (too complicated)
+      - ACTION ITEM #16: Camber checks (too complicated) -- REVERSED 2/19:
+        camber is NOW checked as a hard reject (no cambered foils for 3D printing)
       - ACTION ITEM #8,17: LE gap check (only check TE)
       - ACTION ITEM #13: Sharpness checks (overcomplicated)
       - ACTION ITEM #14: Overcomplicated checks removed
@@ -127,11 +148,15 @@ def geometry_penalty(coords: np.ndarray,
       coords -- shape (80, 2): decoded foil coords
         rows 0-39  = upper surface TE->LE (x: 1->0)
         rows 40-79 = lower surface LE->TE (x: 0->1)
-      min_thickness    -- hard limit (from dataset scan)
-      max_thickness    -- hard limit
-      te_gap_max       -- soft limit for TE closure
-      thickness_x_min  -- interior check starts at x=0.05
-      thickness_x_max  -- interior check ends at x=0.90
+      min_thickness     -- hard limit: no point in interior thinner than this
+      max_thickness     -- hard limit: no point in interior thicker than this
+      te_gap_max        -- soft limit for TE closure
+      thickness_x_min   -- interior check starts at x=0.05
+      thickness_x_max   -- interior check ends at x=0.90
+      min_max_thickness -- ACTION ITEM (2/19): hard limit: peak thickness must be
+                           at least this value (prevents ultra-thin slivers)
+      max_camber        -- ACTION ITEM (2/19): hard limit: max camber line deviation
+                           from zero (prevents cambered foils, enforces NACA symmetry)
     
     OUTPUTS:
       (penalty, info_dict)
@@ -226,6 +251,45 @@ def geometry_penalty(coords: np.ndarray,
     # ACTION ITEM #15: Check against max_thickness from constraints
     if t_max > max_thickness:
         return 1000.0, {"reason": "too thick", "t_max": t_max}
+
+    # --- CHECK 5: Min-max thickness (peak must be structurally deep enough) ---
+    # ACTION ITEM (2/19 meeting): "ADD Minimum thickness of the maximum thickness
+    # of the foil -- at least this for the max thickness"
+    #
+    # WHY THIS IS DIFFERENT FROM min_thickness:
+    #   min_thickness checks that NO point is too thin (local floor everywhere).
+    #   min_max_thickness checks that the PEAK thickness is deep enough.
+    #   A foil could pass min_thickness (e.g. 0.04 everywhere) but still be a
+    #   useless sliver if t_max is only 0.05 -- not 3D printable or structurally
+    #   viable. This check ensures the foil has enough structural depth at its
+    #   thickest point.
+    if t_max < min_max_thickness:
+        return 1000.0, {"reason": "peak too thin",
+                        "t_max": t_max, "min_max_thickness": min_max_thickness}
+
+    # --- CHECK 6: Max camber (block extreme camber -- hard to 3D print) ---
+    # ACTION ITEM (2/19 meeting): "No cambered foils please -- NACA foils easier
+    # to 3D print / hard to manufacture cambered foils"
+    # INTERPRETATION A (confirmed 2/23): "No EXTREME camber" not "zero camber."
+    # 3D printing struggles with foils above ~4%c camber due to warping and
+    # support structure requirements on the concave lower surface.
+    #
+    # HOW CAMBER IS COMPUTED:
+    #   Camber line = midpoint between upper and lower surface at each x.
+    #   For a perfectly symmetric foil (NACA 00xx), camber = 0 everywhere.
+    #   We check the interior only [0.05, 0.90] -- near LE/TE every foil
+    #   taper closes so tiny apparent camber there is noise, not real camber.
+    #
+    # THRESHOLD: max_camber=0.04 (4%c)
+    #   Allows: NACA 0012 (0%), NACA 2412 (2%), NACA 4412 (4%)
+    #   Blocks:  NACA 6412 (6%), Eppler 61 (7.4%), other high-camber foils
+    camber_line = (yu + yl) / 2.0          # shape (40,) -- midpoint at each x
+    camber_interior = camber_line[mask]     # restrict to x in [0.05, 0.90]
+    max_camber_actual = float(np.max(np.abs(camber_interior)))
+    if max_camber_actual > max_camber:
+        return 1000.0, {"reason": "too cambered",
+                        "max_camber_actual": max_camber_actual,
+                        "max_camber_limit": max_camber}
     
     # --- CHECK 5: TE gap (soft penalty) ---
     # ACTION ITEM #8: "No need for leading edge line 404, only trailing edge"
@@ -313,6 +377,9 @@ def total_penalty(*,
                   min_thickness: float = 0.04,
                   max_thickness: float = 0.14,
                   te_gap_max: float = 0.01,
+                  # ACTION ITEM (2/19 meeting): new manufacturing constraints
+                  min_max_thickness: float = 0.06,   # peak thickness floor (structural depth)
+                  max_camber: float = 0.04,           # 4%c -- blocks Eppler/highly cambered, allows NACA 4-series and below
                   
                   # CL window
                   cl_min: float | None = None,
@@ -354,6 +421,9 @@ def total_penalty(*,
         min_thickness=min_thickness,
         max_thickness=max_thickness,
         te_gap_max=te_gap_max,
+        # ACTION ITEM (2/19 meeting): pass new manufacturing constraints through
+        min_max_thickness=min_max_thickness,
+        max_camber=max_camber,
     )
     
     # Hard reject if geometry is impossible
