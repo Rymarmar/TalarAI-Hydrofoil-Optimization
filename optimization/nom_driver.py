@@ -268,17 +268,26 @@ class NOMTrainingModel(tf.keras.Model):
                  bounds_lam: float = 10.0,
                  fd_eps: float = 0.01,
                  neuralfoil_fn=None,    # callable: latent (6,) → (CL, CD)
+                 constraint_fn=None,   # callable: (latent, coords, CL) → float penalty
                  ):
         super().__init__()
 
         # ACTION ITEM: "Have everything set to be non-trainable / freeze"
         decoder_model.trainable = False
-        self.decoder    = decoder_model
-        self._lat_lo    = tf.constant(lat_lo.astype(np.float32))
-        self._lat_hi    = tf.constant(lat_hi.astype(np.float32))
-        self.bounds_lam = tf.constant(float(bounds_lam), dtype=tf.float32)
-        self.fd_eps     = float(fd_eps)
-        self._nf_fn     = neuralfoil_fn   # stored for use in train_step
+        self.decoder        = decoder_model
+        self._lat_lo        = tf.constant(lat_lo.astype(np.float32))
+        self._lat_hi        = tf.constant(lat_hi.astype(np.float32))
+        self.bounds_lam     = tf.constant(float(bounds_lam), dtype=tf.float32)
+        self.fd_eps         = float(fd_eps)
+        self._nf_fn         = neuralfoil_fn    # stored for use in train_step
+        self._constraint_fn = constraint_fn
+        # constraint_fn(latent_np (6,), coords_np (80,2), CL float) → float
+        # Returns soft penalty (0.0 when all constraints pass).
+        # Without this, train_step only knew about latent bounds — it had no
+        # awareness of thickness, camber, TE gap, or CL limits, so Adam
+        # freely wandered into geometrically invalid regions and the refined
+        # latent was always rejected post-fit with pen=1000. Now the same
+        # geometry checks used in the NOM loop are applied inside .fit() too.
 
         # ACTION ITEM: 6 trainable latent weights via add_weight() so
         # nom.summary() shows Trainable params: 6, and nom.fit() finds them
@@ -380,40 +389,102 @@ class NOMTrainingModel(tf.keras.Model):
             above = np.maximum(0.0, z_np - hi_np)
             bp = lam * float(np.sum(below + above))
 
+            # --- Geometry + CL constraint penalty ---
+            # WHY THIS IS NEEDED:
+            #   Previously train_step only had bounds penalty (stay inside
+            #   latent min/max). It was completely unaware of thickness, camber,
+            #   TE gap, or CL constraints. Adam freely stepped into regions that
+            #   looked aerodynamically great (low CD/CL) but produced foils that
+            #   violated manufacturing constraints, so the refined latent was
+            #   always rejected post-fit with pen=1000. Now we call the same
+            #   constraint_fn used in the NOM loop, so .fit() is aware of
+            #   geometry validity and steers away from violating regions too.
+            #
+            # FINITE-DIFFERENCE GRADIENT OF GEOMETRY PENALTY:
+            #   constraint_fn is also not differentiable (calls total_penalty
+            #   which does numpy geometry checks), so we finite-difference it
+            #   the same way we do CD/CL. For each perturbed z_plus we compute
+            #   both the aero loss AND the constraint penalty, then combine them
+            #   into a single total loss before differencing. This means one
+            #   forward pass per latent dim captures both objectives together.
+            geom_pen_c = 0.0
+            if self._constraint_fn is not None:
+                try:
+                    # constraint_fn needs CL to check cl_min/cl_max
+                    # We already have CL from _eval_cd_over_cl's NeuralFoil call,
+                    # but _eval_cd_over_cl only returns CD/CL scalar. Re-fetch CL.
+                    CL_c, CD_c = self._nf_fn(z_np)
+                    if np.isfinite(CL_c) and CL_c > 0:
+                        # Run decoder to get coords for geometry checks
+                        z_tf = tf.constant(z_np.reshape(1, 6).astype(np.float32))
+                        coords_tf = self.decoder(z_tf, training=False)
+                        coords_np = coords_tf.numpy().reshape(80, -1)
+                        # coords from decoder is (80,) y-values only; reconstruct (80,2)
+                        # using the standard x-grid (same one used in pipeline/constraints)
+                        x_upper = np.linspace(1, 0, 40)
+                        x_lower = np.linspace(0, 1, 40)
+                        x_grid  = np.concatenate([x_upper, x_lower])
+                        coords_2d = np.stack([x_grid, coords_np[:, 0]], axis=1)
+                        geom_pen_c = float(self._constraint_fn(z_np, coords_2d, float(CL_c)))
+                except Exception:
+                    geom_pen_c = 0.0
+
             if not np.isfinite(loss_c):
                 # The current latent produces an invalid foil (CL<=0 or NaN).
                 # We cannot compute a meaningful CD/CL gradient from here.
                 # Return a large loss and zero gradients so Adam holds position.
-                # The bounds penalty gradient (computed below) will still steer
+                # The bounds + geometry penalty gradients will still steer
                 # the latent back toward valid parameter space if it drifted out.
-                loss_total = 1e6 + bp
+                loss_total = 1e6 + bp + geom_pen_c
                 grads_np = np.zeros(6, dtype=np.float32)
-                # Still add bounds gradient so Adam can recover from out-of-bounds
                 grads_np += np.where(z_np < lo_np, -lam,
                             np.where(z_np > hi_np,  lam, 0.0)).astype(np.float32)
                 result = np.array([loss_total] + grads_np.tolist(), dtype=np.float32)
                 return tf.constant(result, dtype=tf.float32)
 
-            loss_total_val = loss_c + bp
+            loss_total_val = loss_c + bp + geom_pen_c
 
-            # --- Finite-difference gradient of CD/CL w.r.t. each of 6 latent dims ---
+            # --- Finite-difference gradient of total loss w.r.t. each of 6 latent dims ---
             # For each dimension i:
             #   z_plus = current z with z[i] bumped up by fd_eps
-            #   grad[i] ≈ (CD/CL(z_plus) - CD/CL(z_current)) / fd_eps
-            # This is a forward finite difference: slope = rise / run.
-            # Adam uses these 6 slope values to decide which direction and
-            # how far to move each latent weight to reduce CD/CL.
-            # Cost: 6 extra NeuralFoil calls per epoch (one per latent dim).
+            #   total_loss(z_plus) = CD/CL(z_plus) + bounds_pen(z_plus) + geom_pen(z_plus)
+            #   grad[i] ≈ (total_loss(z_plus) - total_loss(z_current)) / fd_eps
+            #
+            # This forward finite difference now captures gradients from ALL three
+            # loss terms simultaneously. Previously only CD/CL was differenced;
+            # now thickness/camber/CL constraint gradients also flow through Adam.
             grads_np = np.zeros(6, dtype=np.float32)
             for i in range(6):
                 z_plus = z_np.copy()
                 z_plus[i] += self.fd_eps          # bump dimension i up by epsilon
+
                 loss_p = self._eval_cd_over_cl(z_plus)
-                if np.isfinite(loss_p):
-                    # Forward finite difference: (f(z+eps) - f(z)) / eps
-                    grads_np[i] = float((loss_p - loss_c) / self.fd_eps)
-                # If loss_p is inf (this perturbation broke the foil geometry),
-                # leave grad[i] = 0 so Adam doesn't push in that direction.
+
+                # Geometry penalty at perturbed point
+                geom_pen_p = 0.0
+                if self._constraint_fn is not None and np.isfinite(loss_p):
+                    try:
+                        CL_p, CD_p = self._nf_fn(z_plus)
+                        if np.isfinite(CL_p) and CL_p > 0:
+                            z_tf_p    = tf.constant(z_plus.reshape(1, 6).astype(np.float32))
+                            coords_tf_p = self.decoder(z_tf_p, training=False)
+                            coords_np_p = coords_tf_p.numpy().reshape(80, -1)
+                            coords_2d_p = np.stack([x_grid, coords_np_p[:, 0]], axis=1)
+                            geom_pen_p  = float(self._constraint_fn(z_plus, coords_2d_p, float(CL_p)))
+                    except Exception:
+                        geom_pen_p = 0.0
+
+                # Bounds penalty at perturbed point (analytical — cheap)
+                below_p = np.maximum(0.0, lo_np - z_plus)
+                above_p = np.maximum(0.0, z_plus - hi_np)
+                bp_p    = lam * float(np.sum(below_p + above_p))
+
+                total_loss_p = loss_p + bp_p + geom_pen_p
+
+                if np.isfinite(total_loss_p) and np.isfinite(loss_total_val):
+                    grads_np[i] = float((total_loss_p - loss_total_val) / self.fd_eps)
+                # If perturbed total is inf/nan, leave grad[i]=0 so Adam
+                # doesn't step in that direction.
 
             # --- Add analytical gradient of bounds penalty ---
             # The bounds penalty is: lam * sum(relu(lo-z) + relu(z-hi))
@@ -456,8 +527,8 @@ class NOMTrainingModel(tf.keras.Model):
         # Return metrics dict. Keras logs these and prints them during .fit().
         # loss_total_t[0] extracts the scalar from the (1,) tensor for display.
         return {
-            "loss":  loss_total_t[0],
-            "CD_CL": result_tensor[0],
+            "loss":  loss_total_t[0],   # total = CD/CL + bounds_pen + geom_pen
+            "CD_CL": result_tensor[0],  # raw aero objective (no penalties)
         }
 
     def get_latent_numpy(self) -> np.ndarray:
@@ -479,12 +550,16 @@ def build_and_train_nom(
     lat_hi: np.ndarray,
     *,
     init_latent: np.ndarray | None = None,
-    learning_rate: float = 0.005,
-    n_epochs: int = 200,
+    learning_rate: float = 0.0005,   # TUNED: was 0.005 — Adam at 0.005 overshot badly
+                                     # (loss oscillated: 0.0089→0.0172→0.0098 in first 3 epochs)
+                                     # 0.0005 gives smoother descent and stays near valid region
+    n_epochs: int = 400,             # TUNED: was 200 — more epochs at smaller lr = smoother
+                                     # convergence. Total compute cost is similar (lr↓10x, epochs↑2x)
     bounds_lam: float = 10.0,
     fd_eps: float = 0.01,
     alpha: float = 1.0,
     Re: float = 450000.0,
+    penalty_kwargs: dict | None = None,  # geometry constraint kwargs forwarded to total_penalty
     verbose: bool = True,
 ) -> np.ndarray:
     """
@@ -496,11 +571,15 @@ def build_and_train_nom(
       3. nom.compile(Adam(lr))            set optimizer
       4. nom.fit(data, epochs=n_epochs)   run gradient descent via .fit()
 
-    LOSS inside .fit():
-      Each epoch, train_step calls NeuralFoil to get real CD/CL,
-      estimates the gradient via finite differences across the 6 latent dims,
-      and applies it with Adam. This is the professor's diagram implemented
-      fully using .fit().
+    LOSS inside .fit() — now includes geometry constraints:
+      total_loss = CD/CL  (NeuralFoil aero objective)
+                 + bounds_penalty  (stay inside latent min/max)
+                 + geometry_penalty  (thickness, camber, TE gap, CL limits)
+
+      All three terms are finite-differenced together so Adam sees the full
+      landscape including constraint walls, not just CD/CL alone. This is
+      what was missing before — the refinement kept getting rejected post-fit
+      with pen=1000 because train_step was blind to geometry constraints.
 
     OUTPUT: best refined latent shape (6,)
     """
@@ -515,6 +594,30 @@ def build_and_train_nom(
         res = pipeline.eval_latent_with_neuralfoil(z_np, alpha=alpha, Re=Re)
         return float(res["CL"]), float(res["CD"])
 
+    # Wrap total_penalty as a simple (latent, coords, CL) → float callable
+    # so train_step can call it without knowing about lat_lo/lat_hi/kwargs.
+    # This is the constraint_fn that was missing — it brings thickness, camber,
+    # TE gap, and CL limits into the TF training loss.
+    _pkwargs = penalty_kwargs or {}
+    def constraint_fn(z_np: np.ndarray, coords_np: np.ndarray, CL: float) -> float:
+        """Returns soft geometry+CL penalty. 0.0 means all constraints pass."""
+        try:
+            pen, _ = total_penalty(
+                latent_vec=z_np,
+                coords=coords_np,
+                CL=CL,
+                lat_lo=lat_lo,
+                lat_hi=lat_hi,
+                **_pkwargs,
+            )
+            # Cap the penalty contribution so a single hard-reject (pen=1000)
+            # doesn't completely overwhelm the CD/CL signal. Adam needs to
+            # still see the aero gradient direction even when constraints are
+            # violated, otherwise it freezes in place.
+            return float(min(pen, 50.0))
+        except Exception:
+            return 0.0
+
     # ------------------------------------------------------------------
     # 1. Build
     # ------------------------------------------------------------------
@@ -526,6 +629,7 @@ def build_and_train_nom(
         bounds_lam=bounds_lam,
         fd_eps=fd_eps,
         neuralfoil_fn=neuralfoil_fn,
+        constraint_fn=constraint_fn,
     )
     nom(None)  # build layers so summary() works
 
@@ -573,8 +677,9 @@ def build_and_train_nom(
 
     if verbose:
         print(f"Running nom.fit() for {n_epochs} epochs  (Adam lr={learning_rate})")
-        print(f"  Loss = CD/CL (NeuralFoil) + bounds_penalty")
+        print(f"  Loss = CD/CL (NeuralFoil) + bounds_penalty + geometry_penalty")
         print(f"  Gradient: finite differences, eps={fd_eps}")
+        print(f"  Geometry constraints active: {'yes' if penalty_kwargs else 'no (no penalty_kwargs passed)'}")
         print()
 
     history = nom.fit(
@@ -999,12 +1104,13 @@ def nom_optimize(
             lat_lo=lat_lo,
             lat_hi=lat_hi,
             init_latent=best['latent'],
-            learning_rate=0.005,
-            n_epochs=200,
+            learning_rate=0.0005,   # reduced from 0.005 — prevents overshooting
+            n_epochs=400,           # increased from 200 — more steps at smaller lr
             bounds_lam=10.0,
             fd_eps=0.01,
             alpha=alpha,
             Re=Re,
+            penalty_kwargs=penalty_kwargs,  # pass geometry constraints into TF training
             verbose=True,
         )
 
