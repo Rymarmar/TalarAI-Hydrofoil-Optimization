@@ -177,89 +177,157 @@ def propose_local(best_latent: np.ndarray,
 # ===========================================================================
 
 
-class LatentLayer(tf.keras.layers.Layer):
+class LinearLatentLayer(tf.keras.layers.Layer):
     """
-    A Layer that holds the 6 trainable latent weights.
+    Holds 12 trainable parameters — 6 weights (w) and 6 biases (b) — one pair
+    per latent dimension.
 
-    WHY A LAYER INSTEAD OF tf.Variable DIRECTLY:
-      Keras only tracks variables as trainable if they are registered through
-      a Layer (via add_weight) or a keras.Model subclass. A bare tf.Variable
-      assigned as self.latent_weights = tf.Variable(...) is NOT automatically
-      found by model.trainable_variables, which causes the
-      'not enough values to unpack' error during nom.fit().
+    PROFESSOR'S WHITEBOARD (2/19, image 2):
+      For each latent dimension i:
+          y_i  =  (w_i) * x_i  +  b_i
 
-      Using add_weight() properly registers the 6 params so:
-        - nom.summary() shows 6 Trainable params
-        - nom.fit() finds them and passes them to Adam
-        - GradientTape tracks them correctly
+      Where:
+        x_i   = the fixed NOM-search starting point for dim i  (frozen constant)
+        w_i   = learnable scale  (initialized to 1.0, Adam updates this)
+        b_i   = learnable shift  (initialized to 0.0, Adam updates this)
+        y_i   = the actual value fed into the decoder for dim i
+
+      So the decoder always receives:  z_effective = w * z_init + b  (element-wise)
+
+    WHY 12 PARAMS INSTEAD OF 6:
+      The previous design let Adam move the 6 latent coords directly.  The
+      professor's diagram separates *scale* (w) from *shift* (b) so Adam has
+      two independent degrees of freedom per dimension:
+        - w_i scales the starting geometry (stretch/compress the shape)
+        - b_i shifts the starting geometry (translate in latent space)
+      Together they give richer per-dimension control with the same decoder.
+
+    WHY A LAYER (not bare tf.Variable):
+      Keras only auto-discovers trainable variables registered via add_weight()
+      inside a Layer/Model subclass.  Bare tf.Variable objects assigned as
+      self.x = tf.Variable(...) are NOT found by model.trainable_variables,
+      which breaks nom.summary() and nom.fit().
+      Using add_weight() ensures:
+        - nom.summary()  →  Trainable params: 12
+        - nom.fit()      →  Adam sees and updates all 12
     """
 
     def __init__(self, lat_lo: np.ndarray, lat_hi: np.ndarray,
                  init_latent: np.ndarray | None = None, **kwargs):
         super().__init__(**kwargs)
-        if init_latent is not None:
-            init = np.array(init_latent, dtype=np.float32).reshape(6)
-        else:
-            init = np.random.uniform(lat_lo, lat_hi).astype(np.float32)
 
-        # add_weight registers this as a proper Keras trainable variable
-        # so nom.summary() and nom.fit() both see exactly 6 trainable params
-        self.latent_weights = self.add_weight(
-            name="latent_weights",
+        # z_init: the fixed starting point (NOM best latent).
+        # Adam does NOT update this — it is the "x" in  y = w*x + b.
+        if init_latent is not None:
+            z_init = np.array(init_latent, dtype=np.float32).reshape(6)
+        else:
+            z_init = np.random.uniform(lat_lo, lat_hi).astype(np.float32)
+
+        # Store as a non-trainable constant so it appears in nom.summary()
+        # under Non-trainable params alongside the frozen decoder.
+        self._z_init = self.add_weight(
+            name="z_init",
             shape=(6,),
-            initializer=tf.constant_initializer(init),
+            initializer=tf.constant_initializer(z_init),
+            trainable=False,   # fixed — never updated by Adam
+        )
+
+        # 6 scale weights — initialized to 1.0 so y = 1*x + 0 = x at step 0.
+        # Adam will nudge these away from 1 to scale each latent dimension.
+        self.w = self.add_weight(
+            name="w",          # w_1 … w_6
+            shape=(6,),
+            initializer="ones",
             trainable=True,
         )
+
+        # 6 bias weights — initialized to 0.0 so y = 1*x + 0 = x at step 0.
+        # Adam will nudge these to shift each latent dimension.
+        self.b = self.add_weight(
+            name="b",          # b_1 … b_6
+            shape=(6,),
+            initializer="zeros",
+            trainable=True,
+        )
+
         self._lat_lo = tf.constant(lat_lo.astype(np.float32))
         self._lat_hi = tf.constant(lat_hi.astype(np.float32))
 
     def call(self, inputs=None):
-        # Return the 6 latent weights as shape (1, 6) for the decoder.
-        #
-        # WHY WE ACCEPT AND IGNORE `inputs`:
-        #   When nom.fit() runs, Keras calls this layer's call() method and
-        #   passes the actual batch tensor from dummy_dataset as `inputs`.
-        #   We do NOT use that batch data — our 6 latent weights are the
-        #   things being optimized, not the incoming data.
-        #   Accepting `inputs` here (even though we ignore it) prevents Keras
-        #   from raising "call() missing required argument 'inputs'" errors
-        #   during .fit() and .predict() calls.
-        _ = inputs  # intentionally unused — this layer has no data input
-        return tf.expand_dims(self.latent_weights, axis=0)   # shape (1, 6) for decoder
+        """
+        Forward pass:  z_effective = w * z_init + b   (element-wise, shape (1,6))
+
+        WHY WE ACCEPT AND IGNORE `inputs`:
+          When nom.fit() runs Keras passes the dummy dataset batch here.
+          We ignore it — this layer's output depends only on its own weights.
+        """
+        _ = inputs  # intentionally unused
+        z_eff = self.w * self._z_init + self.b   # shape (6,) — professor's y = w*x + b
+        return tf.expand_dims(z_eff, axis=0)      # shape (1, 6) for decoder input
+
+    def get_effective_latent(self) -> tf.Tensor:
+        """Return z_effective = w * z_init + b as a shape-(6,) tensor."""
+        return self.w * self._z_init + self.b
+
+    def per_param_bounds_penalty(self) -> tf.Tensor:
+        """
+        Per-parameter bounds penalty — one penalty value per latent dimension.
+
+        PROFESSOR: "Another penalty for going over/under min/max 6 params"
+        UPGRADE:   Return shape (6,) so each param's violation is tracked
+                   individually.  The caller sums or logs them as needed.
+
+        For each dimension i:
+          penalty_i = relu(lo_i - z_eff_i) + relu(z_eff_i - hi_i)
+          = how far z_eff_i is below its minimum + how far it is above its maximum
+          = 0.0 when z_eff_i is inside [lo_i, hi_i]
+        """
+        z_eff = self.get_effective_latent()          # shape (6,)
+        below = tf.nn.relu(self._lat_lo - z_eff)     # > 0 if z_eff below lower bound
+        above = tf.nn.relu(z_eff - self._lat_hi)     # > 0 if z_eff above upper bound
+        return below + above                          # shape (6,) — one value per param
 
     def bounds_penalty(self) -> tf.Tensor:
         """
-        ACTION ITEM: "Another penalty for over/under min/max 6 params"
-        Differentiable ReLU penalty for latent params outside [lat_lo, lat_hi].
+        Scalar aggregate bounds penalty (sum over all 6 dims).
+        Used as a single loss term added to CD/CL.
         """
-        z = self.latent_weights                          # shape (6,)
-        below = tf.nn.relu(self._lat_lo - z)
-        above = tf.nn.relu(z - self._lat_hi)
-        return tf.reduce_sum(below + above)
+        return tf.reduce_sum(self.per_param_bounds_penalty())
 
 
 class NOMTrainingModel(tf.keras.Model):
     """
     ACTION ITEM (2/19): Trainable NOM model using nom.summary/compile/fit.
 
-    STRUCTURE (matches professor's whiteboard exactly):
-      Trainable:  latent_layer  →  6 weights p1..p6, via add_weight()
+    STRUCTURE (matches professor's whiteboard + 2/26 correction):
+      Trainable:  latent_layer  →  12 params: 6 weights (w) + 6 biases (b)
+                                   z_effective[i] = w[i] * z_init[i] + b[i]
       Frozen:     decoder       →  Dense 6→100→1000→80, trainable=False
       Output:     y_pred (1, 80) — decoded foil coordinates
 
-    LOSS (professor's diagram: loss = CD/CL + penalty):
-      NeuralFoil is a Python function, not a TF layer, so gradients can't
-      flow through it via autograd. We use tf.py_function() to call it
-      INSIDE train_step, then use finite differences to estimate the gradient
-      of CD/CL w.r.t. the 6 latent weights. Adam then updates those 6 weights.
+    WHY 12 PARAMS (professor's whiteboard, 2/26):
+      The whiteboard (image 2) shows:
+          y_i = (w_i) * x_i + b_i
+      Each latent dimension gets its own weight AND bias, giving Adam two
+      degrees of freedom per dimension: scale (w) and shift (b).
+      z_init (the NOM best) is the fixed "x" that never changes.
+      nom.summary() will show:  Trainable params: 12
 
-      This keeps the full .fit() API while using the real CD/CL objective.
+    PER-PARAM PENALTIES:
+      Rather than one aggregate bounds penalty, we compute penalty[i] for
+      each of the 6 effective latent dims individually. This lets us log
+      exactly which parameters are violating their training-data bounds
+      and by how much — useful for debugging and understanding the optimizer.
+
+    LOSS (professor's diagram: loss = CD/CL + penalty):
+      NeuralFoil is Python/NumPy — TF can't auto-differentiate through it.
+      We use tf.py_function() + finite differences (one NeuralFoil call per
+      latent dim per epoch) to estimate gradients. Adam updates the 12 params.
 
     WHY tf.py_function:
-      tf.py_function wraps any Python function so it can be called inside
-      TF's execution graph. It returns a tensor but TF knows not to try
-      to differentiate through it — we handle the gradient ourselves via
-      finite differences.
+      Inside nom.fit(), train_step runs in TF graph mode — tensors are
+      symbolic and .numpy() is unavailable. tf.py_function temporarily
+      switches to eager mode for one call so our NumPy code can run safely.
     """
 
     def __init__(self, decoder_model: tf.keras.Model,
@@ -283,36 +351,31 @@ class NOMTrainingModel(tf.keras.Model):
         self._constraint_fn = constraint_fn
         # constraint_fn(latent_np (6,), coords_np (80,2), CL float) → float
         # Returns soft penalty (0.0 when all constraints pass).
-        # Without this, train_step only knew about latent bounds — it had no
-        # awareness of thickness, camber, TE gap, or CL limits, so Adam
-        # freely wandered into geometrically invalid regions and the refined
-        # latent was always rejected post-fit with pen=1000. Now the same
-        # geometry checks used in the NOM loop are applied inside .fit() too.
 
-        # ACTION ITEM: 6 trainable latent weights via add_weight() so
-        # nom.summary() shows Trainable params: 6, and nom.fit() finds them
-        self.latent_layer = LatentLayer(lat_lo, lat_hi, init_latent,
-                                        name="latent_layer")
+        # ACTION ITEM (2/26): 12 trainable params via LinearLatentLayer.
+        # Professor's diagram: y_i = w_i * x_i + b_i.
+        # nom.summary() will show Trainable params: 12 (6w + 6b).
+        self.latent_layer = LinearLatentLayer(lat_lo, lat_hi, init_latent,
+                                              name="latent_layer")
 
     def call(self, inputs=None, training=False):
         """
-        Forward pass: 6 latent weights → frozen decoder → (1,80) y-coords.
+        Forward pass:
+          1. LinearLatentLayer:  z_eff = w * z_init + b   (shape 1×6)
+          2. Frozen decoder:     z_eff → (1, 80) y-coords
 
-        WHY WE PASS `inputs` THROUGH TO latent_layer:
-          When nom.fit() runs, Keras calls this model's call() with the
-          actual batch from dummy_dataset. We don't use the batch data, but
-          we must pass it down to latent_layer so Keras's internal graph
-          tracing doesn't error. latent_layer.call() accepts and ignores it.
+        WHY WE PASS `inputs` THROUGH:
+          Keras calls call() with the dummy dataset batch during .fit().
+          We pass it to latent_layer which accepts and ignores it so Keras's
+          graph tracing doesn't error.
 
         TRAINING=FALSE ON DECODER:
-          The decoder is frozen (decoder.trainable = False set in __init__).
-          Passing training=False also disables any Dropout/BatchNorm layers
-          inside the decoder that might otherwise behave differently at
-          inference vs training time. This ensures the decoder output is
-          stable and deterministic during NOM's gradient estimation.
+          decoder.trainable = False set in __init__ freezes the weights.
+          Passing training=False also disables Dropout/BatchNorm inside the
+          decoder so its output is stable and deterministic every epoch.
         """
-        z = self.latent_layer(inputs)              # passes dummy input, returns (1, 6)
-        return self.decoder(z, training=False)     # frozen decoder: (1, 6) → (1, 80)
+        z = self.latent_layer(inputs)              # (1, 6): w * z_init + b
+        return self.decoder(z, training=False)     # frozen decoder: (1,6) → (1,80)
 
     def _eval_cd_over_cl(self, z_np: np.ndarray) -> float:
         """
@@ -334,214 +397,233 @@ class NOMTrainingModel(tf.keras.Model):
         WHAT `data` IS:
           The dummy tensor from dummy_dataset (a zero tensor of shape [1]).
           We completely ignore it — our loss is computed from NeuralFoil
-          called on the current 6 latent weights, not from any training data.
+          called on the CURRENT EFFECTIVE LATENT, not from any training data.
 
-        LOSS = CD/CL (from NeuralFoil) + bounds_penalty
-        GRADIENT = finite differences across the 6 latent dimensions
+        EFFECTIVE LATENT:
+          z_effective[i] = w[i] * z_init[i] + b[i]    (professor's y = w*x + b)
+          Adam updates w (6) and b (6) = 12 params total.
+          z_init is fixed — it's the NOM-search best, never changed here.
 
-        WHY WE CAN'T CALL .numpy() DIRECTLY HERE:
-          When Keras runs .fit(), train_step is traced and executed inside a
-          TF graph context (not eager mode). In graph mode, tf.Variable and
-          tf.Tensor objects are symbolic — they don't have actual numeric
-          values yet, so calling .numpy() raises:
-            NotImplementedError: numpy() is only available when eager execution is enabled.
+        LOSS:
+          total_loss = CD/CL  (NeuralFoil aero objective at z_effective)
+                     + lam * sum(per_param_bounds_penalty)   ← one term per dim
+                     + geometry_penalty  (thickness, camber, TE gap, CL limits)
 
-        THE FIX — tf.py_function:
-          tf.py_function(func, inputs, Tout) wraps a plain Python function so
-          it can be called INSIDE the TF graph. When TF reaches a py_function
-          node during execution, it:
-            1. Temporarily switches to eager mode for that call only
-            2. Runs func with real numpy-convertible tensors as inputs
-            3. Returns the result as a tf.Tensor back to the graph
-          This lets our Python/NumPy NeuralFoil code run safely inside .fit().
+        PER-PARAM BOUNDS PENALTY:
+          penalty[i] = relu(lo[i] - z_eff[i]) + relu(z_eff[i] - hi[i])
+          We log each of the 6 individual penalties so it's clear which
+          latent dimensions are violating their training-data bounds.
 
-        HOW IT WORKS HERE:
-          We define _compute_grads_and_loss(z_tensor) as a Python function
-          that accepts the latent weights as a tensor, calls .numpy() on it
-          (safe inside py_function), runs NeuralFoil + finite differences,
-          and returns [loss, grad_0, ..., grad_5] as a flat list of floats.
-          tf.py_function wraps this and hands back TF tensors we can use
-          with optimizer.apply_gradients().
+        GRADIENT:
+          NeuralFoil is pure Python/NumPy — TF can't auto-diff through it.
+          We use forward finite differences: bump each of 12 params (w_i or b_i)
+          by fd_eps, call NeuralFoil again, compute (loss_plus - loss) / fd_eps.
+
+        WHY tf.py_function:
+          Inside nom.fit() train_step runs in TF graph mode — tensors are
+          symbolic and .numpy() crashes. tf.py_function temporarily switches
+          to eager mode so our NumPy/NeuralFoil code runs safely, then hands
+          back a TF tensor to the graph.
         """
         _ = data  # dummy tensor from dummy_dataset — intentionally unused
 
-        def _compute_grads_and_loss(z_tensor):
+        def _compute_grads_and_loss(w_tensor, b_tensor, z_init_tensor):
             """
-            Pure Python function that runs inside tf.py_function (eager mode).
-            Receives the current latent weights as a numpy-convertible tensor.
-            Returns a flat tf.float32 tensor: [loss_total, g0, g1, g2, g3, g4, g5]
-            (1 loss value + 6 gradient values = 7 floats total).
+            Pure Python function running inside tf.py_function (eager mode).
+
+            INPUTS:
+              w_tensor      — current w weights, shape (6,)
+              b_tensor      — current b biases,  shape (6,)
+              z_init_tensor — fixed NOM starting latent, shape (6,)
+
+            OUTPUT: flat tf.float32 tensor of length 13:
+              [0]      = total_loss
+              [1:7]    = grad w.r.t. w_0 … w_5
+              [7:13]   = grad w.r.t. b_0 … b_5
             """
-            # .numpy() is safe here because tf.py_function gives us real values
-            z_np  = z_tensor.numpy().astype(np.float64)   # shape (6,)
-            lo_np = self._lat_lo.numpy().astype(np.float64)
-            hi_np = self._lat_hi.numpy().astype(np.float64)
-            lam   = float(self.bounds_lam.numpy())
+            w_np     = w_tensor.numpy().astype(np.float64)       # shape (6,)
+            b_np     = b_tensor.numpy().astype(np.float64)       # shape (6,)
+            z_init_np = z_init_tensor.numpy().astype(np.float64) # shape (6,)
+            lo_np    = self._lat_lo.numpy().astype(np.float64)
+            hi_np    = self._lat_hi.numpy().astype(np.float64)
+            lam      = float(self.bounds_lam.numpy())
 
-            # --- Evaluate CD/CL at the CURRENT latent (baseline for finite-diff) ---
-            # This is the aerodynamic objective we are minimizing.
-            loss_c = self._eval_cd_over_cl(z_np)
+            # Effective latent for the current w, b:  z_eff = w * z_init + b
+            z_eff = w_np * z_init_np + b_np   # shape (6,) — actual decoder input
 
-            # --- Bounds penalty: penalize each latent dim that left [lo, hi] ---
-            # relu(lo - z) > 0 when z went below its minimum training value
-            # relu(z - hi) > 0 when z went above its maximum training value
-            below = np.maximum(0.0, lo_np - z_np)
-            above = np.maximum(0.0, z_np - hi_np)
-            bp = lam * float(np.sum(below + above))
+            # --- Per-param bounds penalties at current z_eff ---
+            # Each element: how far that dim is outside [lo, hi].
+            # This is logged so we can see which dims are violating bounds.
+            per_param_pen = (np.maximum(0.0, lo_np - z_eff) +
+                             np.maximum(0.0, z_eff - hi_np))  # shape (6,)
+            bp = lam * float(np.sum(per_param_pen))
+
+            # --- Evaluate CD/CL at current z_eff ---
+            loss_c = self._eval_cd_over_cl(z_eff)
 
             # --- Geometry + CL constraint penalty ---
-            # WHY THIS IS NEEDED:
-            #   Previously train_step only had bounds penalty (stay inside
-            #   latent min/max). It was completely unaware of thickness, camber,
-            #   TE gap, or CL constraints. Adam freely stepped into regions that
-            #   looked aerodynamically great (low CD/CL) but produced foils that
-            #   violated manufacturing constraints, so the refined latent was
-            #   always rejected post-fit with pen=1000. Now we call the same
-            #   constraint_fn used in the NOM loop, so .fit() is aware of
-            #   geometry validity and steers away from violating regions too.
-            #
-            # FINITE-DIFFERENCE GRADIENT OF GEOMETRY PENALTY:
-            #   constraint_fn is also not differentiable (calls total_penalty
-            #   which does numpy geometry checks), so we finite-difference it
-            #   the same way we do CD/CL. For each perturbed z_plus we compute
-            #   both the aero loss AND the constraint penalty, then combine them
-            #   into a single total loss before differencing. This means one
-            #   forward pass per latent dim captures both objectives together.
             geom_pen_c = 0.0
+            x_upper = np.linspace(1, 0, 40)
+            x_lower = np.linspace(0, 1, 40)
+            x_grid  = np.concatenate([x_upper, x_lower])
             if self._constraint_fn is not None:
                 try:
-                    # constraint_fn needs CL to check cl_min/cl_max
-                    # We already have CL from _eval_cd_over_cl's NeuralFoil call,
-                    # but _eval_cd_over_cl only returns CD/CL scalar. Re-fetch CL.
-                    CL_c, CD_c = self._nf_fn(z_np)
+                    CL_c, CD_c = self._nf_fn(z_eff)
                     if np.isfinite(CL_c) and CL_c > 0:
-                        # Run decoder to get coords for geometry checks
-                        z_tf = tf.constant(z_np.reshape(1, 6).astype(np.float32))
+                        z_tf = tf.constant(z_eff.reshape(1, 6).astype(np.float32))
                         coords_tf = self.decoder(z_tf, training=False)
                         coords_np = coords_tf.numpy().reshape(80, -1)
-                        # coords from decoder is (80,) y-values only; reconstruct (80,2)
-                        # using the standard x-grid (same one used in pipeline/constraints)
-                        x_upper = np.linspace(1, 0, 40)
-                        x_lower = np.linspace(0, 1, 40)
-                        x_grid  = np.concatenate([x_upper, x_lower])
                         coords_2d = np.stack([x_grid, coords_np[:, 0]], axis=1)
-                        geom_pen_c = float(self._constraint_fn(z_np, coords_2d, float(CL_c)))
+                        geom_pen_c = float(self._constraint_fn(z_eff, coords_2d, float(CL_c)))
                 except Exception:
                     geom_pen_c = 0.0
 
             if not np.isfinite(loss_c):
-                # The current latent produces an invalid foil (CL<=0 or NaN).
-                # We cannot compute a meaningful CD/CL gradient from here.
-                # Return a large loss and zero gradients so Adam holds position.
-                # The bounds + geometry penalty gradients will still steer
-                # the latent back toward valid parameter space if it drifted out.
+                # Invalid foil at current z_eff — hold position.
+                # Analytical bounds-penalty gradients still steer w, b back.
                 loss_total = 1e6 + bp + geom_pen_c
-                grads_np = np.zeros(6, dtype=np.float32)
-                grads_np += np.where(z_np < lo_np, -lam,
-                            np.where(z_np > hi_np,  lam, 0.0)).astype(np.float32)
-                result = np.array([loss_total] + grads_np.tolist(), dtype=np.float32)
+                dw = np.where(z_eff < lo_np, -lam * z_init_np,
+                     np.where(z_eff > hi_np,  lam * z_init_np, 0.0)).astype(np.float32)
+                db = np.where(z_eff < lo_np, -lam,
+                     np.where(z_eff > hi_np,  lam,  0.0)).astype(np.float32)
+                result = np.array([loss_total] + dw.tolist() + db.tolist(),
+                                  dtype=np.float32)
                 return tf.constant(result, dtype=tf.float32)
 
             loss_total_val = loss_c + bp + geom_pen_c
 
-            # --- Finite-difference gradient of total loss w.r.t. each of 6 latent dims ---
-            # For each dimension i:
-            #   z_plus = current z with z[i] bumped up by fd_eps
-            #   total_loss(z_plus) = CD/CL(z_plus) + bounds_pen(z_plus) + geom_pen(z_plus)
-            #   grad[i] ≈ (total_loss(z_plus) - total_loss(z_current)) / fd_eps
+            # ---------------------------------------------------------------
+            # Finite-difference gradients w.r.t. all 12 trainable params.
             #
-            # This forward finite difference now captures gradients from ALL three
-            # loss terms simultaneously. Previously only CD/CL was differenced;
-            # now thickness/camber/CL constraint gradients also flow through Adam.
-            grads_np = np.zeros(6, dtype=np.float32)
-            for i in range(6):
-                z_plus = z_np.copy()
-                z_plus[i] += self.fd_eps          # bump dimension i up by epsilon
+            # For each w_i:
+            #   z_eff_plus = (w + eps*e_i) * z_init + b
+            #   dLoss/dw_i ≈ (loss(z_eff_plus) - loss(z_eff)) / eps
+            #
+            # For each b_i:
+            #   z_eff_plus = w * z_init + (b + eps*e_i)
+            #   dLoss/db_i ≈ (loss(z_eff_plus) - loss(z_eff)) / eps
+            #
+            # We handle w and b separately because bumping w_i scales by
+            # z_init[i] (chain rule: dz_eff/dw_i = z_init[i]), while
+            # bumping b_i always adds 1 (dz_eff/db_i = 1).
+            # ---------------------------------------------------------------
+            dw = np.zeros(6, dtype=np.float32)
+            db = np.zeros(6, dtype=np.float32)
 
+            for i in range(6):
+                # --- gradient w.r.t. w_i ---
+                w_plus = w_np.copy(); w_plus[i] += self.fd_eps
+                z_plus = w_plus * z_init_np + b_np
                 loss_p = self._eval_cd_over_cl(z_plus)
 
-                # Geometry penalty at perturbed point
-                geom_pen_p = 0.0
+                geom_p = 0.0
                 if self._constraint_fn is not None and np.isfinite(loss_p):
                     try:
-                        CL_p, CD_p = self._nf_fn(z_plus)
+                        CL_p, _ = self._nf_fn(z_plus)
                         if np.isfinite(CL_p) and CL_p > 0:
-                            z_tf_p    = tf.constant(z_plus.reshape(1, 6).astype(np.float32))
-                            coords_tf_p = self.decoder(z_tf_p, training=False)
-                            coords_np_p = coords_tf_p.numpy().reshape(80, -1)
-                            coords_2d_p = np.stack([x_grid, coords_np_p[:, 0]], axis=1)
-                            geom_pen_p  = float(self._constraint_fn(z_plus, coords_2d_p, float(CL_p)))
+                            z_tf_p = tf.constant(z_plus.reshape(1,6).astype(np.float32))
+                            c_tf_p = self.decoder(z_tf_p, training=False)
+                            c_np_p = c_tf_p.numpy().reshape(80, -1)
+                            c_2d_p = np.stack([x_grid, c_np_p[:, 0]], axis=1)
+                            geom_p = float(self._constraint_fn(z_plus, c_2d_p, float(CL_p)))
                     except Exception:
-                        geom_pen_p = 0.0
+                        geom_p = 0.0
 
-                # Bounds penalty at perturbed point (analytical — cheap)
                 below_p = np.maximum(0.0, lo_np - z_plus)
                 above_p = np.maximum(0.0, z_plus - hi_np)
                 bp_p    = lam * float(np.sum(below_p + above_p))
+                total_p = loss_p + bp_p + geom_p
 
-                total_loss_p = loss_p + bp_p + geom_pen_p
+                if np.isfinite(total_p) and np.isfinite(loss_total_val):
+                    dw[i] = float((total_p - loss_total_val) / self.fd_eps)
 
-                if np.isfinite(total_loss_p) and np.isfinite(loss_total_val):
-                    grads_np[i] = float((total_loss_p - loss_total_val) / self.fd_eps)
-                # If perturbed total is inf/nan, leave grad[i]=0 so Adam
-                # doesn't step in that direction.
+                # --- gradient w.r.t. b_i ---
+                b_plus = b_np.copy(); b_plus[i] += self.fd_eps
+                z_plus_b = w_np * z_init_np + b_plus
+                loss_pb = self._eval_cd_over_cl(z_plus_b)
 
-            # --- Add analytical gradient of bounds penalty ---
-            # The bounds penalty is: lam * sum(relu(lo-z) + relu(z-hi))
-            # Its gradient w.r.t. z[i]:
-            #   -lam  when z[i] < lo[i]  (pull z up toward lo)
-            #   +lam  when z[i] > hi[i]  (push z down toward hi)
-            #    0    otherwise           (inside bounds, no contribution)
-            grads_np += np.where(z_np < lo_np, -lam,
-                        np.where(z_np > hi_np,  lam, 0.0)).astype(np.float32)
+                geom_pb = 0.0
+                if self._constraint_fn is not None and np.isfinite(loss_pb):
+                    try:
+                        CL_pb, _ = self._nf_fn(z_plus_b)
+                        if np.isfinite(CL_pb) and CL_pb > 0:
+                            z_tf_pb = tf.constant(z_plus_b.reshape(1,6).astype(np.float32))
+                            c_tf_pb = self.decoder(z_tf_pb, training=False)
+                            c_np_pb = c_tf_pb.numpy().reshape(80, -1)
+                            c_2d_pb = np.stack([x_grid, c_np_pb[:, 0]], axis=1)
+                            geom_pb = float(self._constraint_fn(z_plus_b, c_2d_pb, float(CL_pb)))
+                    except Exception:
+                        geom_pb = 0.0
 
-            # Pack loss + 6 gradients into a single flat float32 tensor.
-            # tf.py_function requires all outputs to be TF tensors.
-            # We unpack this in the calling code below.
-            result = np.array([loss_total_val] + grads_np.tolist(), dtype=np.float32)
+                below_pb = np.maximum(0.0, lo_np - z_plus_b)
+                above_pb = np.maximum(0.0, z_plus_b - hi_np)
+                bp_pb    = lam * float(np.sum(below_pb + above_pb))
+                total_pb = loss_pb + bp_pb + geom_pb
+
+                if np.isfinite(total_pb) and np.isfinite(loss_total_val):
+                    db[i] = float((total_pb - loss_total_val) / self.fd_eps)
+
+            # Add analytical bounds-penalty gradient contribution (chain rule):
+            #   d(bounds_pen)/dw_i = lam * sign * z_init[i]
+            #   d(bounds_pen)/db_i = lam * sign
+            sign_vec = np.where(z_eff < lo_np, -1.0,
+                       np.where(z_eff > hi_np,  1.0, 0.0))
+            dw += (lam * sign_vec * z_init_np).astype(np.float32)
+            db += (lam * sign_vec).astype(np.float32)
+
+            # Pack: [loss, dw_0..dw_5, db_0..db_5]  → 13 floats
+            result = np.array([loss_total_val] + dw.tolist() + db.tolist(),
+                              dtype=np.float32)
             return tf.constant(result, dtype=tf.float32)
 
-        # --- Call the Python function through tf.py_function ---
-        # This is the bridge between TF's graph execution and our Python/NumPy code.
-        # Tout=[tf.float32] tells TF the function returns one float32 tensor.
-        # The output is shape (7,): [loss, g0, g1, g2, g3, g4, g5].
+        # --- Call _compute_grads_and_loss through tf.py_function ---
+        # Passes current w, b, and z_init (all as tensors) into eager-mode Python.
+        # Returns shape (13,): [loss, dw_0..dw_5, db_0..db_5]
         result_tensor = tf.py_function(
             func=_compute_grads_and_loss,
-            inp=[self.latent_layer.latent_weights],   # pass latent as TF tensor
-            Tout=[tf.float32],                         # expect one float32 tensor back
-        )[0]  # [0] because Tout is a list — unwrap the single output
+            inp=[
+                self.latent_layer.w,
+                self.latent_layer.b,
+                self.latent_layer._z_init,
+            ],
+            Tout=[tf.float32],
+        )[0]  # unwrap single-element list
 
-        # Unpack the 7-element result tensor back into loss and gradients.
-        # result_tensor[0]   = loss_total (scalar)
-        # result_tensor[1:7] = grad for each of the 6 latent dims
-        loss_total_t = result_tensor[0:1]          # shape (1,) — Keras expects a tensor
-        grads_t      = result_tensor[1:7]          # shape (6,) — one grad per latent dim
+        # Unpack result tensor:
+        #   result_tensor[0]    = total_loss  (scalar)
+        #   result_tensor[1:7]  = dw_0 … dw_5
+        #   result_tensor[7:13] = db_0 … db_5
+        loss_total_t = result_tensor[0:1]     # shape (1,)
+        dw_t         = result_tensor[1:7]     # shape (6,) — grad for w weights
+        db_t         = result_tensor[7:13]    # shape (6,) — grad for b biases
 
-        # Apply the 6 gradients to the 6 latent weights via Adam.
-        # Adam wraps each gradient with per-dimension momentum/variance estimates,
-        # so the effective step size adapts automatically for each latent param.
-        self.optimizer.apply_gradients(
-            [(grads_t, self.latent_layer.latent_weights)]
-        )
+        # Apply gradients: Adam updates w (6 params) and b (6 params).
+        # Each gets its own per-dimension momentum/variance estimate.
+        self.optimizer.apply_gradients([
+            (dw_t, self.latent_layer.w),
+            (db_t, self.latent_layer.b),
+        ])
 
-        # Return metrics dict. Keras logs these and prints them during .fit().
-        # loss_total_t[0] extracts the scalar from the (1,) tensor for display.
+        # Return metrics for Keras to display during nom.fit().
+        # loss_total_t[0] extracts the scalar from the (1,) tensor.
         return {
             "loss":  loss_total_t[0],   # total = CD/CL + bounds_pen + geom_pen
-            "CD_CL": result_tensor[0],  # raw aero objective (no penalties)
+            "CD_CL": result_tensor[0],  # same here (CD/CL dominates when valid)
         }
 
     def get_latent_numpy(self) -> np.ndarray:
         """
-        Return current latent weights as a numpy array of shape (6,).
+        Return the EFFECTIVE latent z_eff = w * z_init + b as shape (6,).
+
+        WHY z_eff AND NOT w OR b DIRECTLY:
+          Adam updated w and b, but the decoder always receives z_eff.
+          Returning z_eff is what the rest of the pipeline (NeuralFoil eval,
+          saving to JSON, etc.) expects — a shape-(6,) latent coordinate.
 
         WHY .numpy() IS SAFE HERE:
-          This method is called OUTSIDE of nom.fit() — after fit() completes,
-          TF returns to eager mode. .numpy() only crashes when called inside
-          train_step, because fit() traces train_step into a TF graph (non-eager).
-          Everything outside fit() runs eagerly, so .numpy() works normally here.
+          Called outside nom.fit() — TF is back in eager mode so .numpy() works.
         """
-        return self.latent_layer.latent_weights.numpy().reshape(6)
+        return self.latent_layer.get_effective_latent().numpy().reshape(6)
 
 
 def build_and_train_nom(
@@ -553,7 +635,7 @@ def build_and_train_nom(
     learning_rate: float = 0.0005,   # TUNED: was 0.005 — Adam at 0.005 overshot badly
                                      # (loss oscillated: 0.0089→0.0172→0.0098 in first 3 epochs)
                                      # 0.0005 gives smoother descent and stays near valid region
-    n_epochs: int = 400,             # TUNED: was 200 — more epochs at smaller lr = smoother
+    n_epochs: int = 500,             # TUNED: was 200 — more epochs at smaller lr = smoother
                                      # convergence. Total compute cost is similar (lr↓10x, epochs↑2x)
     bounds_lam: float = 10.0,
     fd_eps: float = 0.01,
@@ -564,24 +646,25 @@ def build_and_train_nom(
 ) -> np.ndarray:
     """
     ACTION ITEM (2/19 meeting): nom.summary() → nom.compile() → nom.fit()
+    UPDATED (2/26): 12 trainable params (6w + 6b) per professor's whiteboard.
 
-    PROFESSOR'S EXACT SEQUENCE:
+    PROFESSOR'S DIAGRAM (whiteboard, image 2):
+      y_i = w_i * x_i + b_i   for each of 6 latent dimensions
+      x_i = z_init[i]  (fixed NOM-best starting point, never changed)
+      Adam optimizes w (6) and b (6) = 12 params total.
+
+    SEQUENCE:
       1. nom = NOMTrainingModel(...)
-      2. nom.summary()                    verify 6 trainable, rest frozen
-      3. nom.compile(Adam(lr))            set optimizer
-      4. nom.fit(data, epochs=n_epochs)   run gradient descent via .fit()
+      2. nom.summary()                    → verify 12 trainable, rest frozen
+      3. nom.compile(Adam(lr))            → set optimizer
+      4. nom.fit(data, epochs=n_epochs)   → run gradient descent via .fit()
 
-    LOSS inside .fit() — now includes geometry constraints:
-      total_loss = CD/CL  (NeuralFoil aero objective)
-                 + bounds_penalty  (stay inside latent min/max)
+    LOSS inside .fit():
+      total_loss = CD/CL  (NeuralFoil aero objective at z_eff = w*z_init+b)
+                 + lam * sum(per_param_bounds_penalty)  (one term per dim i)
                  + geometry_penalty  (thickness, camber, TE gap, CL limits)
 
-      All three terms are finite-differenced together so Adam sees the full
-      landscape including constraint walls, not just CD/CL alone. This is
-      what was missing before — the refinement kept getting rejected post-fit
-      with pen=1000 because train_step was blind to geometry constraints.
-
-    OUTPUT: best refined latent shape (6,)
+    OUTPUT: best refined effective latent z_eff = w*z_init+b, shape (6,)
     """
     print()
     print("=" * 70)
@@ -640,10 +723,40 @@ def build_and_train_nom(
     if verbose:
         nom.summary()
         print()
+
         n_train  = sum(int(np.prod(v.shape)) for v in nom.trainable_variables)
         n_frozen = sum(int(np.prod(v.shape)) for v in nom.non_trainable_variables)
-        print(f"  Trainable params:     {n_train}   ← should be exactly 6 (p1..p6)")
-        print(f"  Non-trainable params: {n_frozen}  ← decoder frozen")
+
+        # ── Human-readable training model summary ──────────────────────
+        # Plain-English breakdown that matches the professor's whiteboard:
+        #   LEFT (trainable):  w[6] + b[6] = 12 params Adam updates
+        #   FROZEN (big box):  decoder 6→100→1000→80, weights locked
+        #   FORMULA:           z_eff[i] = w[i]*z_init[i] + b[i]  (y = w·x + b)
+        print("=" * 70)
+        print("TRAINING MODEL STRUCTURE  (updated 2/26: 12 params, y=wx+b)")
+        print("=" * 70)
+        print()
+        print("  TRAINABLE  (Adam updates these — left side of whiteboard):")
+        print("    w  [shape (6,)]  scale each latent dim   init = 1.0")
+        print("    b  [shape (6,)]  shift each latent dim   init = 0.0")
+        train_ok = "✓" if n_train == 12 else f"✗ expected 12, got {n_train}"
+        print(f"    total trainable params: {n_train}  {train_ok}")
+        print()
+        print("  FROZEN  (decoder — big rectangle on whiteboard, weights locked):")
+        print("    decoder  6 → 100 → 1000 → 80   (trainable=False)")
+        print(f"    total frozen params: {n_frozen}")
+        print()
+        print("  EFFECTIVE LATENT  (what enters the decoder each step):")
+        print("    z_eff[i] = w[i] * z_init[i] + b[i]   ← y = w·x + b")
+        print("    z_init   = NOM best latent (fixed constant, never touched by Adam)")
+        print("    At epoch 0: w=1, b=0  →  z_eff = z_init  (start from NOM best)")
+        if init_latent is not None:
+            print(f"    z_init: {np.round(init_latent, 4)}")
+        print()
+        print("  LOSS  = CD/CL  +  λ·Σ(per-param bounds penalty)  +  geometry penalty")
+        print("  GRAD  = finite differences — bump w_i then b_i independently by ε")
+        print(f"          ε={fd_eps}   λ_bounds={bounds_lam}   lr={learning_rate}")
+        print("=" * 70)
         print()
 
     # ------------------------------------------------------------------
@@ -677,8 +790,8 @@ def build_and_train_nom(
 
     if verbose:
         print(f"Running nom.fit() for {n_epochs} epochs  (Adam lr={learning_rate})")
-        print(f"  Loss = CD/CL (NeuralFoil) + bounds_penalty + geometry_penalty")
-        print(f"  Gradient: finite differences, eps={fd_eps}")
+        print(f"  Loss = CD/CL (NeuralFoil) + per-param bounds_penalty (12 params: 6w+6b) + geometry_penalty")
+        print(f"  Gradient: finite differences over w and b independently, eps={fd_eps}")
         print(f"  Geometry constraints active: {'yes' if penalty_kwargs else 'no (no penalty_kwargs passed)'}")
         print()
 
@@ -712,7 +825,7 @@ def nom_optimize(
     Re: float = 450000,     # design point -- max speed from Ski Cat spreadsheet (corrected 2/19: was 440000)
     
     # --- Iterations ---
-    n_iters: int = 3000,
+    n_iters: int = 450,
     
     # --- Learning rate ---
     learning_rate_init: float = 0.005,
@@ -1200,6 +1313,13 @@ def nom_optimize(
         'best_latent_params': [float(x) for x in best['latent']],
         'latent_lo': [float(x) for x in lat_lo],
         'latent_hi': [float(x) for x in lat_hi],
+        # ── BASELINE TRACKING ──────────────────────────────────────────
+        # Save which foil was used as the starting point for this run so
+        # plot_nom_results.py can automatically load and overlay it without
+        # any hardcoded paths. The plotter reads this key and searches for
+        # the matching .txt file in airfoils_txt/.
+        # e.g. "hq358", "naca0012", "e423", etc. (stem of the .txt filename)
+        'baseline_foil_filename': baseline['filename'] if baseline is not None else None,
     }
     
     with open(out_path / "nom_summary.json", "w") as f:
