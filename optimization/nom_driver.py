@@ -3,8 +3,6 @@ python -m optimization.nom_driver
 
 optimization/nom_driver.py
 
-UPDATED: Uses lookup table baseline instead of random seed search (prof action item).
-
 ACTION ITEMS ADDRESSED:
   ✓ "Make lookup table, find best airfoil, use as baseline" - load_best_baseline()
   ✓ "Use lookup table instead of seeds" - replaced find_valid_seed()
@@ -12,15 +10,14 @@ ACTION ITEMS ADDRESSED:
   ✓ "5e5 also for reynolds" - Re=5e5 (unchanged)
   ✓ "No more need for camber and le gap max" - removed from constraints
   ✓ "Limits of alpha and reynolds - add to constraints" - added validation
-
-WHAT THIS FILE DOES:
-  NOM (Neural Optimization Machine) loop that searches latent space to find
-  the foil minimizing CD/CL while satisfying all physical constraints.
+  ✓ "Find weights first, THEN go into NOM" (prof 2/26) - TF runs BEFORE NOM, no fallback
 
 WORKFLOW:
-  1. Load best baseline from lookup table (replaces random seed search)
-  2. Main loop: propose → evaluate → score → keep if better
-  3. Save best foil coordinates, latent params, and optimization history
+  1. Load best baseline from lookup table
+  2. TF training: Adam learns w,b → z_eff = w*z_init + b
+     NOM ALWAYS starts from z_eff (no fallback to raw baseline)
+  3. NOM random search: local search from z_eff
+  4. Save best NOM result
 """
 
 from __future__ import annotations
@@ -635,7 +632,7 @@ def build_and_train_nom(
     learning_rate: float = 0.0005,   # TUNED: was 0.005 — Adam at 0.005 overshot badly
                                      # (loss oscillated: 0.0089→0.0172→0.0098 in first 3 epochs)
                                      # 0.0005 gives smoother descent and stays near valid region
-    n_epochs: int = 500,             # TUNED: was 200 — more epochs at smaller lr = smoother
+    n_epochs: int = 200,             # TUNED: was 200 — more epochs at smaller lr = smoother
                                      # convergence. Total compute cost is similar (lr↓10x, epochs↑2x)
     bounds_lam: float = 10.0,
     fd_eps: float = 0.01,
@@ -825,7 +822,7 @@ def nom_optimize(
     Re: float = 450000,     # design point -- max speed from Ski Cat spreadsheet (corrected 2/19: was 440000)
     
     # --- Iterations ---
-    n_iters: int = 450,
+    n_iters: int = 1000,
     
     # --- Learning rate ---
     learning_rate_init: float = 0.005,
@@ -1051,10 +1048,7 @@ def nom_optimize(
     print("=" * 70)
     print()
     
-    # -----------------------------------------------------------------------
-    # Main optimization loop
-    # -----------------------------------------------------------------------
-    
+    # shared by TF training and NOM loop
     penalty_kwargs = {
         'lam_bounds': lam_bounds,
         'lam_geom': lam_geom,
@@ -1064,27 +1058,96 @@ def nom_optimize(
         'te_gap_max': te_gap_max,
         'cl_min': cl_min,
         'cl_max': cl_max,
-        # ACTION ITEM (2/19 meeting): manufacturing constraints
-        # CALIBRATION HISTORY:
-        #   max_camber=0.01 → too tight, zero valid candidates (whole dataset is cambered)
-        #   max_camber=0.08 → too loose, best foil was 7.4%c Eppler-class (hard to print)
-        #   max_camber=0.04 → FINAL (Interpretation A confirmed 2/23):
-        #     "No extreme camber hard to 3D print" not "zero camber"
-        #     Allows NACA 0012 (0%), NACA 2412 (2%), NACA 4412 (4%)
-        #     Blocks  NACA 6412 (6%), Eppler 61 (7.4%), any foil above 4%c
-        #
-        #   min_max_thickness=0.04: foil must have at least 4% peak thickness
-        #     (structural depth for 3D printing and physical integrity)
+        # max_camber=0.04: block extreme camber >4%c (hard to 3D print)
+        # min_max_thickness=0.04: foil must have at least 4% peak thickness
         'min_max_thickness': 0.04,
         'max_camber': 0.04,
     }
-    
+
+    # -----------------------------------------------------------------------
+    # STEP 1 — TF TRAINING  (professor 2/26: "find weights first, THEN NOM")
+    # -----------------------------------------------------------------------
+    # Adam learns w and b from the lookup-table baseline (z_init = frozen).
+    # z_eff = w*z_init + b is the gradient-refined starting point for NOM.
+    # NOM ALWAYS starts from z_eff — there is no fallback to the raw baseline.
+    # -----------------------------------------------------------------------
+    if best is None:
+        print("⚠️  No valid baseline found — cannot run. Check lookup table path.")
+        return
+
+    tf_ran           = True
+    tf_CL            = None
+    tf_CD            = None
+    tf_n_epochs      = 400
+    tf_learning_rate = 0.0005
+
+    print("=" * 70)
+    print("STEP 1 — TF WEIGHT TRAINING  (nom.summary → nom.compile → nom.fit)")
+    print("=" * 70)
+    print()
+
+    z_eff = build_and_train_nom(
+        pipeline=pipeline,
+        lat_lo=lat_lo,
+        lat_hi=lat_hi,
+        init_latent=best['latent'],      # z_init = lookup table best (frozen)
+        learning_rate=tf_learning_rate,
+        n_epochs=tf_n_epochs,
+        bounds_lam=10.0,
+        fd_eps=0.01,
+        alpha=alpha,
+        Re=Re,
+        penalty_kwargs=penalty_kwargs,
+        verbose=True,
+    )
+
+    # Evaluate z_eff and hand it to NOM as the starting point — always.
+    # No comparison against baseline, no fallback. z_eff IS the start.
+    res_tf = safe_eval(pipeline, z_eff, alpha=alpha, Re=Re)
+    if res_tf is not None:
+        CL_tf, CD_tf, coords_tf = res_tf['CL'], res_tf['CD'], res_tf['coords']
+        obj_tf = default_objective(CL_tf, CD_tf)
+        pen_tf, _ = total_penalty(
+            latent_vec=z_eff, coords=coords_tf, CL=CL_tf,
+            lat_lo=lat_lo, lat_hi=lat_hi, **penalty_kwargs
+        )
+        tf_CL = float(CL_tf)
+        tf_CD = float(CD_tf)
+        print(f"TF output: CL={CL_tf:.4f}  CD={CD_tf:.6f}  "
+              f"L/D={CL_tf/CD_tf:.1f}  pen={pen_tf:.4f}")
+        # Always overwrite best with z_eff — NOM explores from here
+        best = {
+            'latent':    z_eff.copy(),
+            'coords':    coords_tf.copy(),
+            'CL':        float(CL_tf),
+            'CD':        float(CD_tf),
+            'objective': float(obj_tf),
+            'penalty':   float(pen_tf),
+            'total':     float(obj_tf + pen_tf),
+            't_min':     0.0,
+            't_max':     0.0,
+            'te_gap':    0.0,
+        }
+        print("✓ NOM will start from TF z_eff")
+    else:
+        # z_eff produced a physically degenerate foil NeuralFoil refused to eval.
+        # This is the only exception — keep raw baseline so NOM has SOMETHING.
+        print("⚠️  TF z_eff failed NeuralFoil eval entirely — falling back to raw baseline")
+
+    print()
+    print("=" * 70)
+    print("STEP 2 — NOM RANDOM SEARCH  (starting from TF z_eff)")
+    print("=" * 70)
+    print()
+
+    # -----------------------------------------------------------------------
+    # STEP 2 — NOM random search  (always local from TF z_eff)
+    # -----------------------------------------------------------------------
     history = []
-    valid = 0
+    valid   = 0
     skipped = 0
-    lr = float(learning_rate_init)
-    
-    # Diagnostic counters (printed for first 20 skips to help debug)
+    lr      = float(learning_rate_init)
+
     _pending_skips = 0
 
     def _flush_skips():
@@ -1092,40 +1155,13 @@ def nom_optimize(
         if _pending_skips > 0:
             print(f"  ... skipped {_pending_skips} invalid candidates")
             _pending_skips = 0
-    
+
     for it in range(1, n_iters + 1):
-        
-        # --- PROPOSE ---
-        # ACTION ITEM (2/19 meeting): "Lines 397-400, 404-405: global is not
-        # needed -- take out mode"
-        #
-        # WHAT CHANGED FROM OLD CODE:
-        #   Old code had probabilistic 75%/25% local/global switching using
-        #   p_local and a random draw each iteration — that was the "mode"
-        #   the professor said to take out.
-        #   New code: ALWAYS proposes locally from the current best latent.
-        #   Global random sampling is ONLY used as a fallback when best=None
-        #   (which happens only if the lookup table baseline failed all
-        #   constraints and we haven't found ANY valid candidate yet).
-        #
-        # NOTE: p_local is kept in the function signature for backwards
-        # compatibility but is NOT used in this loop. The broader global
-        # search role is now handled by the TF .fit() refinement that runs
-        # AFTER this loop (build_and_train_nom at line 554 / below).
-        #
-        # FALLBACK:
-        #   best=None means no valid candidate exists yet (baseline failed or
-        #   not provided). We can't do local search without a starting point,
-        #   so randomly sample uniformly from [lat_lo, lat_hi] until we find
-        #   the first valid foil, then switch permanently to local proposals.
-        if best is None:
-            # Emergency: no valid foil yet — pick a random point in latent box
-            cand = propose_global(lat_lo, lat_hi)
-        else:
-            # Normal: perturb best latent with Gaussian noise scaled by lr
-            # (lr decays over iterations so steps get smaller over time)
-            cand = propose_local(best['latent'], lr=lr, lat_lo=lat_lo, lat_hi=lat_hi)
-        
+
+        # Always propose locally from current best (z_eff at start,
+        # then best NOM candidate as loop progresses)
+        cand = propose_local(best['latent'], lr=lr, lat_lo=lat_lo, lat_hi=lat_hi)
+
         # --- EVALUATE ---
         res = safe_eval(pipeline, cand, alpha=alpha, Re=Re)
         if res is None:
@@ -1133,129 +1169,57 @@ def nom_optimize(
             _pending_skips += 1
             lr *= float(lr_decay)
             continue
-        
+
         CL, CD, coords = res['CL'], res['CD'], res['coords']
-        
-        # --- OBJECTIVE ---
         obj = default_objective(CL, CD)
-        
-        # --- PENALTY ---
+
         pen, pen_info = total_penalty(
-            latent_vec=cand,
-            coords=coords,
-            CL=CL,
-            lat_lo=lat_lo,
-            lat_hi=lat_hi,
-            **penalty_kwargs
+            latent_vec=cand, coords=coords, CL=CL,
+            lat_lo=lat_lo, lat_hi=lat_hi, **penalty_kwargs
         )
-        
-        # --- HARD REJECT (prof: using 1000 not inf) ---
-        # FIX: was `pen > 1000.0` (strictly greater), which let pen=1000.0 slip
-        # through as "valid" since hard rejects return exactly 1000.0.
-        # Changed to `pen >= 1000.0` so any hard-rejected foil is always skipped.
+
+        # Hard reject: pen >= 1000 means geometry/constraint violation
         if not (np.isfinite(pen) and np.isfinite(obj)) or pen >= 1000.0:
             skipped += 1
             _pending_skips += 1
             lr *= float(lr_decay)
             continue
-        
+
         # --- VALID CANDIDATE ---
         valid += 1
         total = float(obj + pen)
-        
+
         rec = {
-            'iter': int(it),
-            # ACTION ITEM (2/19): 'mode' removed (global exploration taken out)
-            'lr': float(lr),
-            'CL': float(CL),
-            'CD': float(CD),
+            'iter':      int(it),
+            'lr':        float(lr),
+            'CL':        float(CL),
+            'CD':        float(CD),
             'objective': float(obj),
-            'penalty': float(pen),
-            'total': float(total),
-            't_min': float(pen_info.get('t_min', 0.0)),
-            't_max': float(pen_info.get('t_max', 0.0)),
-            'te_gap': float(pen_info.get('te_gap', 0.0)),
+            'penalty':   float(pen),
+            'total':     float(total),
+            't_min':     float(pen_info.get('t_min', 0.0)),
+            't_max':     float(pen_info.get('t_max', 0.0)),
+            'te_gap':    float(pen_info.get('te_gap', 0.0)),
         }
         history.append(rec)
-        
+
         # --- UPDATE BEST ---
-        if best is None or total < best['total']:
+        if total < best['total']:
             best = {**rec, 'latent': cand.copy(), 'coords': coords.copy()}
             _flush_skips()
             print(
                 f"[{it:4d}/{n_iters}] NEW BEST | "
-                f"total={total:.6f} "
-                f"(obj={obj:.6f}, pen={pen:.6f}) | "
+                f"total={total:.6f} (obj={obj:.6f}, pen={pen:.6f}) | "
                 f"CL={CL:.4f} CD={CD:.6f} | "
                 f"L/D={CL/CD:.1f} | "
-                f"tmin={pen_info.get('t_min', 0):.4f} tmax={pen_info.get('t_max', 0):.4f} | "
+                f"tmin={pen_info.get('t_min',0):.4f} tmax={pen_info.get('t_max',0):.4f} | "
                 f"lr={lr:.2e}"
-                # ACTION ITEM (2/19): removed mode from print (global taken out)
             )
-        
-        # -----------------------------------------------------------------------
-        # ACTION ITEM (2/19): no training inside the for loop.
-        # Training (nom.summary/compile/fit) happens AFTER the loop below.
-        # -----------------------------------------------------------------------
 
         # --- DECAY LR ---
         lr *= float(lr_decay)
 
-    # -----------------------------------------------------------------------
-    # LINE 554 — ACTION ITEM (2/19 meeting):
-    # "nom_optimize for loop: no training -- for training use .fit"
-    #
-    # NOM random search finished. Now refine the best latent with TF:
-    #   nom.summary() → nom.compile() → nom.fit()
-    # -----------------------------------------------------------------------
-    if best is not None:
-        print()
-        _flush_skips()
-        print("Starting TF refinement (nom.summary → nom.compile → nom.fit)...")
-        refined_latent = build_and_train_nom(
-            pipeline=pipeline,
-            lat_lo=lat_lo,
-            lat_hi=lat_hi,
-            init_latent=best['latent'],
-            learning_rate=0.0005,   # reduced from 0.005 — prevents overshooting
-            n_epochs=400,           # increased from 200 — more steps at smaller lr
-            bounds_lam=10.0,
-            fd_eps=0.01,
-            alpha=alpha,
-            Re=Re,
-            penalty_kwargs=penalty_kwargs,  # pass geometry constraints into TF training
-            verbose=True,
-        )
-
-        # Evaluate with NeuralFoil to see if TF refinement improved things
-        res_r = safe_eval(pipeline, refined_latent, alpha=alpha, Re=Re)
-        if res_r is not None:
-            CL_r, CD_r, coords_r = res_r['CL'], res_r['CD'], res_r['coords']
-            obj_r = default_objective(CL_r, CD_r)
-            pen_r, _ = total_penalty(
-                latent_vec=refined_latent,
-                coords=coords_r,
-                CL=CL_r,
-                lat_lo=lat_lo,
-                lat_hi=lat_hi,
-                **penalty_kwargs
-            )
-            total_r = obj_r + pen_r
-            print(f"TF-refined: CL={CL_r:.4f}  CD={CD_r:.6f}  "
-                  f"L/D={CL_r/CD_r:.1f}  pen={pen_r:.4f}")
-            if pen_r < 1000.0 and total_r < best['total']:
-                print("✓ TF refinement improved NOM best — adopting refined latent")
-                best['latent']    = refined_latent.copy()
-                best['coords']    = coords_r.copy()
-                best['CL']        = float(CL_r)
-                best['CD']        = float(CD_r)
-                best['objective'] = float(obj_r)
-                best['penalty']   = float(pen_r)
-                best['total']     = float(total_r)
-            else:
-                print("  TF refinement did not improve — keeping NOM best")
-        else:
-            print("  TF-refined latent failed NeuralFoil eval — keeping NOM best")
+    _flush_skips()
 
     # -----------------------------------------------------------------------
     # Save results
@@ -1314,12 +1278,17 @@ def nom_optimize(
         'latent_lo': [float(x) for x in lat_lo],
         'latent_hi': [float(x) for x in lat_hi],
         # ── BASELINE TRACKING ──────────────────────────────────────────
-        # Save which foil was used as the starting point for this run so
-        # plot_nom_results.py can automatically load and overlay it without
-        # any hardcoded paths. The plotter reads this key and searches for
-        # the matching .txt file in airfoils_txt/.
-        # e.g. "hq358", "naca0012", "e423", etc. (stem of the .txt filename)
         'baseline_foil_filename': baseline['filename'] if baseline is not None else None,
+        # ── TF TRAINING RESULTS ────────────────────────────────────────
+        # TF always runs FIRST (professor 2/26). NOM always starts from z_eff.
+        # final_result_from is always 'nom_search' — NOM owns the final answer.
+        'tf_ran':            tf_ran,
+        'tf_n_epochs':       tf_n_epochs,
+        'tf_learning_rate':  tf_learning_rate,
+        'tf_CL':             tf_CL,
+        'tf_CD':             tf_CD,
+        'tf_LD':             float(tf_CL / tf_CD) if (tf_CL and tf_CD) else None,
+        'final_result_from': 'nom_search',
     }
     
     with open(out_path / "nom_summary.json", "w") as f:

@@ -14,6 +14,8 @@ KEY CHANGES from old version:
   ✓ Check thickness only in interior x ∈ [0.05, 0.90] (prof: line 408 feedback)
   ✓ Simplified geometry_penalty to ONLY return thickness violation
   ✓ Lambda weights auto-normalized so Σ(λ_i) = 1
+  
+  
 
 PENALTIES:
   1) latent_bounds_penalty  -- params outside training data range
