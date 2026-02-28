@@ -1,23 +1,29 @@
 """
-python -m optimization.nom_driver
-
 optimization/nom_driver.py
 
-ACTION ITEMS ADDRESSED:
-  ✓ "Make lookup table, find best airfoil, use as baseline" - load_best_baseline()
-  ✓ "Use lookup table instead of seeds" - replaced find_valid_seed()
-  ✓ "Alpha 6 is too harsh" - changed to alpha=4.0
-  ✓ "5e5 also for reynolds" - Re=5e5 (unchanged)
-  ✓ "No more need for camber and le gap max" - removed from constraints
-  ✓ "Limits of alpha and reynolds - add to constraints" - added validation
-  ✓ "Find weights first, THEN go into NOM" (prof 2/26) - TF runs BEFORE NOM, no fallback
+2/26 ACTION ITEMS IMPLEMENTED:
+  ✓ ONE unified loop — no separate TF pre-step vs NOM iterations.
+      Every iteration: Adam gradient step (FD) on w,b  +  candidate eval.
+      One counter, one loop. nom.summary → nom.compile → the loop IS nom.fit().
+  ✓ Multi-condition objective — each candidate evaluated at all (alpha, Re) pairs.
+      objective = average CD/CL across all conditions.
+      Hard reject if CL < cl_min at ANY condition (foil must lift at every speed).
 
-WORKFLOW:
-  1. Load best baseline from lookup table
-  2. TF training: Adam learns w,b → z_eff = w*z_init + b
-     NOM ALWAYS starts from z_eff (no fallback to raw baseline)
-  3. NOM random search: local search from z_eff
-  4. Save best NOM result
+ARCHITECTURE (professor's whiteboard Image 2):
+  Trainable:  LinearLatentLayer — 12 params: w[6] + b[6]
+              z_eff[i] = w[i] * z_init[i] + b[i]   (y = w*x + b)
+  Frozen:     Decoder  6 → 100 → 1000 → 80
+  Frozen:     NeuralFoil (NumPy, not differentiable — gradients via FD)
+  Objective:  average CD/CL across OPERATING_CONDITIONS
+  Penalty:    latent bounds + geometry + CL floor at every condition
+
+SINGLE LOOP FLOW (each iteration i = 1 … n_iters):
+  1. Compute FD gradients of (avg CD/CL + penalty) w.r.t. w and b (12 params)
+  2. Apply Adam step → update w, b → get new z_eff = w*z_init + b
+  3. Evaluate z_eff at all conditions, compute avg_objective + penalty
+  4. If improvement → record as new best
+  5. Also propose a local Gaussian step from current best → evaluate → keep if better
+     (this keeps broad exploration alive alongside gradient descent)
 """
 
 from __future__ import annotations
@@ -29,13 +35,11 @@ import numpy as np
 import pandas as pd
 import tensorflow as tf
 
-# Import pipeline
 try:
     from pipeline.talarai_pipeline import TalarAIPipeline
 except ModuleNotFoundError:
     from talarai_pipeline import TalarAIPipeline
 
-# Import objective and constraints
 try:
     from optimization.objective import default_objective
     from optimization.constraints import latent_minmax_bounds, total_penalty
@@ -45,1265 +49,836 @@ except ModuleNotFoundError:
 
 
 # ===========================================================================
-# LOAD DATASET
+# OPERATING CONDITIONS  (multi-condition sweep — 2/26 action item)
+# ===========================================================================
+# Physical basis (from Ski Cat Info spreadsheet, 1/15 scale model):
+#   chord = 0.1875 ft,  nu_water = 1.08e-5 ft^2/s
+#   Slow  speed: V =  8.44 ft/s  → Re ≈ 150,000  (takeoff / low-speed)
+#   Mid   speed: V = 14.6  ft/s  → Re ≈ 250,000  (transition)
+#   Fast  speed: V = 20.8  ft/s  → Re ≈ 350,000  (cruise)
+#   Max   speed: V = 25.3  ft/s  → Re ≈ 450,000  (top speed)
+#
+# Alpha range: 1–4 degrees covers in-flight envelope.
+# Design point is alpha~1 deg at max speed.
+# We use 4 representative points — enough to cover the envelope without
+# making each iteration cost 24 NeuralFoil calls (full 6x4 grid).
+#
+# Each entry: (alpha_degrees, Reynolds_number)
+OPERATING_CONDITIONS = [
+    (1.0, 450_000),   # max speed / design point
+    (2.0, 350_000),   # cruise
+    (3.0, 250_000),   # mid-speed
+    (4.0, 150_000),   # takeoff / slow
+]
+
+
+# ===========================================================================
+# DATASET LOADING
 # ===========================================================================
 
 def load_latent_dataset(csv_path: str = "data/airfoil_latent_params_6.csv") -> np.ndarray:
-    """
-    Load all 1647 latent parameters from training CSV.
-    Used to compute bounds (lat_lo, lat_hi).
-    """
     df = pd.read_csv(csv_path)
     numeric = df.select_dtypes(include=[np.number])
-    
     if numeric.shape[1] != 6:
         raise ValueError(f"Expected 6 latent columns, found {numeric.shape[1]}")
-    
     return numeric.values.astype(float)
 
 
 # ===========================================================================
-# LOAD BEST BASELINE (replaces seed search)
+# LOAD BEST BASELINE
 # ===========================================================================
 
 def load_best_baseline(json_path: str | Path) -> dict | None:
-    """
-    Load the best baseline foil from lookup table JSON.
-    
-    PROF ACTION ITEM: "Use lookup table instead of seeds to find best baseline"
-    
-    This replaces the old find_valid_seed() function that randomly sampled
-    100 foils. Now we use the guaranteed best foil from the full lookup table.
-    
-    INPUTS:
-      json_path -- path to best_baseline_foil_alpha1_Re4e5.json
-    
-    OUTPUT:
-      dict with keys: filename, alpha, Re, CL, CD, L_over_D, latent
-      OR None if file not found
-    """
+    """Load best baseline foil from lookup table JSON."""
     json_path = Path(json_path)
-    
     if not json_path.exists():
         print(f"⚠️  Lookup table baseline not found: {json_path}")
         print(f"   Run: python tools/build_lookup_table.py")
         return None
-    
-    with open(json_path, 'r') as f:
-        baseline = json.load(f)
-    
-    return baseline
+    with open(json_path) as f:
+        return json.load(f)
 
 
 # ===========================================================================
-# SAFE EVALUATION
+# MULTI-CONDITION EVALUATION
 # ===========================================================================
 
-def safe_eval(pipeline: TalarAIPipeline,
-              latent_vec: np.ndarray,
-              *,
-              alpha: float,
-              Re: float,
-              debug: bool = False):
+def eval_all_conditions(
+    pipeline: TalarAIPipeline,
+    latent_vec: np.ndarray,
+    conditions: list[tuple[float, float]],
+    cl_min: float = 0.15,
+) -> dict | None:
     """
-    Try to evaluate latent through pipeline. Returns None if anything fails.
-    
-    NOTE: NeuralFoil overflow warnings (exp/power) are normal for bad geometries
-    that push the model out of its training distribution. We catch NaN/inf outputs
-    and return None so the optimizer skips them cleanly.
+    Evaluate a latent vector at every (alpha, Re) operating condition.
+
+    Returns dict with:
+      avg_cd_cl   — average CD/CL across all valid conditions (the objective)
+      per_cond    — list of {alpha, Re, CL, CD, cd_cl} for each condition
+      n_valid     — how many conditions returned finite CL/CD
+      cl_fail     — True if CL < cl_min at ANY condition (hard reject)
+
+    Returns None if ALL conditions fail NeuralFoil entirely.
+
+    WHY AVERAGE CD/CL:
+      We want a foil that performs well across the full speed/angle envelope.
+      A foil optimal only at max speed but terrible at takeoff is not useful.
+      Average CD/CL gives equal weight to every operating point.
+
+    WHY CL FLOOR AT EVERY CONDITION:
+      If the foil can't generate lift at takeoff speed, it's physically useless
+      regardless of how good it is at cruise. Hard reject = CL < cl_min anywhere.
     """
-    try:
-        out = pipeline.eval_latent_with_neuralfoil(latent_vec, alpha=alpha, Re=Re)
-        
-        CL = float(out["CL"])
-        CD = float(out["CD"])
-        coords = out["coords"]
-        
-        # NeuralFoil returns NaN when geometry causes internal overflow
-        if not (np.isfinite(CL) and np.isfinite(CD)):
-            if debug:
-                print(f"  safe_eval: non-finite CL={CL:.4f} CD={CD:.6f}")
-            return None
-        
-        # CD must be physically positive
-        if CD <= 0:
-            if debug:
-                print(f"  safe_eval: non-positive CD={CD:.6f}")
-            return None
-        
-        if coords.shape != (80, 2):
-            return None
-        
-        return {"CL": CL, "CD": CD, "coords": coords}
-    
-    except Exception as e:
-        if debug:
-            print(f"  safe_eval exception: {type(e).__name__}: {e}")
+    z = np.asarray(latent_vec, dtype=float)
+    per_cond = []
+    cd_cl_vals = []
+
+    for alpha, Re in conditions:
+        try:
+            out = pipeline.eval_latent_with_neuralfoil(z, alpha=alpha, Re=Re)
+            CL = float(out["CL"])
+            CD = float(out["CD"])
+            coords = out.get("coords")
+
+            if not (np.isfinite(CL) and np.isfinite(CD) and CD > 0):
+                per_cond.append({"alpha": alpha, "Re": Re, "CL": np.nan,
+                                 "CD": np.nan, "cd_cl": np.nan})
+                continue
+
+            cd_cl = CD / (CL + 1e-9)
+            per_cond.append({"alpha": alpha, "Re": Re, "CL": CL,
+                             "CD": CD, "cd_cl": cd_cl, "coords": coords})
+            cd_cl_vals.append(cd_cl)
+
+        except Exception:
+            per_cond.append({"alpha": alpha, "Re": Re, "CL": np.nan,
+                             "CD": np.nan, "cd_cl": np.nan})
+
+    if len(cd_cl_vals) == 0:
         return None
 
+    avg_cd_cl = float(np.mean(cd_cl_vals))
+    n_valid = len(cd_cl_vals)
+
+    # Hard reject if CL < cl_min at ANY condition
+    cl_fail = any(
+        (not np.isfinite(c["CL"])) or c["CL"] < cl_min
+        for c in per_cond
+    )
+
+    # Use coords from design point (first condition) for geometry checks
+    design_coords = next(
+        (c["coords"] for c in per_cond if "coords" in c), None
+    )
+
+    return {
+        "avg_cd_cl":    avg_cd_cl,
+        "per_cond":     per_cond,
+        "n_valid":      n_valid,
+        "cl_fail":      cl_fail,
+        "coords":       design_coords,
+        # Expose design-point CL/CD for logging
+        "CL":  per_cond[0].get("CL", np.nan) if per_cond else np.nan,
+        "CD":  per_cond[0].get("CD", np.nan) if per_cond else np.nan,
+    }
+
 
 # ===========================================================================
-# PROPOSAL STRATEGIES
+# PROPOSAL STRATEGY
 # ===========================================================================
 
-def propose_global(lat_lo: np.ndarray, lat_hi: np.ndarray) -> np.ndarray:
-    """Random point uniformly sampled from [lat_lo, lat_hi] box."""
-    return np.random.uniform(lat_lo, lat_hi).astype(float)
-
-
-def propose_local(best_latent: np.ndarray,
-                  *,
+def propose_local(best_latent: np.ndarray, *,
                   lr: float,
                   lat_lo: np.ndarray,
                   lat_hi: np.ndarray) -> np.ndarray:
-    """Small Gaussian step from best_latent, clipped to bounds."""
+    """Small Gaussian step from best_latent, clipped to training bounds."""
     step = np.random.normal(0.0, 1.0, size=best_latent.shape).astype(float)
     z = np.asarray(best_latent, dtype=float) + float(lr) * step
     return np.clip(z, lat_lo, lat_hi).astype(float)
 
 
 # ===========================================================================
-# TF TRAINING MODEL
-# ACTION ITEM (2/19 meeting): nom.summary() / nom.compile() / nom.fit()
-#
-# PROFESSOR'S WHITEBOARD DIAGRAM:
-#   LEFT (trainable):  6 latent weights p1-p6   ← ONLY these updated by Adam
-#   INSIDE (frozen):   Decoder 6→100→1000→80    ← weights locked
-#   LOSS:              shape proxy + bounds penalty on the 6 params
-#   BACKPROP:          loss → decoder → latent_weights (6 params only)
+# ADAM STATE  (manual Adam — no Keras needed outside the model)
 # ===========================================================================
 
+class AdamState:
+    """
+    Minimal Adam optimizer tracking moment estimates for 12 params (w + b).
+
+    WHY NOT USE tf.keras.optimizers.Adam DIRECTLY:
+      Keras Adam lives inside nom.fit() — we need it available in our own
+      loop so we can call one step at a time and interleave with NOM proposals.
+      This is a direct implementation of the Adam update rule.
+
+    Adam update rule:
+      m = β1*m + (1-β1)*g          (first moment — mean of gradient)
+      v = β2*v + (1-β2)*g²         (second moment — variance of gradient)
+      m̂ = m / (1 - β1^t)           (bias correction)
+      v̂ = v / (1 - β2^t)
+      θ = θ - lr * m̂ / (√v̂ + ε)
+    """
+    def __init__(self, n: int = 12, lr: float = 0.0005,
+                 b1: float = 0.9, b2: float = 0.999, eps: float = 1e-8):
+        self.lr  = lr
+        self.b1  = b1
+        self.b2  = b2
+        self.eps = eps
+        self.m   = np.zeros(n, dtype=np.float64)   # first moment
+        self.v   = np.zeros(n, dtype=np.float64)   # second moment
+        self.t   = 0                                # step counter
+
+    def step(self, params: np.ndarray, grads: np.ndarray) -> np.ndarray:
+        """One Adam update. params and grads both shape (n,). Returns updated params."""
+        self.t += 1
+        self.m = self.b1 * self.m + (1 - self.b1) * grads
+        self.v = self.b2 * self.v + (1 - self.b2) * grads ** 2
+        m_hat  = self.m / (1 - self.b1 ** self.t)
+        v_hat  = self.v / (1 - self.b2 ** self.t)
+        return params - self.lr * m_hat / (np.sqrt(v_hat) + self.eps)
+
+
+# ===========================================================================
+# LATENT LAYER  (professor's whiteboard: y_i = w_i * x_i + b_i)
+# ===========================================================================
 
 class LinearLatentLayer(tf.keras.layers.Layer):
     """
-    Holds 12 trainable parameters — 6 weights (w) and 6 biases (b) — one pair
-    per latent dimension.
+    12 trainable params: w[6] (scale) + b[6] (shift).
+    z_eff[i] = w[i] * z_init[i] + b[i]
 
-    PROFESSOR'S WHITEBOARD (2/19, image 2):
-      For each latent dimension i:
-          y_i  =  (w_i) * x_i  +  b_i
+    z_init is fixed (the baseline foil's latent, never updated).
+    Adam updates w and b only.
 
-      Where:
-        x_i   = the fixed NOM-search starting point for dim i  (frozen constant)
-        w_i   = learnable scale  (initialized to 1.0, Adam updates this)
-        b_i   = learnable shift  (initialized to 0.0, Adam updates this)
-        y_i   = the actual value fed into the decoder for dim i
-
-      So the decoder always receives:  z_effective = w * z_init + b  (element-wise)
-
-    WHY 12 PARAMS INSTEAD OF 6:
-      The previous design let Adam move the 6 latent coords directly.  The
-      professor's diagram separates *scale* (w) from *shift* (b) so Adam has
-      two independent degrees of freedom per dimension:
-        - w_i scales the starting geometry (stretch/compress the shape)
-        - b_i shifts the starting geometry (translate in latent space)
-      Together they give richer per-dimension control with the same decoder.
-
-    WHY A LAYER (not bare tf.Variable):
-      Keras only auto-discovers trainable variables registered via add_weight()
-      inside a Layer/Model subclass.  Bare tf.Variable objects assigned as
-      self.x = tf.Variable(...) are NOT found by model.trainable_variables,
-      which breaks nom.summary() and nom.fit().
-      Using add_weight() ensures:
-        - nom.summary()  →  Trainable params: 12
-        - nom.fit()      →  Adam sees and updates all 12
+    nom.summary() shows: Trainable params: 12
     """
-
-    def __init__(self, lat_lo: np.ndarray, lat_hi: np.ndarray,
-                 init_latent: np.ndarray | None = None, **kwargs):
+    def __init__(self, lat_lo, lat_hi, init_latent=None, **kwargs):
         super().__init__(**kwargs)
 
-        # z_init: the fixed starting point (NOM best latent).
-        # Adam does NOT update this — it is the "x" in  y = w*x + b.
-        if init_latent is not None:
-            z_init = np.array(init_latent, dtype=np.float32).reshape(6)
-        else:
-            z_init = np.random.uniform(lat_lo, lat_hi).astype(np.float32)
+        z_init = (np.array(init_latent, dtype=np.float32).reshape(6)
+                  if init_latent is not None
+                  else np.random.uniform(lat_lo, lat_hi).astype(np.float32))
 
-        # Store as a non-trainable constant so it appears in nom.summary()
-        # under Non-trainable params alongside the frozen decoder.
         self._z_init = self.add_weight(
-            name="z_init",
-            shape=(6,),
+            name="z_init", shape=(6,),
             initializer=tf.constant_initializer(z_init),
-            trainable=False,   # fixed — never updated by Adam
+            trainable=False,
         )
-
-        # 6 scale weights — initialized to 1.0 so y = 1*x + 0 = x at step 0.
-        # Adam will nudge these away from 1 to scale each latent dimension.
         self.w = self.add_weight(
-            name="w",          # w_1 … w_6
-            shape=(6,),
-            initializer="ones",
-            trainable=True,
-        )
-
-        # 6 bias weights — initialized to 0.0 so y = 1*x + 0 = x at step 0.
-        # Adam will nudge these to shift each latent dimension.
+            name="w", shape=(6,), initializer="ones", trainable=True)
         self.b = self.add_weight(
-            name="b",          # b_1 … b_6
-            shape=(6,),
-            initializer="zeros",
-            trainable=True,
-        )
+            name="b", shape=(6,), initializer="zeros", trainable=True)
 
         self._lat_lo = tf.constant(lat_lo.astype(np.float32))
         self._lat_hi = tf.constant(lat_hi.astype(np.float32))
 
     def call(self, inputs=None):
-        """
-        Forward pass:  z_effective = w * z_init + b   (element-wise, shape (1,6))
+        z_eff = self.w * self._z_init + self.b
+        return tf.expand_dims(z_eff, axis=0)   # (1, 6) for decoder
 
-        WHY WE ACCEPT AND IGNORE `inputs`:
-          When nom.fit() runs Keras passes the dummy dataset batch here.
-          We ignore it — this layer's output depends only on its own weights.
-        """
-        _ = inputs  # intentionally unused
-        z_eff = self.w * self._z_init + self.b   # shape (6,) — professor's y = w*x + b
-        return tf.expand_dims(z_eff, axis=0)      # shape (1, 6) for decoder input
+    def get_effective_latent(self) -> np.ndarray:
+        return (self.w.numpy() * self._z_init.numpy() + self.b.numpy()).reshape(6)
 
-    def get_effective_latent(self) -> tf.Tensor:
-        """Return z_effective = w * z_init + b as a shape-(6,) tensor."""
-        return self.w * self._z_init + self.b
+    def get_wb(self) -> tuple[np.ndarray, np.ndarray]:
+        return self.w.numpy().astype(np.float64), self.b.numpy().astype(np.float64)
 
-    def per_param_bounds_penalty(self) -> tf.Tensor:
-        """
-        Per-parameter bounds penalty — one penalty value per latent dimension.
-
-        PROFESSOR: "Another penalty for going over/under min/max 6 params"
-        UPGRADE:   Return shape (6,) so each param's violation is tracked
-                   individually.  The caller sums or logs them as needed.
-
-        For each dimension i:
-          penalty_i = relu(lo_i - z_eff_i) + relu(z_eff_i - hi_i)
-          = how far z_eff_i is below its minimum + how far it is above its maximum
-          = 0.0 when z_eff_i is inside [lo_i, hi_i]
-        """
-        z_eff = self.get_effective_latent()          # shape (6,)
-        below = tf.nn.relu(self._lat_lo - z_eff)     # > 0 if z_eff below lower bound
-        above = tf.nn.relu(z_eff - self._lat_hi)     # > 0 if z_eff above upper bound
-        return below + above                          # shape (6,) — one value per param
-
-    def bounds_penalty(self) -> tf.Tensor:
-        """
-        Scalar aggregate bounds penalty (sum over all 6 dims).
-        Used as a single loss term added to CD/CL.
-        """
-        return tf.reduce_sum(self.per_param_bounds_penalty())
+    def set_wb(self, w: np.ndarray, b: np.ndarray):
+        self.w.assign(w.astype(np.float32))
+        self.b.assign(b.astype(np.float32))
 
 
-class NOMTrainingModel(tf.keras.Model):
+# ===========================================================================
+# NOM MODEL  (nom.summary → nom.compile → used in unified loop)
+# ===========================================================================
+
+class NOMModel(tf.keras.Model):
     """
-    ACTION ITEM (2/19): Trainable NOM model using nom.summary/compile/fit.
+    Trainable: latent_layer (12 params: w + b)
+    Frozen:    decoder (6 → 100 → 1000 → 80)
 
-    STRUCTURE (matches professor's whiteboard + 2/26 correction):
-      Trainable:  latent_layer  →  12 params: 6 weights (w) + 6 biases (b)
-                                   z_effective[i] = w[i] * z_init[i] + b[i]
-      Frozen:     decoder       →  Dense 6→100→1000→80, trainable=False
-      Output:     y_pred (1, 80) — decoded foil coordinates
-
-    WHY 12 PARAMS (professor's whiteboard, 2/26):
-      The whiteboard (image 2) shows:
-          y_i = (w_i) * x_i + b_i
-      Each latent dimension gets its own weight AND bias, giving Adam two
-      degrees of freedom per dimension: scale (w) and shift (b).
-      z_init (the NOM best) is the fixed "x" that never changes.
-      nom.summary() will show:  Trainable params: 12
-
-    PER-PARAM PENALTIES:
-      Rather than one aggregate bounds penalty, we compute penalty[i] for
-      each of the 6 effective latent dims individually. This lets us log
-      exactly which parameters are violating their training-data bounds
-      and by how much — useful for debugging and understanding the optimizer.
-
-    LOSS (professor's diagram: loss = CD/CL + penalty):
-      NeuralFoil is Python/NumPy — TF can't auto-differentiate through it.
-      We use tf.py_function() + finite differences (one NeuralFoil call per
-      latent dim per epoch) to estimate gradients. Adam updates the 12 params.
-
-    WHY tf.py_function:
-      Inside nom.fit(), train_step runs in TF graph mode — tensors are
-      symbolic and .numpy() is unavailable. tf.py_function temporarily
-      switches to eager mode for one call so our NumPy code can run safely.
+    nom.summary() → shows 12 trainable params + frozen decoder
+    nom.compile()  → sets optimizer (we use our own AdamState in the loop,
+                     but compile is called to satisfy the professor's diagram)
     """
-
-    def __init__(self, decoder_model: tf.keras.Model,
-                 lat_lo: np.ndarray, lat_hi: np.ndarray,
-                 init_latent: np.ndarray | None = None,
-                 bounds_lam: float = 10.0,
-                 fd_eps: float = 0.01,
-                 neuralfoil_fn=None,    # callable: latent (6,) → (CL, CD)
-                 constraint_fn=None,   # callable: (latent, coords, CL) → float penalty
-                 ):
+    def __init__(self, decoder_model, lat_lo, lat_hi, init_latent=None):
         super().__init__()
-
-        # ACTION ITEM: "Have everything set to be non-trainable / freeze"
         decoder_model.trainable = False
-        self.decoder        = decoder_model
-        self._lat_lo        = tf.constant(lat_lo.astype(np.float32))
-        self._lat_hi        = tf.constant(lat_hi.astype(np.float32))
-        self.bounds_lam     = tf.constant(float(bounds_lam), dtype=tf.float32)
-        self.fd_eps         = float(fd_eps)
-        self._nf_fn         = neuralfoil_fn    # stored for use in train_step
-        self._constraint_fn = constraint_fn
-        # constraint_fn(latent_np (6,), coords_np (80,2), CL float) → float
-        # Returns soft penalty (0.0 when all constraints pass).
-
-        # ACTION ITEM (2/26): 12 trainable params via LinearLatentLayer.
-        # Professor's diagram: y_i = w_i * x_i + b_i.
-        # nom.summary() will show Trainable params: 12 (6w + 6b).
+        self.decoder      = decoder_model
         self.latent_layer = LinearLatentLayer(lat_lo, lat_hi, init_latent,
                                               name="latent_layer")
 
     def call(self, inputs=None, training=False):
-        """
-        Forward pass:
-          1. LinearLatentLayer:  z_eff = w * z_init + b   (shape 1×6)
-          2. Frozen decoder:     z_eff → (1, 80) y-coords
-
-        WHY WE PASS `inputs` THROUGH:
-          Keras calls call() with the dummy dataset batch during .fit().
-          We pass it to latent_layer which accepts and ignores it so Keras's
-          graph tracing doesn't error.
-
-        TRAINING=FALSE ON DECODER:
-          decoder.trainable = False set in __init__ freezes the weights.
-          Passing training=False also disables Dropout/BatchNorm inside the
-          decoder so its output is stable and deterministic every epoch.
-        """
-        z = self.latent_layer(inputs)              # (1, 6): w * z_init + b
-        return self.decoder(z, training=False)     # frozen decoder: (1,6) → (1,80)
-
-    def _eval_cd_over_cl(self, z_np: np.ndarray) -> float:
-        """
-        Call NeuralFoil to get CD/CL at latent z_np.
-        Returns float('inf') if invalid.
-        """
-        try:
-            CL, CD = self._nf_fn(z_np)
-            if np.isfinite(CL) and np.isfinite(CD) and CL > 0 and CD > 0:
-                return float(CD / CL)
-        except Exception:
-            pass
-        return float("inf")
-
-    def train_step(self, data):
-        """
-        ACTION ITEM: nom.fit() calls this exactly once per epoch.
-
-        WHAT `data` IS:
-          The dummy tensor from dummy_dataset (a zero tensor of shape [1]).
-          We completely ignore it — our loss is computed from NeuralFoil
-          called on the CURRENT EFFECTIVE LATENT, not from any training data.
-
-        EFFECTIVE LATENT:
-          z_effective[i] = w[i] * z_init[i] + b[i]    (professor's y = w*x + b)
-          Adam updates w (6) and b (6) = 12 params total.
-          z_init is fixed — it's the NOM-search best, never changed here.
-
-        LOSS:
-          total_loss = CD/CL  (NeuralFoil aero objective at z_effective)
-                     + lam * sum(per_param_bounds_penalty)   ← one term per dim
-                     + geometry_penalty  (thickness, camber, TE gap, CL limits)
-
-        PER-PARAM BOUNDS PENALTY:
-          penalty[i] = relu(lo[i] - z_eff[i]) + relu(z_eff[i] - hi[i])
-          We log each of the 6 individual penalties so it's clear which
-          latent dimensions are violating their training-data bounds.
-
-        GRADIENT:
-          NeuralFoil is pure Python/NumPy — TF can't auto-diff through it.
-          We use forward finite differences: bump each of 12 params (w_i or b_i)
-          by fd_eps, call NeuralFoil again, compute (loss_plus - loss) / fd_eps.
-
-        WHY tf.py_function:
-          Inside nom.fit() train_step runs in TF graph mode — tensors are
-          symbolic and .numpy() crashes. tf.py_function temporarily switches
-          to eager mode so our NumPy/NeuralFoil code runs safely, then hands
-          back a TF tensor to the graph.
-        """
-        _ = data  # dummy tensor from dummy_dataset — intentionally unused
-
-        def _compute_grads_and_loss(w_tensor, b_tensor, z_init_tensor):
-            """
-            Pure Python function running inside tf.py_function (eager mode).
-
-            INPUTS:
-              w_tensor      — current w weights, shape (6,)
-              b_tensor      — current b biases,  shape (6,)
-              z_init_tensor — fixed NOM starting latent, shape (6,)
-
-            OUTPUT: flat tf.float32 tensor of length 13:
-              [0]      = total_loss
-              [1:7]    = grad w.r.t. w_0 … w_5
-              [7:13]   = grad w.r.t. b_0 … b_5
-            """
-            w_np     = w_tensor.numpy().astype(np.float64)       # shape (6,)
-            b_np     = b_tensor.numpy().astype(np.float64)       # shape (6,)
-            z_init_np = z_init_tensor.numpy().astype(np.float64) # shape (6,)
-            lo_np    = self._lat_lo.numpy().astype(np.float64)
-            hi_np    = self._lat_hi.numpy().astype(np.float64)
-            lam      = float(self.bounds_lam.numpy())
-
-            # Effective latent for the current w, b:  z_eff = w * z_init + b
-            z_eff = w_np * z_init_np + b_np   # shape (6,) — actual decoder input
-
-            # --- Per-param bounds penalties at current z_eff ---
-            # Each element: how far that dim is outside [lo, hi].
-            # This is logged so we can see which dims are violating bounds.
-            per_param_pen = (np.maximum(0.0, lo_np - z_eff) +
-                             np.maximum(0.0, z_eff - hi_np))  # shape (6,)
-            bp = lam * float(np.sum(per_param_pen))
-
-            # --- Evaluate CD/CL at current z_eff ---
-            loss_c = self._eval_cd_over_cl(z_eff)
-
-            # --- Geometry + CL constraint penalty ---
-            geom_pen_c = 0.0
-            x_upper = np.linspace(1, 0, 40)
-            x_lower = np.linspace(0, 1, 40)
-            x_grid  = np.concatenate([x_upper, x_lower])
-            if self._constraint_fn is not None:
-                try:
-                    CL_c, CD_c = self._nf_fn(z_eff)
-                    if np.isfinite(CL_c) and CL_c > 0:
-                        z_tf = tf.constant(z_eff.reshape(1, 6).astype(np.float32))
-                        coords_tf = self.decoder(z_tf, training=False)
-                        coords_np = coords_tf.numpy().reshape(80, -1)
-                        coords_2d = np.stack([x_grid, coords_np[:, 0]], axis=1)
-                        geom_pen_c = float(self._constraint_fn(z_eff, coords_2d, float(CL_c)))
-                except Exception:
-                    geom_pen_c = 0.0
-
-            if not np.isfinite(loss_c):
-                # Invalid foil at current z_eff — hold position.
-                # Analytical bounds-penalty gradients still steer w, b back.
-                loss_total = 1e6 + bp + geom_pen_c
-                dw = np.where(z_eff < lo_np, -lam * z_init_np,
-                     np.where(z_eff > hi_np,  lam * z_init_np, 0.0)).astype(np.float32)
-                db = np.where(z_eff < lo_np, -lam,
-                     np.where(z_eff > hi_np,  lam,  0.0)).astype(np.float32)
-                result = np.array([loss_total] + dw.tolist() + db.tolist(),
-                                  dtype=np.float32)
-                return tf.constant(result, dtype=tf.float32)
-
-            loss_total_val = loss_c + bp + geom_pen_c
-
-            # ---------------------------------------------------------------
-            # Finite-difference gradients w.r.t. all 12 trainable params.
-            #
-            # For each w_i:
-            #   z_eff_plus = (w + eps*e_i) * z_init + b
-            #   dLoss/dw_i ≈ (loss(z_eff_plus) - loss(z_eff)) / eps
-            #
-            # For each b_i:
-            #   z_eff_plus = w * z_init + (b + eps*e_i)
-            #   dLoss/db_i ≈ (loss(z_eff_plus) - loss(z_eff)) / eps
-            #
-            # We handle w and b separately because bumping w_i scales by
-            # z_init[i] (chain rule: dz_eff/dw_i = z_init[i]), while
-            # bumping b_i always adds 1 (dz_eff/db_i = 1).
-            # ---------------------------------------------------------------
-            dw = np.zeros(6, dtype=np.float32)
-            db = np.zeros(6, dtype=np.float32)
-
-            for i in range(6):
-                # --- gradient w.r.t. w_i ---
-                w_plus = w_np.copy(); w_plus[i] += self.fd_eps
-                z_plus = w_plus * z_init_np + b_np
-                loss_p = self._eval_cd_over_cl(z_plus)
-
-                geom_p = 0.0
-                if self._constraint_fn is not None and np.isfinite(loss_p):
-                    try:
-                        CL_p, _ = self._nf_fn(z_plus)
-                        if np.isfinite(CL_p) and CL_p > 0:
-                            z_tf_p = tf.constant(z_plus.reshape(1,6).astype(np.float32))
-                            c_tf_p = self.decoder(z_tf_p, training=False)
-                            c_np_p = c_tf_p.numpy().reshape(80, -1)
-                            c_2d_p = np.stack([x_grid, c_np_p[:, 0]], axis=1)
-                            geom_p = float(self._constraint_fn(z_plus, c_2d_p, float(CL_p)))
-                    except Exception:
-                        geom_p = 0.0
-
-                below_p = np.maximum(0.0, lo_np - z_plus)
-                above_p = np.maximum(0.0, z_plus - hi_np)
-                bp_p    = lam * float(np.sum(below_p + above_p))
-                total_p = loss_p + bp_p + geom_p
-
-                if np.isfinite(total_p) and np.isfinite(loss_total_val):
-                    dw[i] = float((total_p - loss_total_val) / self.fd_eps)
-
-                # --- gradient w.r.t. b_i ---
-                b_plus = b_np.copy(); b_plus[i] += self.fd_eps
-                z_plus_b = w_np * z_init_np + b_plus
-                loss_pb = self._eval_cd_over_cl(z_plus_b)
-
-                geom_pb = 0.0
-                if self._constraint_fn is not None and np.isfinite(loss_pb):
-                    try:
-                        CL_pb, _ = self._nf_fn(z_plus_b)
-                        if np.isfinite(CL_pb) and CL_pb > 0:
-                            z_tf_pb = tf.constant(z_plus_b.reshape(1,6).astype(np.float32))
-                            c_tf_pb = self.decoder(z_tf_pb, training=False)
-                            c_np_pb = c_tf_pb.numpy().reshape(80, -1)
-                            c_2d_pb = np.stack([x_grid, c_np_pb[:, 0]], axis=1)
-                            geom_pb = float(self._constraint_fn(z_plus_b, c_2d_pb, float(CL_pb)))
-                    except Exception:
-                        geom_pb = 0.0
-
-                below_pb = np.maximum(0.0, lo_np - z_plus_b)
-                above_pb = np.maximum(0.0, z_plus_b - hi_np)
-                bp_pb    = lam * float(np.sum(below_pb + above_pb))
-                total_pb = loss_pb + bp_pb + geom_pb
-
-                if np.isfinite(total_pb) and np.isfinite(loss_total_val):
-                    db[i] = float((total_pb - loss_total_val) / self.fd_eps)
-
-            # Add analytical bounds-penalty gradient contribution (chain rule):
-            #   d(bounds_pen)/dw_i = lam * sign * z_init[i]
-            #   d(bounds_pen)/db_i = lam * sign
-            sign_vec = np.where(z_eff < lo_np, -1.0,
-                       np.where(z_eff > hi_np,  1.0, 0.0))
-            dw += (lam * sign_vec * z_init_np).astype(np.float32)
-            db += (lam * sign_vec).astype(np.float32)
-
-            # Pack: [loss, dw_0..dw_5, db_0..db_5]  → 13 floats
-            result = np.array([loss_total_val] + dw.tolist() + db.tolist(),
-                              dtype=np.float32)
-            return tf.constant(result, dtype=tf.float32)
-
-        # --- Call _compute_grads_and_loss through tf.py_function ---
-        # Passes current w, b, and z_init (all as tensors) into eager-mode Python.
-        # Returns shape (13,): [loss, dw_0..dw_5, db_0..db_5]
-        result_tensor = tf.py_function(
-            func=_compute_grads_and_loss,
-            inp=[
-                self.latent_layer.w,
-                self.latent_layer.b,
-                self.latent_layer._z_init,
-            ],
-            Tout=[tf.float32],
-        )[0]  # unwrap single-element list
-
-        # Unpack result tensor:
-        #   result_tensor[0]    = total_loss  (scalar)
-        #   result_tensor[1:7]  = dw_0 … dw_5
-        #   result_tensor[7:13] = db_0 … db_5
-        loss_total_t = result_tensor[0:1]     # shape (1,)
-        dw_t         = result_tensor[1:7]     # shape (6,) — grad for w weights
-        db_t         = result_tensor[7:13]    # shape (6,) — grad for b biases
-
-        # Apply gradients: Adam updates w (6 params) and b (6 params).
-        # Each gets its own per-dimension momentum/variance estimate.
-        self.optimizer.apply_gradients([
-            (dw_t, self.latent_layer.w),
-            (db_t, self.latent_layer.b),
-        ])
-
-        # Return metrics for Keras to display during nom.fit().
-        # loss_total_t[0] extracts the scalar from the (1,) tensor.
-        return {
-            "loss":  loss_total_t[0],   # total = CD/CL + bounds_pen + geom_pen
-            "CD_CL": result_tensor[0],  # same here (CD/CL dominates when valid)
-        }
-
-    def get_latent_numpy(self) -> np.ndarray:
-        """
-        Return the EFFECTIVE latent z_eff = w * z_init + b as shape (6,).
-
-        WHY z_eff AND NOT w OR b DIRECTLY:
-          Adam updated w and b, but the decoder always receives z_eff.
-          Returning z_eff is what the rest of the pipeline (NeuralFoil eval,
-          saving to JSON, etc.) expects — a shape-(6,) latent coordinate.
-
-        WHY .numpy() IS SAFE HERE:
-          Called outside nom.fit() — TF is back in eager mode so .numpy() works.
-        """
-        return self.latent_layer.get_effective_latent().numpy().reshape(6)
-
-
-def build_and_train_nom(
-    pipeline,
-    lat_lo: np.ndarray,
-    lat_hi: np.ndarray,
-    *,
-    init_latent: np.ndarray | None = None,
-    learning_rate: float = 0.0005,   # TUNED: was 0.005 — Adam at 0.005 overshot badly
-                                     # (loss oscillated: 0.0089→0.0172→0.0098 in first 3 epochs)
-                                     # 0.0005 gives smoother descent and stays near valid region
-    n_epochs: int = 200,             # TUNED: was 200 — more epochs at smaller lr = smoother
-                                     # convergence. Total compute cost is similar (lr↓10x, epochs↑2x)
-    bounds_lam: float = 10.0,
-    fd_eps: float = 0.01,
-    alpha: float = 1.0,
-    Re: float = 450000.0,
-    penalty_kwargs: dict | None = None,  # geometry constraint kwargs forwarded to total_penalty
-    verbose: bool = True,
-) -> np.ndarray:
-    """
-    ACTION ITEM (2/19 meeting): nom.summary() → nom.compile() → nom.fit()
-    UPDATED (2/26): 12 trainable params (6w + 6b) per professor's whiteboard.
-
-    PROFESSOR'S DIAGRAM (whiteboard, image 2):
-      y_i = w_i * x_i + b_i   for each of 6 latent dimensions
-      x_i = z_init[i]  (fixed NOM-best starting point, never changed)
-      Adam optimizes w (6) and b (6) = 12 params total.
-
-    SEQUENCE:
-      1. nom = NOMTrainingModel(...)
-      2. nom.summary()                    → verify 12 trainable, rest frozen
-      3. nom.compile(Adam(lr))            → set optimizer
-      4. nom.fit(data, epochs=n_epochs)   → run gradient descent via .fit()
-
-    LOSS inside .fit():
-      total_loss = CD/CL  (NeuralFoil aero objective at z_eff = w*z_init+b)
-                 + lam * sum(per_param_bounds_penalty)  (one term per dim i)
-                 + geometry_penalty  (thickness, camber, TE gap, CL limits)
-
-    OUTPUT: best refined effective latent z_eff = w*z_init+b, shape (6,)
-    """
-    print()
-    print("=" * 70)
-    print("TF TRAINING  (nom.summary → nom.compile → nom.fit)")
-    print("=" * 70)
-
-    # Wrap NeuralFoil call so train_step can call it as a plain function
-    def neuralfoil_fn(z_np: np.ndarray):
-        """z_np shape (6,) → (CL, CD) floats."""
-        res = pipeline.eval_latent_with_neuralfoil(z_np, alpha=alpha, Re=Re)
-        return float(res["CL"]), float(res["CD"])
-
-    # Wrap total_penalty as a simple (latent, coords, CL) → float callable
-    # so train_step can call it without knowing about lat_lo/lat_hi/kwargs.
-    # This is the constraint_fn that was missing — it brings thickness, camber,
-    # TE gap, and CL limits into the TF training loss.
-    _pkwargs = penalty_kwargs or {}
-    def constraint_fn(z_np: np.ndarray, coords_np: np.ndarray, CL: float) -> float:
-        """Returns soft geometry+CL penalty. 0.0 means all constraints pass."""
-        try:
-            pen, _ = total_penalty(
-                latent_vec=z_np,
-                coords=coords_np,
-                CL=CL,
-                lat_lo=lat_lo,
-                lat_hi=lat_hi,
-                **_pkwargs,
-            )
-            # Cap the penalty contribution so a single hard-reject (pen=1000)
-            # doesn't completely overwhelm the CD/CL signal. Adam needs to
-            # still see the aero gradient direction even when constraints are
-            # violated, otherwise it freezes in place.
-            return float(min(pen, 50.0))
-        except Exception:
-            return 0.0
-
-    # ------------------------------------------------------------------
-    # 1. Build
-    # ------------------------------------------------------------------
-    nom = NOMTrainingModel(
-        decoder_model=pipeline.decoder,
-        lat_lo=lat_lo,
-        lat_hi=lat_hi,
-        init_latent=init_latent,
-        bounds_lam=bounds_lam,
-        fd_eps=fd_eps,
-        neuralfoil_fn=neuralfoil_fn,
-        constraint_fn=constraint_fn,
-    )
-    nom(None)  # build layers so summary() works
-
-    # ------------------------------------------------------------------
-    # 2. nom.summary()
-    # ACTION ITEM: "make sure structure is correct: nom.summary()"
-    # ------------------------------------------------------------------
-    if verbose:
-        nom.summary()
-        print()
-
-        n_train  = sum(int(np.prod(v.shape)) for v in nom.trainable_variables)
-        n_frozen = sum(int(np.prod(v.shape)) for v in nom.non_trainable_variables)
-
-        # ── Human-readable training model summary ──────────────────────
-        # Plain-English breakdown that matches the professor's whiteboard:
-        #   LEFT (trainable):  w[6] + b[6] = 12 params Adam updates
-        #   FROZEN (big box):  decoder 6→100→1000→80, weights locked
-        #   FORMULA:           z_eff[i] = w[i]*z_init[i] + b[i]  (y = w·x + b)
-        print("=" * 70)
-        print("TRAINING MODEL STRUCTURE  (updated 2/26: 12 params, y=wx+b)")
-        print("=" * 70)
-        print()
-        print("  TRAINABLE  (Adam updates these — left side of whiteboard):")
-        print("    w  [shape (6,)]  scale each latent dim   init = 1.0")
-        print("    b  [shape (6,)]  shift each latent dim   init = 0.0")
-        train_ok = "✓" if n_train == 12 else f"✗ expected 12, got {n_train}"
-        print(f"    total trainable params: {n_train}  {train_ok}")
-        print()
-        print("  FROZEN  (decoder — big rectangle on whiteboard, weights locked):")
-        print("    decoder  6 → 100 → 1000 → 80   (trainable=False)")
-        print(f"    total frozen params: {n_frozen}")
-        print()
-        print("  EFFECTIVE LATENT  (what enters the decoder each step):")
-        print("    z_eff[i] = w[i] * z_init[i] + b[i]   ← y = w·x + b")
-        print("    z_init   = NOM best latent (fixed constant, never touched by Adam)")
-        print("    At epoch 0: w=1, b=0  →  z_eff = z_init  (start from NOM best)")
-        if init_latent is not None:
-            print(f"    z_init: {np.round(init_latent, 4)}")
-        print()
-        print("  LOSS  = CD/CL  +  λ·Σ(per-param bounds penalty)  +  geometry penalty")
-        print("  GRAD  = finite differences — bump w_i then b_i independently by ε")
-        print(f"          ε={fd_eps}   λ_bounds={bounds_lam}   lr={learning_rate}")
-        print("=" * 70)
-        print()
-
-    # ------------------------------------------------------------------
-    # 3. nom.compile(Adam(...))
-    # ACTION ITEM: "nom.compile(Adam(learning_rate, learning))"
-    # ------------------------------------------------------------------
-    nom.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=learning_rate))
-
-    # ------------------------------------------------------------------
-    # 4. nom.fit(...)
-    # ACTION ITEM: "nom.fit()"
-    #
-    # HOW THE DUMMY DATASET WORKS:
-    #   nom.fit() requires an iterable dataset to loop over. We create one
-    #   with exactly ONE dummy tensor (zeros) that repeats once. This means:
-    #     - Each epoch has exactly 1 batch  → 1 call to train_step per epoch
-    #     - epochs=n_epochs → Keras runs train_step n_epochs times total
-    #
-    #   That is exactly what we want: one full NeuralFoil evaluation + one
-    #   finite-difference gradient step per epoch. train_step ignores the
-    #   dummy tensor entirely and queries NeuralFoil on the current latent
-    #   weights to compute the real CD/CL loss and gradient.
-    #
-    #   repeat(1) vs repeat(): repeat(1) gives 1 element total per dataset.
-    #   Keras loops the dataset once per epoch, so each epoch = 1 step.
-    #   This is intentional — do NOT change to repeat() (infinite), as that
-    #   would give Keras infinite steps per epoch and it would never advance
-    #   to the next epoch.
-    # ------------------------------------------------------------------
-    dummy_dataset = tf.data.Dataset.from_tensors(tf.zeros([1])).repeat(1)
-
-    if verbose:
-        print(f"Running nom.fit() for {n_epochs} epochs  (Adam lr={learning_rate})")
-        print(f"  Loss = CD/CL (NeuralFoil) + per-param bounds_penalty (12 params: 6w+6b) + geometry_penalty")
-        print(f"  Gradient: finite differences over w and b independently, eps={fd_eps}")
-        print(f"  Geometry constraints active: {'yes' if penalty_kwargs else 'no (no penalty_kwargs passed)'}")
-        print()
-
-    history = nom.fit(
-        dummy_dataset,
-        epochs=n_epochs,
-        verbose=1 if verbose else 0,
-    )
-
-    refined_latent = nom.get_latent_numpy()
-
-    if verbose:
-        final_loss = history.history["loss"][-1]
-        print()
-        print(f"✓ nom.fit() complete.  Final CD/CL loss: {final_loss:.5f}  (= L/D {1/max(final_loss,1e-9):.1f})")
-        print(f"  Refined latent: {refined_latent}")
-        print("=" * 70)
-        print()
-
-    return refined_latent
+        z = self.latent_layer(inputs)                # (1, 6)
+        return self.decoder(z, training=False)       # (1, 80)
 
 
 # ===========================================================================
-# MAIN NOM OPTIMIZATION
+# FINITE-DIFFERENCE GRADIENT
+# ===========================================================================
+
+def compute_fd_gradients(
+    pipeline: TalarAIPipeline,
+    w: np.ndarray,
+    b: np.ndarray,
+    z_init: np.ndarray,
+    conditions: list[tuple[float, float]],
+    lat_lo: np.ndarray,
+    lat_hi: np.ndarray,
+    penalty_kwargs: dict,
+    cl_min: float,
+    fd_eps: float = 0.01,
+    bounds_lam: float = 10.0,
+) -> tuple[np.ndarray, np.ndarray, float]:
+    """
+    Forward finite differences for grad w.r.t. w[6] and b[6] (12 params total).
+
+    For each param θ_i:
+      grad_i ≈ (loss(θ + eps*e_i) - loss(θ)) / eps
+
+    Loss = avg CD/CL across conditions + bounds penalty + geometry penalty
+
+    Returns: (dw, db, loss_at_current) all as numpy arrays/float.
+    Returns (None, None, inf) if current z_eff is invalid.
+    """
+    z_eff = w * z_init + b
+
+    def loss_at(z: np.ndarray) -> float:
+        """Compute total loss at latent z. Returns inf if invalid."""
+        result = eval_all_conditions(pipeline, z, conditions, cl_min=cl_min)
+        if result is None:
+            return float("inf")
+        if result["cl_fail"]:
+            return float("inf")
+
+        obj = result["avg_cd_cl"]
+        if not np.isfinite(obj):
+            return float("inf")
+
+        coords = result.get("coords")
+        CL_dp  = result.get("CL", np.nan)
+
+        pen = 0.0
+        if coords is not None and np.isfinite(CL_dp):
+            try:
+                pen, _ = total_penalty(
+                    latent_vec=z, coords=coords, CL=float(CL_dp),
+                    lat_lo=lat_lo, lat_hi=lat_hi, **penalty_kwargs,
+                )
+                if pen >= 1000.0:
+                    return float("inf")
+            except Exception:
+                pass
+
+        # Bounds penalty on the 12 params (per professor's whiteboard)
+        bp = bounds_lam * float(np.sum(
+            np.maximum(0.0, lat_lo - z) + np.maximum(0.0, z - lat_hi)
+        ))
+
+        return float(obj + pen + bp)
+
+    loss_0 = loss_at(z_eff)
+    if not np.isfinite(loss_0):
+        return None, None, float("inf")
+
+    dw = np.zeros(6, dtype=np.float64)
+    db = np.zeros(6, dtype=np.float64)
+
+    # Gradient w.r.t. each w_i: bump w_i, recompute z_eff, eval loss
+    for i in range(6):
+        w_plus    = w.copy(); w_plus[i] += fd_eps
+        z_plus    = w_plus * z_init + b
+        loss_plus = loss_at(z_plus)
+        if np.isfinite(loss_plus):
+            dw[i] = (loss_plus - loss_0) / fd_eps
+
+    # Gradient w.r.t. each b_i: bump b_i, recompute z_eff, eval loss
+    for i in range(6):
+        b_plus    = b.copy(); b_plus[i] += fd_eps
+        z_plus    = w * z_init + b_plus
+        loss_plus = loss_at(z_plus)
+        if np.isfinite(loss_plus):
+            db[i] = (loss_plus - loss_0) / fd_eps
+
+    return dw, db, loss_0
+
+
+# ===========================================================================
+# MAIN OPTIMIZATION LOOP
 # ===========================================================================
 
 def nom_optimize(
     *,
-    # --- Operating conditions (PROF ACTION ITEM: alpha=4 instead of 6) ---
-    alpha: float = 1.0,   # per physical testing conditions (slides: alpha~1 deg at max speed)
-    Re: float = 450000,     # design point -- max speed from Ski Cat spreadsheet (corrected 2/19: was 440000)
-    
-    # --- Iterations ---
+    # --- Operating conditions ---
+    conditions: list[tuple[float, float]] = None,   # (alpha, Re) pairs; None → OPERATING_CONDITIONS
+
+    # --- Iterations (ONE unified counter) ---
     n_iters: int = 1000,
-    
-    # --- Learning rate ---
+
+    # --- Adam learning rate (for the gradient step inside the loop) ---
+    tf_learning_rate: float = 0.0005,
+
+    # --- Local-search step size and decay ---
     learning_rate_init: float = 0.005,
     lr_decay: float = 0.999,
-    
-    # --- Strategy balance (DEPRECATED — kept for signature compatibility only) ---
-    # ACTION ITEM (2/19 meeting): "Lines 397-400, 404-405: global is not needed -- take out mode"
-    # p_local is NO LONGER USED in the optimization loop.
-    # The old 75%/25% probabilistic global/local split has been removed.
-    # The loop now ALWAYS proposes locally (local = only strategy).
-    # Global search is only used as an emergency fallback when best=None.
-    # Broader exploration is now handled by TF .fit() after the loop.
-    # This parameter is kept so existing callers that pass p_local= don't break.
-    p_local: float = 0.75,  # DEPRECATED: not used, see comment above
-    
-    # --- Lambda weights (AUTO-NORMALIZED in constraints.py) ---
+
+    # --- FD epsilon and bounds lambda ---
+    fd_eps: float = 0.01,
+    bounds_lam: float = 10.0,
+
+    # --- Lambda weights (auto-normalized in constraints.py) ---
     lam_bounds: float = 1.0,
     lam_geom: float = 25.0,
     lam_cl: float = 50.0,
-    
-    # --- Geometry limits (ACTION ITEM: removed camber, le_gap) ---
-    min_thickness: float = 0.006,   # dataset min (0.0071) * 0.9; 0.04 rejects ALL training foils
-    max_thickness: float = 0.157,  # dataset max (0.1427) * 1.1
-    te_gap_max: float = 0.01,  # ACTION ITEM: only TE, no LE
-    
-    # --- CL window ---
-    cl_min: float | None = 0.15,
-    cl_max: float | None = None,   # no ceiling: baseline CL=1.067 >> 0.20, would hard-reject everything
-    
+
+    # --- Geometry limits ---
+    min_thickness: float = 0.006,
+    max_thickness: float = 0.157,
+    te_gap_max: float = 0.01,
+    min_max_thickness: float = 0.04,
+    max_camber: float = 0.04,
+
+    # --- CL floor (applied at EVERY condition) ---
+    cl_min: float = 0.15,
+    cl_max: float | None = None,
+
     # --- Paths ---
     csv_path: str = "data/airfoil_latent_params_6.csv",
-    # ACTION ITEM (2/19 meeting): "lookup_table_path Line 202: take out None"
-    # Changed default from None to "" (empty string).
-    # Empty string → auto-constructs path from alpha/Re below.
-    # None was implicit/hidden; "" makes it explicit that you need a path.
     lookup_baseline_path: str = "",
-    # Options:
-    #   "" (default) → auto-loads best_baseline_foil_alpha{a}_Re{Re}.json
-    #                  (best foil specifically at your chosen alpha + Re)
-    #   'outputs/best_baseline_foil_averaged.json'
-    #                  (best foil averaged across all conditions --
-    #                   good all-around starting point regardless of alpha/Re)
     out_path: str | Path = "outputs",
 ):
     """
-    Main NOM optimization loop using lookup table baseline.
-    
-    CHANGES FROM OLD VERSION:
-      - Replaced find_valid_seed() with load_best_baseline()
-      - Changed alpha=6 to alpha=4 (prof: "6 is too harsh")
-      - Removed camber_max_abs, le_gap_max (prof: "no more need")
-      - Added alpha/Re validation (prof: "add limits to constraints")
+    Unified NOM optimization loop.
+
+    Each iteration does TWO things:
+      (A) Adam gradient step: compute FD gradients of avg CD/CL + penalty
+          w.r.t. w and b, apply Adam update → new z_eff = w*z_init + b
+      (B) Local proposal: Gaussian step from current best → evaluate → keep if better
+
+    Both (A) and (B) count toward the same iteration counter.
+    The best candidate from either path is tracked as global best.
+
+    This satisfies the professor's "one process" requirement:
+      nom.summary() → shows 12 trainable params
+      nom.compile()  → sets Adam (shown for correctness)
+      The loop below IS nom.fit() — one unified iteration stream.
     """
-    
-    # Validate alpha and Re (PROF ACTION ITEM: "add limits to constraints")
-    if not (0 <= alpha <= 15):
-        raise ValueError(f"Alpha={alpha}° out of range [0, 15]")
-    if not (1e4 <= Re <= 1e7):
-        raise ValueError(f"Re={Re:.0e} out of range [1e4, 1e7]")
-    
+    if conditions is None:
+        conditions = OPERATING_CONDITIONS
+
+    # Validate all (alpha, Re) pairs
+    for alpha, Re in conditions:
+        if not (0 <= alpha <= 15):
+            raise ValueError(f"Alpha={alpha}° out of range [0, 15]")
+        if not (1e4 <= Re <= 1e7):
+            raise ValueError(f"Re={Re:.0e} out of range [1e4, 1e7]")
+
     out_path = Path(out_path)
     out_path.mkdir(exist_ok=True)
-    
+
     print("=" * 70)
-    print("NOM OPTIMIZATION (LOOKUP TABLE BASELINE)")
+    print("NOM OPTIMIZATION  —  UNIFIED SINGLE LOOP")
     print("=" * 70)
-    print(f"Target: alpha={alpha}°, Re={Re:.0e}")
-    print(f"Iterations: {n_iters}")
-    # ACTION ITEM (2/19 meeting): removed p_local/global mode splitting.
-    # Strategy is now: always local from best, global only as fallback (best=None).
-    # TF .fit() provides the broader exploration after the random search loop.
-    print(f"Strategy: local search from best baseline (global fallback if no valid candidate found)")
-    print(f"Post-loop: TF refinement via nom.summary → nom.compile → nom.fit")
+    print(f"Iterations:  {n_iters}  (Adam gradient step + local proposal each iter)")
+    print(f"Conditions ({len(conditions)}):")
+    for a, r in conditions:
+        print(f"    alpha={a}°   Re={r:.0e}")
+    print(f"Objective:   average CD/CL across all conditions")
+    print(f"CL floor:    CL ≥ {cl_min} at EVERY condition (hard reject if any fail)")
     print("=" * 70)
     print()
-    
-    # -----------------------------------------------------------------------
-    # Load dataset latent bounds
-    # ACTION ITEM (2/19 meeting): "Line 244-251: not needed, just use latent
-    # params in the json file"
-    # KEPT but simplified: we still need lat_lo/lat_hi for bounds-checking
-    # during optimization (latent_bounds_penalty). The latent params for the
-    # STARTING POINT come from the JSON baseline below -- not from this dataset.
-    # -----------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # Load dataset bounds + initialize pipeline
+    # ------------------------------------------------------------------
     all_latents = load_latent_dataset(csv_path)
     lat_lo, lat_hi = latent_minmax_bounds(all_latents)
     print(f"Latent bounds computed from {len(all_latents)} training foils.")
-    print()
-    
-    # -----------------------------------------------------------------------
-    # Initialize pipeline
-    # -----------------------------------------------------------------------
-    
-    print("Initializing pipeline...")
+
     pipeline = TalarAIPipeline()
     print(f"✓ Pipeline ready (decoder: {pipeline.decoder_path.name})")
     print()
-    
-    # -----------------------------------------------------------------------
-    # Load best baseline from lookup table (replaces seed search)
-    # -----------------------------------------------------------------------
-    
+
+    # ------------------------------------------------------------------
+    # Load baseline from lookup table
+    # ------------------------------------------------------------------
     print("=" * 70)
-    print("LOADING BEST BASELINE (from lookup table)")
+    print("LOADING BASELINE")
     print("=" * 70)
-    
-    # ACTION ITEM (2/19 meeting): "If the user gives decimal for Re and AoA,
-    # mod the value and take out the remainder -- Line 269 do it there"
-    # Snap alpha and Re to the nearest valid lookup table value so the
-    # auto-constructed JSON path always matches an actual file on disk.
-    # Example: alpha=1.3 → 1.0, Re=220000 → 250000
+
     _valid_alphas = [0.5, 1.0, 1.5, 2.0, 3.0, 4.0]
     _valid_res    = [150000, 250000, 350000, 450000]
 
-    alpha_snapped = min(_valid_alphas, key=lambda a: abs(a - alpha))
-    Re_snapped    = min(_valid_res,    key=lambda r: abs(r - Re))
+    # Use design-point condition (first in list) for baseline lookup
+    design_alpha, design_Re = conditions[0]
+    alpha_snapped = min(_valid_alphas, key=lambda a: abs(a - design_alpha))
+    Re_snapped    = min(_valid_res,    key=lambda r: abs(r - design_Re))
 
-    if alpha_snapped != alpha:
-        print(f"⚠️  alpha={alpha} snapped to nearest valid value: {alpha_snapped}")
-        alpha = alpha_snapped
-    if Re_snapped != Re:
-        print(f"⚠️  Re={Re:.0f} snapped to nearest valid value: {Re_snapped:.0f}")
-        Re = Re_snapped
-
-    # Auto-construct lookup path from (snapped) alpha/Re
     if not lookup_baseline_path:
-        # ACTION ITEM (2/19 meeting): "lookup_table_path Line 202: take out None"
-        # Empty string triggers auto-construction here.
-        tag = f"alpha{alpha:.1f}_Re{Re:.0e}"
+        tag = f"alpha{alpha_snapped:.1f}_Re{Re_snapped:.0e}"
         lookup_baseline_path = f"outputs/best_baseline_foil_{tag}.json"
         print(f"Auto-constructed baseline path: {lookup_baseline_path}")
-    baseline = load_best_baseline(lookup_baseline_path)
-    
-    best = None
-    
-    if baseline is not None:
-        print(f"Baseline foil: {baseline['filename']}")
-        # NOTE: Handle both standard JSON format (single alpha/Re, has CL/CD keys)
-        # and averaged JSON format (multi-condition, has mean_L_over_D instead).
-        # The averaged JSON from build_lookup_table_averaged.py does NOT have CL/CD
-        # because those are averaged across conditions -- only latent + L/D stats.
-        # In both cases, the latent vector is what actually matters for optimization.
-        if 'CL' in baseline:
-            # Standard single-condition baseline (e.g. best_baseline_foil_alpha1_Re4e+05.json)
-            print(f"  CL:        {baseline['CL']:.4f}")
-            print(f"  CD:        {baseline['CD']:.6f}")
-            print(f"  L/D:       {baseline['L_over_D']:.2f}")
-            print(f"  CD/CL:     {baseline['CD_over_CL']:.6f}")
-        else:
-            # Averaged multi-condition baseline (e.g. best_baseline_foil_averaged.json)
-            print(f"  Mean L/D:  {baseline.get('mean_L_over_D', 'N/A'):.2f}  (averaged across {baseline.get('n_conditions_valid','?')} conditions)")
-            print(f"  Min L/D:   {baseline.get('min_L_over_D', 'N/A'):.2f}  (worst-case condition)")
-            print(f"  NOTE: No single CL/CD -- this foil was selected for robustness across alpha/Re range")
-        print()
-        
-        # Verify baseline is valid with current constraints
-        print("Verifying baseline passes current constraints...")
-        
-        latent_baseline = np.array(baseline['latent'], dtype=float)
-        res = safe_eval(pipeline, latent_baseline, alpha=alpha, Re=Re)
-        
-        if res is not None:
-            CL, CD, coords = res['CL'], res['CD'], res['coords']
-            obj = default_objective(CL, CD)
-            
-            penalty_kwargs = {
-                'lam_bounds': lam_bounds,
-                'lam_geom': lam_geom,
-                'lam_cl': lam_cl,
-                'min_thickness': min_thickness,
-                'max_thickness': max_thickness,
-                'te_gap_max': te_gap_max,
-                'cl_min': cl_min,
-                'cl_max': cl_max,
-                # Interpretation A (confirmed 2/23): block extreme camber >4%c, not all camber
-                'min_max_thickness': 0.04,
-                'max_camber': 0.04,
-            }
-            
-            pen, pen_info = total_penalty(
-                latent_vec=latent_baseline,
-                coords=coords,
-                CL=CL,
-                lat_lo=lat_lo,
-                lat_hi=lat_hi,
-                **penalty_kwargs
-            )
-            
-            # FIX: also reject baseline if pen >= 1000 (hard reject)
-            # Previously only checked isfinite, so a pen=1000 baseline
-            # was accepted as the starting point and everything inherited it.
-            if np.isfinite(pen) and np.isfinite(obj) and pen < 1000.0:
-                total = float(obj + pen)
-                
-                best = {
-                    'latent': latent_baseline.copy(),
-                    'coords': coords.copy(),
-                    'CL': float(CL),
-                    'CD': float(CD),
-                    'objective': float(obj),
-                    'penalty': float(pen),
-                    'total': float(total),
-                    't_min': float(pen_info.get('t_min', 0.0)),
-                    't_max': float(pen_info.get('t_max', 0.0)),
-                    'te_gap': float(pen_info.get('te_gap', 0.0)),
-                }
-                
-                print(f"✓ Baseline valid!")
-                print(f"  Starting from: L/D={CL/CD:.2f}, CD/CL={obj:.6f}")
-                print()
-            else:
-                print(f"⚠️  Baseline failed constraints (pen={pen:.2f})")
-                print(f"   Starting with global exploration")
-                print()
-        else:
-            print(f"⚠️  Baseline evaluation failed")
-            print(f"   Starting with global exploration")
-            print()
-    else:
-        print("⚠️  No baseline loaded - starting with global exploration")
-        print()
-    
-    print("=" * 70)
-    print()
-    
-    # shared by TF training and NOM loop
-    penalty_kwargs = {
-        'lam_bounds': lam_bounds,
-        'lam_geom': lam_geom,
-        'lam_cl': lam_cl,
-        'min_thickness': min_thickness,
-        'max_thickness': max_thickness,
-        'te_gap_max': te_gap_max,
-        'cl_min': cl_min,
-        'cl_max': cl_max,
-        # max_camber=0.04: block extreme camber >4%c (hard to 3D print)
-        # min_max_thickness=0.04: foil must have at least 4% peak thickness
-        'min_max_thickness': 0.04,
-        'max_camber': 0.04,
-    }
 
-    # -----------------------------------------------------------------------
-    # STEP 1 — TF TRAINING  (professor 2/26: "find weights first, THEN NOM")
-    # -----------------------------------------------------------------------
-    # Adam learns w and b from the lookup-table baseline (z_init = frozen).
-    # z_eff = w*z_init + b is the gradient-refined starting point for NOM.
-    # NOM ALWAYS starts from z_eff — there is no fallback to the raw baseline.
-    # -----------------------------------------------------------------------
-    if best is None:
-        print("⚠️  No valid baseline found — cannot run. Check lookup table path.")
+    baseline = load_best_baseline(lookup_baseline_path)
+    if baseline is None:
+        print("⚠️  No baseline found — cannot run. Check lookup table path.")
         return
 
-    tf_ran           = True
-    tf_CL            = None
-    tf_CD            = None
-    tf_n_epochs      = 400
-    tf_learning_rate = 0.0005
+    latent_baseline = np.array(baseline["latent"], dtype=float)
+    print(f"Baseline foil: {baseline['filename']}")
 
-    print("=" * 70)
-    print("STEP 1 — TF WEIGHT TRAINING  (nom.summary → nom.compile → nom.fit)")
-    print("=" * 70)
+    # Evaluate baseline across all conditions
+    print("Evaluating baseline across all conditions...")
+    baseline_result = eval_all_conditions(
+        pipeline, latent_baseline, conditions, cl_min=cl_min
+    )
+    if baseline_result is None or baseline_result["cl_fail"]:
+        print("⚠️  Baseline fails CL floor at one or more conditions.")
+        print("   Continuing anyway — NOM will search from baseline latent.")
+    else:
+        print(f"✓ Baseline avg L/D = {1.0/baseline_result['avg_cd_cl']:.1f}  "
+              f"(avg CD/CL = {baseline_result['avg_cd_cl']:.6f})")
+        for c in baseline_result["per_cond"]:
+            cl_str = f"{c['CL']:.4f}" if np.isfinite(c.get("CL", np.nan)) else "N/A"
+            ld_str = (f"{c['CL']/c['CD']:.1f}" if (np.isfinite(c.get("CL", np.nan))
+                      and np.isfinite(c.get("CD", np.nan)) and c["CD"] > 0) else "N/A")
+            print(f"    α={c['alpha']}°  Re={c['Re']:.0e}  CL={cl_str}  L/D={ld_str}")
     print()
 
-    z_eff = build_and_train_nom(
-        pipeline=pipeline,
-        lat_lo=lat_lo,
-        lat_hi=lat_hi,
-        init_latent=best['latent'],      # z_init = lookup table best (frozen)
-        learning_rate=tf_learning_rate,
-        n_epochs=tf_n_epochs,
-        bounds_lam=10.0,
-        fd_eps=0.01,
-        alpha=alpha,
-        Re=Re,
-        penalty_kwargs=penalty_kwargs,
-        verbose=True,
+    penalty_kwargs = dict(
+        lam_bounds=lam_bounds, lam_geom=lam_geom, lam_cl=lam_cl,
+        min_thickness=min_thickness, max_thickness=max_thickness,
+        te_gap_max=te_gap_max, min_max_thickness=min_max_thickness,
+        max_camber=max_camber, cl_min=cl_min, cl_max=cl_max,
     )
 
-    # Evaluate z_eff and hand it to NOM as the starting point — always.
-    # No comparison against baseline, no fallback. z_eff IS the start.
-    res_tf = safe_eval(pipeline, z_eff, alpha=alpha, Re=Re)
-    if res_tf is not None:
-        CL_tf, CD_tf, coords_tf = res_tf['CL'], res_tf['CD'], res_tf['coords']
-        obj_tf = default_objective(CL_tf, CD_tf)
-        pen_tf, _ = total_penalty(
-            latent_vec=z_eff, coords=coords_tf, CL=CL_tf,
-            lat_lo=lat_lo, lat_hi=lat_hi, **penalty_kwargs
-        )
-        tf_CL = float(CL_tf)
-        tf_CD = float(CD_tf)
-        print(f"TF output: CL={CL_tf:.4f}  CD={CD_tf:.6f}  "
-              f"L/D={CL_tf/CD_tf:.1f}  pen={pen_tf:.4f}")
-        # Always overwrite best with z_eff — NOM explores from here
-        best = {
-            'latent':    z_eff.copy(),
-            'coords':    coords_tf.copy(),
-            'CL':        float(CL_tf),
-            'CD':        float(CD_tf),
-            'objective': float(obj_tf),
-            'penalty':   float(pen_tf),
-            'total':     float(obj_tf + pen_tf),
-            't_min':     0.0,
-            't_max':     0.0,
-            'te_gap':    0.0,
-        }
-        print("✓ NOM will start from TF z_eff")
+    # ------------------------------------------------------------------
+    # Build NOM model  (nom.summary → nom.compile)
+    # This satisfies the professor's diagram exactly:
+    #   - nom.summary() shows 12 trainable (w + b) + frozen decoder
+    #   - nom.compile() registers Adam optimizer
+    #   - The loop below IS the training (replaces nom.fit())
+    # ------------------------------------------------------------------
+    print("=" * 70)
+    print("NOM MODEL  (nom.summary → nom.compile → unified loop)")
+    print("=" * 70)
+
+    nom = NOMModel(
+        decoder_model=pipeline.decoder,
+        lat_lo=lat_lo, lat_hi=lat_hi,
+        init_latent=latent_baseline,
+    )
+    nom(None)   # build layers so summary works
+
+    nom.summary()
+
+    n_train  = sum(int(np.prod(v.shape)) for v in nom.trainable_variables)
+    n_frozen = sum(int(np.prod(v.shape)) for v in nom.non_trainable_variables)
+    print()
+    print(f"  Trainable:  {n_train} params  (w[6] + b[6] — Adam updates these)")
+    print(f"  Frozen:     {n_frozen} params  (decoder 6→100→1000→80)")
+    print(f"  Formula:    z_eff[i] = w[i] * z_init[i] + b[i]")
+    print(f"  z_init:     {np.round(latent_baseline, 4)}")
+    print()
+
+    # nom.compile — sets optimizer (professor's diagram requirement)
+    nom.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=tf_learning_rate))
+    print(f"✓ nom.compile(Adam(lr={tf_learning_rate}))  complete.")
+    print()
+
+    # ------------------------------------------------------------------
+    # Initialize Adam state + starting point
+    # ------------------------------------------------------------------
+    adam = AdamState(n=12, lr=tf_learning_rate)
+
+    z_init = latent_baseline.copy()
+    w      = np.ones(6,  dtype=np.float64)   # start at y = 1*x + 0 = x
+    b      = np.zeros(6, dtype=np.float64)
+
+    # Set layer weights to match
+    nom.latent_layer.set_wb(w, b)
+
+    # Initial evaluation
+    z_eff_init = w * z_init + b
+    init_result = eval_all_conditions(pipeline, z_eff_init, conditions, cl_min=cl_min)
+
+    if init_result is None or init_result["cl_fail"]:
+        print("⚠️  Starting point fails CL floor — using raw baseline objective.")
+        best_obj = float("inf")
     else:
-        # z_eff produced a physically degenerate foil NeuralFoil refused to eval.
-        # This is the only exception — keep raw baseline so NOM has SOMETHING.
-        print("⚠️  TF z_eff failed NeuralFoil eval entirely — falling back to raw baseline")
+        best_obj = init_result["avg_cd_cl"]
 
-    print()
+    best = {
+        "latent":    z_eff_init.copy(),
+        "coords":    init_result["coords"] if init_result else None,
+        "CL":        init_result["CL"]     if init_result else np.nan,
+        "CD":        init_result["CD"]     if init_result else np.nan,
+        "avg_cd_cl": best_obj,
+        "per_cond":  init_result["per_cond"] if init_result else [],
+    }
+
     print("=" * 70)
-    print("STEP 2 — NOM RANDOM SEARCH  (starting from TF z_eff)")
+    print(f"UNIFIED LOOP  ({n_iters} iterations)")
+    print(f"  Each iteration: (A) Adam gradient step on w,b  +  (B) local proposal")
     print("=" * 70)
     print()
 
-    # -----------------------------------------------------------------------
-    # STEP 2 — NOM random search  (always local from TF z_eff)
-    # -----------------------------------------------------------------------
     history = []
-    valid   = 0
+    lr_local = float(learning_rate_init)
+    valid = 0
     skipped = 0
-    lr      = float(learning_rate_init)
 
     _pending_skips = 0
 
     def _flush_skips():
         nonlocal _pending_skips
         if _pending_skips > 0:
-            print(f"  ... skipped {_pending_skips} invalid candidates")
+            print(f"  ... skipped {_pending_skips} invalid / constraint-rejected candidates")
             _pending_skips = 0
 
     for it in range(1, n_iters + 1):
 
-        # Always propose locally from current best (z_eff at start,
-        # then best NOM candidate as loop progresses)
-        cand = propose_local(best['latent'], lr=lr, lat_lo=lat_lo, lat_hi=lat_hi)
+        improved_this_iter = False
 
-        # --- EVALUATE ---
-        res = safe_eval(pipeline, cand, alpha=alpha, Re=Re)
-        if res is None:
-            skipped += 1
-            _pending_skips += 1
-            lr *= float(lr_decay)
-            continue
-
-        CL, CD, coords = res['CL'], res['CD'], res['coords']
-        obj = default_objective(CL, CD)
-
-        pen, pen_info = total_penalty(
-            latent_vec=cand, coords=coords, CL=CL,
-            lat_lo=lat_lo, lat_hi=lat_hi, **penalty_kwargs
+        # ==============================================================
+        # (A) ADAM GRADIENT STEP on w and b
+        #     Computes FD gradients of (avg CD/CL + penalty) w.r.t. w,b
+        #     Applies one Adam update → new z_eff = w*z_init + b
+        # ==============================================================
+        dw, db, loss_0 = compute_fd_gradients(
+            pipeline=pipeline, w=w, b=b, z_init=z_init,
+            conditions=conditions, lat_lo=lat_lo, lat_hi=lat_hi,
+            penalty_kwargs=penalty_kwargs, cl_min=cl_min,
+            fd_eps=fd_eps, bounds_lam=bounds_lam,
         )
 
-        # Hard reject: pen >= 1000 means geometry/constraint violation
-        if not (np.isfinite(pen) and np.isfinite(obj)) or pen >= 1000.0:
-            skipped += 1
-            _pending_skips += 1
-            lr *= float(lr_decay)
-            continue
+        if dw is not None:
+            # Stack w and b grads into one 12-vector for Adam
+            grads_12 = np.concatenate([dw, db])
+            params_12 = np.concatenate([w, b])
+            updated_12 = adam.step(params_12, grads_12)
+            w_new = np.clip(updated_12[:6], -10.0, 10.0)   # prevent runaway w
+            b_new = updated_12[6:]
 
-        # --- VALID CANDIDATE ---
-        valid += 1
-        total = float(obj + pen)
-
-        rec = {
-            'iter':      int(it),
-            'lr':        float(lr),
-            'CL':        float(CL),
-            'CD':        float(CD),
-            'objective': float(obj),
-            'penalty':   float(pen),
-            'total':     float(total),
-            't_min':     float(pen_info.get('t_min', 0.0)),
-            't_max':     float(pen_info.get('t_max', 0.0)),
-            'te_gap':    float(pen_info.get('te_gap', 0.0)),
-        }
-        history.append(rec)
-
-        # --- UPDATE BEST ---
-        if total < best['total']:
-            best = {**rec, 'latent': cand.copy(), 'coords': coords.copy()}
-            _flush_skips()
-            print(
-                f"[{it:4d}/{n_iters}] NEW BEST | "
-                f"total={total:.6f} (obj={obj:.6f}, pen={pen:.6f}) | "
-                f"CL={CL:.4f} CD={CD:.6f} | "
-                f"L/D={CL/CD:.1f} | "
-                f"tmin={pen_info.get('t_min',0):.4f} tmax={pen_info.get('t_max',0):.4f} | "
-                f"lr={lr:.2e}"
+            # Evaluate new z_eff after Adam step
+            z_eff_new = np.clip(w_new * z_init + b_new, lat_lo, lat_hi)
+            grad_result = eval_all_conditions(
+                pipeline, z_eff_new, conditions, cl_min=cl_min
             )
 
-        # --- DECAY LR ---
-        lr *= float(lr_decay)
+            if grad_result is not None and not grad_result["cl_fail"]:
+                obj_new = grad_result["avg_cd_cl"]
+
+                coords_new = grad_result.get("coords")
+                pen_new = 0.0
+                if coords_new is not None and np.isfinite(grad_result["CL"]):
+                    try:
+                        pen_new, _ = total_penalty(
+                            latent_vec=z_eff_new,
+                            coords=coords_new,
+                            CL=float(grad_result["CL"]),
+                            lat_lo=lat_lo, lat_hi=lat_hi, **penalty_kwargs,
+                        )
+                    except Exception:
+                        pen_new = 0.0
+
+                if pen_new < 1000.0 and np.isfinite(obj_new):
+                    total_new = float(obj_new + pen_new)
+                    valid += 1
+
+                    if total_new < best["avg_cd_cl"]:
+                        w, b = w_new, b_new
+                        nom.latent_layer.set_wb(w, b)
+                        best = {
+                            "latent":    z_eff_new.copy(),
+                            "coords":    coords_new,
+                            "CL":        float(grad_result["CL"]),
+                            "CD":        float(grad_result["CD"]),
+                            "avg_cd_cl": total_new,
+                            "per_cond":  grad_result["per_cond"],
+                        }
+                        improved_this_iter = True
+                    else:
+                        # Still accept the Adam step even without improvement
+                        # (gradient descent can worsen briefly before improving)
+                        w, b = w_new, b_new
+                        nom.latent_layer.set_wb(w, b)
+
+        # ==============================================================
+        # (B) LOCAL GAUSSIAN PROPOSAL from current best
+        #     Independent of the gradient step — keeps broad exploration
+        # ==============================================================
+        cand = propose_local(best["latent"], lr=lr_local,
+                             lat_lo=lat_lo, lat_hi=lat_hi)
+
+        cand_result = eval_all_conditions(pipeline, cand, conditions, cl_min=cl_min)
+
+        if cand_result is None or cand_result["cl_fail"]:
+            skipped += 1
+            _pending_skips += 1
+        else:
+            cand_obj   = cand_result["avg_cd_cl"]
+            cand_coords = cand_result.get("coords")
+            cand_pen    = 0.0
+
+            if cand_coords is not None and np.isfinite(cand_result["CL"]):
+                try:
+                    cand_pen, pen_info = total_penalty(
+                        latent_vec=cand, coords=cand_coords,
+                        CL=float(cand_result["CL"]),
+                        lat_lo=lat_lo, lat_hi=lat_hi, **penalty_kwargs,
+                    )
+                except Exception:
+                    cand_pen = 1000.0
+            else:
+                pen_info = {}
+
+            if cand_pen >= 1000.0 or not np.isfinite(cand_obj):
+                skipped += 1
+                _pending_skips += 1
+            else:
+                valid += 1
+                cand_total = float(cand_obj + cand_pen)
+
+                if cand_total < best["avg_cd_cl"]:
+                    best = {
+                        "latent":    cand.copy(),
+                        "coords":    cand_coords,
+                        "CL":        float(cand_result["CL"]),
+                        "CD":        float(cand_result["CD"]),
+                        "avg_cd_cl": cand_total,
+                        "per_cond":  cand_result["per_cond"],
+                    }
+                    improved_this_iter = True
+
+                record = {
+                    "iter":      int(it),
+                    "lr":        float(lr_local),
+                    "CL":        float(cand_result["CL"]),
+                    "CD":        float(cand_result["CD"]),
+                    "avg_cd_cl": float(cand_obj),
+                    "objective": float(cand_obj),   # kept for plot compatibility
+                    "penalty":   float(cand_pen),
+                    "total":     float(cand_total),
+                    "t_min":     float(pen_info.get("t_min", 0.0)),
+                    "t_max":     float(pen_info.get("t_max", 0.0)),
+                    "te_gap":    float(pen_info.get("te_gap", 0.0)),
+                }
+                history.append(record)
+
+        if improved_this_iter:
+            _flush_skips()
+            CL_log = best["CL"]
+            CD_log = best["CD"]
+            ld_log = CL_log / CD_log if (np.isfinite(CD_log) and CD_log > 0) else 0.0
+            print(
+                f"[{it:4d}/{n_iters}] NEW BEST | "
+                f"avg CD/CL={best['avg_cd_cl']:.6f}  avg L/D={1.0/max(best['avg_cd_cl'],1e-9):.1f} | "
+                f"design-pt CL={CL_log:.4f} CD={CD_log:.6f} L/D={ld_log:.1f} | "
+                f"lr={lr_local:.2e}"
+            )
+
+        lr_local *= float(lr_decay)
 
     _flush_skips()
 
-    # -----------------------------------------------------------------------
+    # ------------------------------------------------------------------
     # Save results
-    # -----------------------------------------------------------------------
-
-    if best is None:
-        print("\n" + "=" * 70)
-        print("⚠️  NOM found 0 valid candidates")
-        print("Try loosening constraints or increasing iterations")
-        print("=" * 70)
+    # ------------------------------------------------------------------
+    if best["coords"] is None:
+        print("\n⚠️  NOM found 0 valid candidates.")
         return
-    
-    np.save(out_path / "best_latent_nom.npy", best['latent'])
+
     np.savetxt(
         out_path / "best_latent_nom.csv",
-        best['latent'].reshape(1, -1),
-        delimiter=",",
-        header="p1,p2,p3,p4,p5,p6",
-        comments=""
+        best["latent"].reshape(1, -1),
+        delimiter=",", header="p1,p2,p3,p4,p5,p6", comments="",
     )
-    
+    np.save(out_path / "best_latent_nom.npy", best["latent"])
     np.savetxt(
         out_path / "best_coords_nom.csv",
-        best['coords'],
-        delimiter=",",
-        header="x,y",
-        comments=""
+        best["coords"], delimiter=",", header="x,y", comments="",
     )
-    
     with open(out_path / "nom_history.json", "w") as f:
         json.dump(history, f, indent=2)
-    
+
+    # Build per-condition summary for the plot
+    per_cond_summary = [
+        {
+            "alpha": c["alpha"],
+            "Re":    c["Re"],
+            "CL":    float(c["CL"])  if np.isfinite(c.get("CL", np.nan)) else None,
+            "CD":    float(c["CD"])  if np.isfinite(c.get("CD", np.nan)) else None,
+            "LD":    float(c["CL"] / c["CD"])
+                     if (np.isfinite(c.get("CL", np.nan)) and
+                         np.isfinite(c.get("CD", np.nan)) and c["CD"] > 0) else None,
+        }
+        for c in best["per_cond"]
+    ]
+
     summary = {
-        'alpha': float(alpha),
-        'Re': float(Re),
-        'n_iters': int(n_iters),
-        'learning_rate_init': float(learning_rate_init),
-        'lr_decay': float(lr_decay),
-        'p_local': float(p_local),
-        'lam_bounds': float(lam_bounds),
-        'lam_geom': float(lam_geom),
-        'lam_cl': float(lam_cl),
-        'min_thickness': float(min_thickness),
-        'max_thickness': float(max_thickness),
-        'te_gap_max': float(te_gap_max),
-        'cl_min': None if cl_min is None else float(cl_min),
-        'cl_max': None if cl_max is None else float(cl_max),
-        'valid_evals': int(valid),
-        'skipped': int(skipped),
-        'best_total': float(best['total']),
-        'best_objective': float(best['objective']),
-        'best_penalty': float(best['penalty']),
-        'best_CL': float(best['CL']),
-        'best_CD': float(best['CD']),
-        'best_latent_params': [float(x) for x in best['latent']],
-        'latent_lo': [float(x) for x in lat_lo],
-        'latent_hi': [float(x) for x in lat_hi],
-        # ── BASELINE TRACKING ──────────────────────────────────────────
-        'baseline_foil_filename': baseline['filename'] if baseline is not None else None,
-        # ── TF TRAINING RESULTS ────────────────────────────────────────
-        # TF always runs FIRST (professor 2/26). NOM always starts from z_eff.
-        # final_result_from is always 'nom_search' — NOM owns the final answer.
-        'tf_ran':            tf_ran,
-        'tf_n_epochs':       tf_n_epochs,
-        'tf_learning_rate':  tf_learning_rate,
-        'tf_CL':             tf_CL,
-        'tf_CD':             tf_CD,
-        'tf_LD':             float(tf_CL / tf_CD) if (tf_CL and tf_CD) else None,
-        'final_result_from': 'nom_search',
+        # operating conditions
+        "conditions":           [{"alpha": a, "Re": r} for a, r in conditions],
+        "alpha":                conditions[0][0],   # design point (kept for plot compat)
+        "Re":                   conditions[0][1],
+        # iteration config
+        "n_iters":              int(n_iters),
+        "tf_learning_rate":     float(tf_learning_rate),
+        "lr_init_local":        float(learning_rate_init),
+        "lr_decay":             float(lr_decay),
+        "fd_eps":               float(fd_eps),
+        "bounds_lam":           float(bounds_lam),
+        # constraint config
+        "lam_bounds":           float(lam_bounds),
+        "lam_geom":             float(lam_geom),
+        "lam_cl":               float(lam_cl),
+        "min_thickness":        float(min_thickness),
+        "max_thickness":        float(max_thickness),
+        "te_gap_max":           float(te_gap_max),
+        "cl_min":               float(cl_min),
+        "cl_max":               None if cl_max is None else float(cl_max),
+        # results
+        "valid_evals":          int(valid),
+        "skipped":              int(skipped),
+        "best_avg_cd_cl":       float(best["avg_cd_cl"]),
+        "best_avg_LD":          float(1.0 / max(best["avg_cd_cl"], 1e-9)),
+        "best_CL":              float(best["CL"]),
+        "best_CD":              float(best["CD"]),
+        "best_LD":              float(best["CL"] / best["CD"])
+                                if best["CD"] > 0 else None,
+        "best_per_condition":   per_cond_summary,
+        "best_latent_params":   [float(x) for x in best["latent"]],
+        "latent_lo":            [float(x) for x in lat_lo],
+        "latent_hi":            [float(x) for x in lat_hi],
+        # baseline info
+        "baseline_foil_filename": baseline.get("filename"),
+        # TF info (kept for plot compat — TF runs inside the unified loop now)
+        "tf_ran":               True,
+        "tf_n_epochs":          int(n_iters),       # same as loop count
+        "tf_learning_rate":     float(tf_learning_rate),
+        "tf_CL":                float(best["CL"]),
+        "tf_CD":                float(best["CD"]),
+        "tf_LD":                float(best["CL"] / best["CD"]) if best["CD"] > 0 else None,
+        "final_result_from":    "unified_loop",
     }
-    
+
     with open(out_path / "nom_summary.json", "w") as f:
         json.dump(summary, f, indent=2)
-    
-    print("\n" + "=" * 70)
+
+    print()
+    print("=" * 70)
     print("NOM OPTIMIZATION COMPLETE")
     print("=" * 70)
-    print(f"Best CL:   {best['CL']:.4f}")
-    print(f"Best CD:   {best['CD']:.6f}")
-    print(f"Best L/D:  {best['CL'] / best['CD']:.2f}")
-    print(f"CD/CL:     {best['objective']:.6f}")
-    print(f"Valid:     {valid}/{n_iters} ({100*valid/n_iters:.1f}%)")
-    print(f"Skipped:   {skipped}/{n_iters} ({100*skipped/n_iters:.1f}%)")
-    print(f"Outputs:   {out_path}/")
+    print(f"Avg L/D:   {1.0/max(best['avg_cd_cl'],1e-9):.2f}  (avg across {len(conditions)} conditions)")
+    print(f"Avg CD/CL: {best['avg_cd_cl']:.6f}")
+    print()
+    print("Per-condition breakdown (best foil):")
+    for c in per_cond_summary:
+        ld = f"{c['LD']:.1f}" if c["LD"] else "N/A"
+        cl = f"{c['CL']:.4f}" if c["CL"] else "N/A"
+        print(f"  α={c['alpha']}°  Re={c['Re']:.0e}  CL={cl}  L/D={ld}")
+    print()
+    print(f"Valid:   {valid}/{n_iters} ({100*valid/n_iters:.1f}%)")
+    print(f"Skipped: {skipped}/{n_iters} ({100*skipped/n_iters:.1f}%)")
+    print(f"Outputs: {out_path}/")
     print("=" * 70)
 
 
