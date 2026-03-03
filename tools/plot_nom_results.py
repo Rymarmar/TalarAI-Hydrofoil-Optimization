@@ -156,8 +156,8 @@ def main(
     avg_LD    = summary.get("best_avg_LD", None)   if summary else None
     alpha_val = summary.get("alpha", "?")          if summary else "?"
     Re_val    = summary.get("Re",    0)            if summary else 0
-    n_ep      = summary.get("tf_n_epochs", "?")    if summary else "?"
-    lr_tf     = summary.get("tf_learning_rate", 0.0005) if summary else 0.0005
+    n_ep      = summary.get("n_iters", "?")         if summary else "?"
+    lr_tf     = summary.get("learning_rate", 0.0005) if summary else 0.0005
     conditions = summary.get("conditions", [])     if summary else []
     n_cond    = len(conditions)
 
@@ -269,7 +269,7 @@ def main(
     # clearly visible instead of being squashed at the bottom by outliers.
     if ax_conv is not None and history:
         iters = [h["iter"]      for h in history]
-        objs  = [h.get("avg_cd_cl", h.get("objective", 0)) for h in history]
+        objs  = [h.get("avg_cd_cl", 0) for h in history]
 
         best_curve = []
         cur = float("inf")

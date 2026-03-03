@@ -443,9 +443,6 @@ class LinearLatentLayer(tf.keras.layers.Layer):
         self.b = self.add_weight(
             name="b", shape=(6,), initializer="zeros", trainable=True)
 
-        self._lat_lo = tf.constant(lat_lo.astype(np.float32))
-        self._lat_hi = tf.constant(lat_hi.astype(np.float32))
-
     def call(self, inputs=None):
         """
         Forward pass: apply the professor's formula z_eff = w * z_init + b.
@@ -455,13 +452,14 @@ class LinearLatentLayer(tf.keras.layers.Layer):
         return tf.expand_dims(z_eff, axis=0)      # (1, 6) for decoder input
 
     def get_effective_latent(self) -> np.ndarray:
-        """Return current z_eff = w * z_init + b as a numpy (6,) array."""
-        return (self.w.numpy() * self._z_init.numpy() + self.b.numpy()).reshape(6)
+        """
+        Return current z_eff = w * z_init + b as a numpy (6,) array.
 
-    def set_wb(self, w: np.ndarray, b: np.ndarray):
-        """Manually assign w and b (used in train_step after Adam update)."""
-        self.w.assign(w.astype(np.float32))
-        self.b.assign(b.astype(np.float32))
+        PUBLIC API for external callers (plot_nom_results.py, future UI).
+        NOT used inside train_step because train_step needs w, b, z_init
+        as separate arrays for the finite-difference perturbation loop.
+        """
+        return (self.w.numpy() * self._z_init.numpy() + self.b.numpy()).reshape(6)
 
 
 # ===========================================================================
@@ -524,7 +522,7 @@ class NOMModel(tf.keras.Model):
         self.n_improved  = 0
         self.n_valid     = 0
         self.n_skipped   = 0
-        self._n_iters    = 500  # overwritten by nom_optimize before fit()
+        self._n_iters    = 200  # overwritten by nom_optimize before fit()
 
     def call(self, inputs=None, training=False):
         """
@@ -575,7 +573,7 @@ class NOMModel(tf.keras.Model):
         #   This starts at lr_max, smoothly decays to lr_min.
         # ------------------------------------------------------------------
         iter_num_for_lr = int(self.optimizer.iterations.numpy())
-        n_total_lr = max(getattr(self, "_n_iters", 500), 1)
+        n_total_lr = max(getattr(self, "_n_iters", 200), 1)
         if self._initial_lr is None:
             self._initial_lr = float(self.optimizer.learning_rate)
         lr_max = self._initial_lr
@@ -804,7 +802,6 @@ class NOMModel(tf.keras.Model):
                 "CL":        float(new_result["CL"]),
                 "CD":        float(new_result["CD"]),
                 "avg_cd_cl": float(new_result["avg_cd_cl"]),
-                "objective": float(new_result["avg_cd_cl"]),
                 "loss":      float(new_loss),
             })
         else:
@@ -828,7 +825,7 @@ class NOMModel(tf.keras.Model):
 
     def _print_step(self, iter_num, loss_0, dbg, skipped=False, step_ok=True):
         """Print a one-liner per epoch: iter, loss, CL, CD, L/D, penalty, valid/skip, ETA."""
-        n_total = getattr(self, "_n_iters", 500)
+        n_total = getattr(self, "_n_iters", 200)
         elapsed = time.time() - getattr(self, "_t_start", time.time())
         secs_per_step = elapsed / max(iter_num, 1)
         eta_secs = secs_per_step * (n_total - iter_num)
@@ -882,7 +879,7 @@ def nom_optimize(
     # --- Number of iterations (= epochs passed to nom.fit) ---
     # [2/26]: "iterations and epochs should all be the same — one process"
     # Each epoch = one full FD gradient computation + one Adam update.
-    n_iters: int = 500,
+    n_iters: int = 200,
 
     # --- Adam learning rate ---
     # [2/10]: "Learning Rate: 1e-3 or less"
@@ -1288,7 +1285,7 @@ def nom_optimize(
         "alpha":                  conditions[0][0],
         "Re":                     conditions[0][1],
         "n_iters":                int(n_iters),
-        "tf_learning_rate":       float(tf_learning_rate),
+        "learning_rate":          float(tf_learning_rate),
         "fd_eps":                 float(fd_eps),
         "bounds_lam":             float(bounds_lam),
         "lam_bounds":             float(lam_bounds),
@@ -1315,13 +1312,6 @@ def nom_optimize(
         "latent_lo":              [float(x) for x in lat_lo],
         "latent_hi":              [float(x) for x in lat_hi],
         "baseline_foil_filename": baseline.get("filename"),
-        "tf_ran":                 True,
-        "tf_n_epochs":            int(n_iters),
-        "tf_learning_rate":       float(tf_learning_rate),
-        "tf_CL":                  float(best["CL"]),
-        "tf_CD":                  float(best["CD"]),
-        "tf_LD":                  float(best["CL"] / best["CD"])
-                                  if best["CD"] > 0 else None,
         "final_result_from":      "nom_fit_custom_train_step",
     }
 
