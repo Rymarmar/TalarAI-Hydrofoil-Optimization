@@ -48,6 +48,20 @@ OUTPUTS (averaged across all 12 conditions):
   lookup_table_averaged_all_conditions.csv  -- all 1647 ranked by mean L/D
   best_baseline_foil_averaged.json          -- best all-around foil
 
+CHANGE LOG:
+  [FIX 3/3/26] Phase 2 averaged baseline now applies geometry filtering.
+    Previously, the averaged best foil was picked purely by mean L/D with
+    NO camber or thickness checks. This caused as6097 (9.78% camber) to be
+    selected despite the NOM optimizer enforcing max_camber=8%. Result:
+    every epoch got penalty=1000, n_improved=0 for all 500 iterations.
+    
+    FIX: Phase 2 now reconstructs each candidate foil's coords and checks
+    camber <= max_camber AND min_max_thickness <= t_max before allowing it
+    into the averaged ranking. Only geometry-valid foils can be selected.
+    
+    This matches the constraints NOM enforces (constraints.py geometry_penalty)
+    so the baseline is always a valid starting point.
+
 HOW TO RUN:
   python tools/build_lookup_table.py
 
@@ -80,37 +94,20 @@ LATENT_CSV = PROJECT_ROOT / "data" / "airfoil_latent_params_6.csv"
 OUTPUT_DIR = PROJECT_ROOT / "outputs"
 OUTPUT_DIR.mkdir(exist_ok=True)
 
-# 6x2 = 12 conditions total.
-#
-# ALPHA range (degrees):
-#   Physical basis: from the Ski Cat Info spreadsheet, the full alpha
-#   operating range is 0 to 15 degrees. We sweep 0.5 to 4.0 which covers
-#   the realistic in-flight range -- takeoff transition through cruise.
-#   We stop at 4.0 because thin cambered foils approach stall around 8-10
-#   degrees and NeuralFoil predictions become unreliable above that.
-#   Design point is alpha ~ 1 deg at max speed (from CL requirement slides:
-#   alpha = CL/2pi = 0.111/2pi = 1.012 deg).
-#
-# RE range (Reynolds number, dimensionless):
-#   Physical basis: Re = V * chord / nu_water
-#   chord = 2.25 in = 0.1875 ft
-#   nu_water = 1.08e-5 ft^2/s (kinematic viscosity of water)
-#
-#   From Ski Cat Info spreadsheet (1/16 scale model):
-#     Slow speed:  V = 8.44  ft/s  --> Re = 8.44  * 0.1875 / 1.08e-5 = 146,528 ~ 1.5e5
-#     Max speed:   V = 25.32 ft/s  --> Re = 25.32 * 0.1875 / 1.08e-5 = 439,583 ~ 4.4e5
-#
-#   We use 150,000 and 440,000 to match the spreadsheet values exactly.
-#   NOTE: these are WATER Reynolds numbers. Air Re values (50k-200k seen
-#   in XFLR5 / wind tunnel references) are NOT applicable here.
-
+# 6x4 = 24 conditions total.
 ALPHA_LIST = [0.5, 1.0, 1.5, 2.0, 3.0, 4.0]  # degrees -- 1.0 is design point
+RE_LIST = [150000, 250000, 350000, 450000]
 
-# ACTION ITEM (build_lookup_table 2/19): Four Re values sweeping the operating envelope.
-# Correct values confirmed: 150000, 250000, 350000, 450000
-# These are WATER Reynolds numbers (Re = V * chord / nu_water) for the 1/15 scale model.
-# Spans from low-speed / takeoff up to max test speed in the Davidson Lab towing tank.
-RE_LIST = [150000, 250000, 350000, 450000]   # ACTION ITEM (build_lookup_table 2/19)
+# ---------------------------------------------------------------------------
+# GEOMETRY FILTER DEFAULTS
+# These MUST match the defaults in nom_driver.py / constraints.py so that
+# the baseline selected here is guaranteed to pass NOM's constraint checks.
+# If you change these in nom_driver.py, update them here too.
+# ---------------------------------------------------------------------------
+DEFAULT_MAX_CAMBER        = 0.08   # 8%c — same as nom_driver.py default
+DEFAULT_MIN_MAX_THICKNESS = 0.04   # same as nom_driver.py default
+DEFAULT_MIN_THICKNESS     = 0.006  # same as nom_driver.py default
+DEFAULT_MAX_THICKNESS     = 0.157  # same as nom_driver.py default
 
 
 # ============================================================================
@@ -177,7 +174,7 @@ def evaluate_condition(pipeline, all_latents, filenames, alpha, Re):
 
 
 # ============================================================================
-# CAMBER FILTER UTILITIES
+# GEOMETRY FILTER UTILITIES
 # ============================================================================
 
 def compute_max_camber(coords: np.ndarray,
@@ -223,6 +220,86 @@ def compute_max_camber(coords: np.ndarray,
     return float(np.max(np.abs(camber_line[mask])))
 
 
+def compute_thickness_range(coords: np.ndarray,
+                            x_min: float = 0.05,
+                            x_max: float = 0.90) -> tuple[float, float]:
+    """
+    Compute min and max thickness in the interior [x_min, x_max].
+
+    [FIX 3/3/26]: Added so Phase 2 can also check thickness constraints,
+    not just camber. Matches the logic in constraints.py geometry_penalty().
+
+    INPUTS:
+      coords -- shape (80, 2): same convention as talarai_pipeline output
+      x_min, x_max -- interior range
+
+    OUTPUTS:
+      (t_min, t_max) -- min and max thickness in the interior
+      Returns (0.0, 0.0) if coords are bad
+    """
+    if coords is None or coords.shape != (80, 2):
+        return 0.0, 0.0
+
+    upper_te2le = coords[:40]
+    lower_le2te = coords[40:]
+    upper_le2te = upper_te2le[::-1]
+
+    xu, yu = upper_le2te[:, 0], upper_le2te[:, 1]
+    xl, yl = lower_le2te[:, 0], lower_le2te[:, 1]
+
+    thickness = yu - yl  # point-by-point
+
+    mask = (xu >= x_min) & (xu <= x_max)
+    if not np.any(mask):
+        return 0.0, 0.0
+
+    t_interior = thickness[mask]
+    return float(np.min(t_interior)), float(np.max(t_interior))
+
+
+def check_foil_geometry(coords: np.ndarray,
+                        max_camber: float = DEFAULT_MAX_CAMBER,
+                        min_max_thickness: float = DEFAULT_MIN_MAX_THICKNESS,
+                        min_thickness: float = DEFAULT_MIN_THICKNESS,
+                        max_thickness: float = DEFAULT_MAX_THICKNESS,
+                        ) -> tuple[bool, dict]:
+    """
+    [FIX 3/3/26] Check whether a foil passes the geometry constraints
+    that NOM enforces. Used to filter candidates before selecting the
+    averaged baseline.
+
+    Returns (passes, info_dict).
+    passes = True if the foil would NOT get a 1000 penalty in NOM.
+    """
+    camber = compute_max_camber(coords)
+    t_min, t_max = compute_thickness_range(coords)
+
+    info = {
+        "max_camber": camber,
+        "t_min": t_min,
+        "t_max": t_max,
+    }
+
+    if camber > max_camber:
+        info["reject_reason"] = f"camber {camber*100:.1f}%c > {max_camber*100:.0f}%c limit"
+        return False, info
+
+    if t_max < min_max_thickness:
+        info["reject_reason"] = f"peak thickness {t_max*100:.1f}%c < {min_max_thickness*100:.1f}%c minimum"
+        return False, info
+
+    if t_min < min_thickness:
+        info["reject_reason"] = f"min thickness {t_min*100:.2f}%c < {min_thickness*100:.2f}%c minimum"
+        return False, info
+
+    if t_max > max_thickness:
+        info["reject_reason"] = f"max thickness {t_max*100:.1f}%c > {max_thickness*100:.1f}%c limit"
+        return False, info
+
+    info["reject_reason"] = None
+    return True, info
+
+
 def rebaseline_with_camber_filter(max_camber: float = 0.08):
     """
     ACTION ITEM (2/23): Re-pick best baseline JSONs from existing lookup CSVs,
@@ -243,10 +320,6 @@ def rebaseline_with_camber_filter(max_camber: float = 0.08):
 
     INPUTS:
       max_camber -- hard camber limit (default 0.08 = 8%c)
-        BUG FIX: raised from 0.04 → 0.08 to match nom_driver.py and constraints.py.
-        At 0.04, the HQ-series baseline (hq358, ~7-8%c camber) was being filtered
-        out and NOM was forced to start from a worse foil. All three files must
-        use the same threshold so the baseline selected here can actually be used.
     """
     print("=" * 60)
     print(f"REBASELINE WITH CAMBER FILTER (max_camber={max_camber:.2f} = {max_camber*100:.0f}%c)")
@@ -451,19 +524,53 @@ def build_lookup_table():
             print()
 
     # ------------------------------------------------------------------
-    # PHASE 2: Average L/D across all 12 conditions per foil.
+    # PHASE 2: Average L/D across all conditions per foil.
     #
-    # WHY: A foil that ranks #1 at alpha=1 might rank #50 at alpha=3.
-    # The mean L/D finds the foil that is consistently good everywhere,
-    # not just optimal at one point. This is the better baseline for NOM
-    # because the real SkiCat operates across both slow and max speed.
+    # [FIX 3/3/26] NOW WITH GEOMETRY FILTERING.
+    # Before this fix, the averaged best foil was picked purely by L/D
+    # with no constraint checks. This led to as6097 (9.78% camber) being
+    # selected despite NOM enforcing max_camber=8%, causing 500 wasted
+    # epochs with penalty=1000 and n_improved=0.
     #
-    # min_L_over_D is also saved -- a foil with high mean but very low
-    # minimum has a weak spot in the envelope, which is worth knowing.
+    # FIX: We now reconstruct each foil's coords and check geometry
+    # (camber, thickness) before including it in the averaged ranking.
+    # Only foils that pass the same constraints as NOM are eligible.
     # ------------------------------------------------------------------
     print("=" * 60)
-    print("PHASE 2: AVERAGING L/D ACROSS ALL 12 CONDITIONS")
+    print("PHASE 2: AVERAGING L/D ACROSS ALL CONDITIONS")
+    print("  [FIX] Now filtering by geometry constraints (camber, thickness)")
+    print(f"  max_camber={DEFAULT_MAX_CAMBER*100:.0f}%c  "
+          f"min_max_thickness={DEFAULT_MIN_MAX_THICKNESS*100:.1f}%c  "
+          f"min_thickness={DEFAULT_MIN_THICKNESS*100:.2f}%c  "
+          f"max_thickness={DEFAULT_MAX_THICKNESS*100:.1f}%c")
     print("=" * 60)
+
+    # Pre-compute geometry validity for all foils
+    print(f"Checking geometry for {len(all_latents)} foils...")
+    geom_valid_map = {}   # filename -> True/False
+    geom_info_map  = {}   # filename -> info dict
+    for i, (latent, fname) in enumerate(zip(all_latents, filenames)):
+        if (i + 1) % 200 == 0:
+            print(f"  [{i+1}/{len(all_latents)}] checking geometry...")
+        try:
+            coords = pipeline.latent_to_coordinates(latent)
+            passes, info = check_foil_geometry(
+                coords,
+                max_camber=DEFAULT_MAX_CAMBER,
+                min_max_thickness=DEFAULT_MIN_MAX_THICKNESS,
+                min_thickness=DEFAULT_MIN_THICKNESS,
+                max_thickness=DEFAULT_MAX_THICKNESS,
+            )
+            geom_valid_map[fname] = passes
+            geom_info_map[fname]  = info
+        except Exception:
+            geom_valid_map[fname] = False
+            geom_info_map[fname]  = {"reject_reason": "exception"}
+
+    n_geom_pass = sum(1 for v in geom_valid_map.values() if v)
+    print(f"Foils passing geometry filter: {n_geom_pass}/{len(all_latents)} "
+          f"({100*n_geom_pass/len(all_latents):.1f}%)")
+    print()
 
     all_dfs = []
     for alpha in ALPHA_LIST:
@@ -478,15 +585,6 @@ def build_lookup_table():
                 all_dfs.append(df_c)
 
     if all_dfs:
-        # Merge all per-condition tables into one wide table.
-        # Each row = one foil, each LD_ column = its L/D at one condition.
-        #
-        # FIX (2/19 run): ld_cols is now collected AFTER the merge loop by
-        # scanning df_avg for columns that start with 'LD_'. Previously it was
-        # built during the loop, which caused a KeyError when pandas renamed
-        # columns due to collisions (adding _x/_y suffixes). Reading from the
-        # actual DataFrame columns after merging is always correct regardless
-        # of what Re/alpha tags were used or how pandas formats the names.
         df_avg = all_dfs[0][['filename','p1','p2','p3','p4','p5','p6']].copy()
         for df_c in all_dfs:
             ld_col = [c for c in df_c.columns if c.startswith('LD_')][0]
@@ -499,28 +597,72 @@ def build_lookup_table():
         print(f"  Averaging across {len(ld_cols)} conditions: {ld_cols}")
 
         # Compute mean and min across all conditions.
-        # skipna=True means a foil that failed at 1 condition out of 12
-        # is still ranked based on its 11 valid results.
         df_avg['mean_L_over_D'] = df_avg[ld_cols].mean(axis=1, skipna=True)
         df_avg['min_L_over_D']  = df_avg[ld_cols].min(axis=1, skipna=True)
         df_avg['n_valid']       = df_avg[ld_cols].notna().sum(axis=1)
+
+        # [FIX 3/3/26] Add geometry validity column
+        df_avg['geom_valid'] = df_avg['filename'].map(geom_valid_map).fillna(False)
+        df_avg['max_camber'] = df_avg['filename'].map(
+            lambda f: geom_info_map.get(f, {}).get('max_camber', 999.0)
+        )
+        df_avg['peak_thickness'] = df_avg['filename'].map(
+            lambda f: geom_info_map.get(f, {}).get('t_max', 0.0)
+        )
 
         df_avg = df_avg.sort_values(
             'mean_L_over_D', ascending=False, na_position='last'
         )
 
-        # Save full averaged ranking
+        # Save full averaged ranking (includes geometry columns for inspection)
         avg_file = OUTPUT_DIR / "lookup_table_averaged_all_conditions.csv"
         df_avg.to_csv(avg_file, index=False)
         print(f"  Saved averaged ranking -> {avg_file.name}")
 
-        # Save best all-around foil JSON for nom_driver.py
-        best_avg = df_avg.dropna(subset=['mean_L_over_D']).iloc[0]
+        # ---- Pick best all-around foil WITH GEOMETRY FILTER ----
+        # [FIX 3/3/26] Only consider foils that pass geometry constraints.
+        # This prevents selecting a foil like as6097 (9.78% camber) that
+        # would immediately get penalty=1000 in NOM.
+        df_geom_valid = df_avg[df_avg['geom_valid'] == True].copy()
+        df_geom_valid = df_geom_valid.dropna(subset=['mean_L_over_D'])
+
+        if df_geom_valid.empty:
+            print("  ⚠️  WARNING: No foils pass geometry filter! Using unfiltered best.")
+            print("     This means NOM will likely hit penalty=1000 every epoch.")
+            print("     Consider relaxing max_camber or other geometry limits.")
+            best_avg = df_avg.dropna(subset=['mean_L_over_D']).iloc[0]
+            geom_filtered = False
+        else:
+            best_avg = df_geom_valid.iloc[0]
+            geom_filtered = True
+            # Show what was filtered out
+            unfiltered_best = df_avg.dropna(subset=['mean_L_over_D']).iloc[0]
+            if unfiltered_best['filename'] != best_avg['filename']:
+                print(f"\n  ⚠️  GEOMETRY FILTER CHANGED THE BASELINE:")
+                print(f"     Without filter: {unfiltered_best['filename']}  "
+                      f"mean L/D={unfiltered_best['mean_L_over_D']:.1f}  "
+                      f"camber={unfiltered_best['max_camber']*100:.1f}%c")
+                print(f"     With filter:    {best_avg['filename']}  "
+                      f"mean L/D={best_avg['mean_L_over_D']:.1f}  "
+                      f"camber={best_avg['max_camber']*100:.1f}%c")
+                print(f"     L/D trade-off:  {unfiltered_best['mean_L_over_D']:.1f} → "
+                      f"{best_avg['mean_L_over_D']:.1f}  "
+                      f"(Δ = {best_avg['mean_L_over_D'] - unfiltered_best['mean_L_over_D']:.1f})")
+
         best_avg_dict = {
             'filename':           best_avg['filename'],
             'mean_L_over_D':      float(best_avg['mean_L_over_D']),
             'min_L_over_D':       float(best_avg['min_L_over_D']),
             'n_conditions_valid': int(best_avg['n_valid']),
+            'geometry_filtered':  geom_filtered,
+            'max_camber_actual':  float(best_avg.get('max_camber', 999.0)),
+            'peak_thickness':     float(best_avg.get('peak_thickness', 0.0)),
+            'geometry_limits': {
+                'max_camber':        DEFAULT_MAX_CAMBER,
+                'min_max_thickness': DEFAULT_MIN_MAX_THICKNESS,
+                'min_thickness':     DEFAULT_MIN_THICKNESS,
+                'max_thickness':     DEFAULT_MAX_THICKNESS,
+            },
             'conditions_averaged': [
                 {'alpha': a, 'Re': r}
                 for a in ALPHA_LIST for r in RE_LIST
@@ -532,9 +674,20 @@ def build_lookup_table():
             json.dump(best_avg_dict, f, indent=2)
         print(f"  Saved best all-around  -> {best_avg_file.name}")
         print()
-        print("  TOP 5 ALL-AROUND FOILS (by mean L/D across all 12 conditions):")
+
+        # Show top 5 from BOTH filtered and unfiltered for comparison
+        print("  TOP 5 ALL-AROUND FOILS (geometry-filtered):")
+        if not df_geom_valid.empty:
+            print(df_geom_valid[
+                ['filename', 'mean_L_over_D', 'min_L_over_D', 'max_camber', 'peak_thickness', 'n_valid']
+            ].head(5).to_string(index=False))
+        else:
+            print("  (none pass geometry filter)")
+
+        print()
+        print("  TOP 5 ALL-AROUND FOILS (unfiltered, for reference):")
         print(df_avg[
-            ['filename', 'mean_L_over_D', 'min_L_over_D', 'n_valid']
+            ['filename', 'mean_L_over_D', 'min_L_over_D', 'max_camber', 'peak_thickness', 'n_valid']
         ].head(5).to_string(index=False))
 
     # ------------------------------------------------------------------
@@ -561,9 +714,7 @@ def run_phase2_averaging_only():
     """
     FIX (2/19 run): Run ONLY Phase 2 (averaging) without re-running Phase 1.
 
-    If Phase 1 already completed successfully (all lookup_table_*.csv files
-    exist in outputs/) but Phase 2 crashed, call this instead of build_lookup_table()
-    to avoid waiting 2 hours again.
+    [FIX 3/3/26]: Now also applies geometry filtering, same as full build.
 
     Usage:
         python tools/build_lookup_table.py --phase2
@@ -571,13 +722,52 @@ def run_phase2_averaging_only():
     print("=" * 60)
     print("PHASE 2 ONLY: AVERAGING L/D ACROSS ALL CONDITIONS")
     print("(Skipping Phase 1 -- reading existing lookup CSVs from outputs/)")
+    print(f"  [FIX] Geometry filtering: max_camber={DEFAULT_MAX_CAMBER*100:.0f}%c  "
+          f"min_max_thickness={DEFAULT_MIN_MAX_THICKNESS*100:.1f}%c")
     print("=" * 60)
 
-    # Scan outputs/ for whatever lookup_table_*.csv files actually exist,
-    # regardless of what ALPHA_LIST/RE_LIST say. This is robust to any
-    # Re/alpha combination and avoids the tag-mismatch KeyError.
+    # Load pipeline for geometry checks
+    print("Loading TalarAI pipeline...")
+    pipeline = TalarAIPipeline()
+    print(f"Pipeline ready: {pipeline.decoder_path.name}")
+    print()
+
+    # Load latent params
+    df_csv = pd.read_csv(LATENT_CSV)
+    latent_cols = [c for c in df_csv.columns if c.lower().startswith('p')]
+    all_latents = df_csv[latent_cols].values.astype(np.float32)
+    filenames = df_csv['filename'].tolist() if 'filename' in df_csv.columns \
+                else [f"foil_{i}" for i in range(len(df_csv))]
+
+    # Pre-compute geometry validity
+    print(f"Checking geometry for {len(all_latents)} foils...")
+    geom_valid_map = {}
+    geom_info_map  = {}
+    for i, (latent, fname) in enumerate(zip(all_latents, filenames)):
+        if (i + 1) % 200 == 0:
+            print(f"  [{i+1}/{len(all_latents)}] checking geometry...")
+        try:
+            coords = pipeline.latent_to_coordinates(latent)
+            passes, info = check_foil_geometry(
+                coords,
+                max_camber=DEFAULT_MAX_CAMBER,
+                min_max_thickness=DEFAULT_MIN_MAX_THICKNESS,
+                min_thickness=DEFAULT_MIN_THICKNESS,
+                max_thickness=DEFAULT_MAX_THICKNESS,
+            )
+            geom_valid_map[fname] = passes
+            geom_info_map[fname]  = info
+        except Exception:
+            geom_valid_map[fname] = False
+            geom_info_map[fname]  = {"reject_reason": "exception"}
+
+    n_pass = sum(1 for v in geom_valid_map.values() if v)
+    print(f"Foils passing geometry filter: {n_pass}/{len(all_latents)} "
+          f"({100*n_pass/len(all_latents):.1f}%)")
+    print()
+
+    # Scan outputs/ for existing lookup CSVs
     existing_csvs = sorted(OUTPUT_DIR.glob("lookup_table_alpha*.csv"))
-    # Exclude the averaged output itself if it somehow exists
     existing_csvs = [f for f in existing_csvs if "averaged" not in f.name]
 
     if not existing_csvs:
@@ -592,7 +782,7 @@ def run_phase2_averaging_only():
 
     all_dfs = []
     for fpath in existing_csvs:
-        tag = fpath.stem.replace("lookup_table_", "")  # e.g. "alpha1.0_Re1e+04"
+        tag = fpath.stem.replace("lookup_table_", "")
         df_c = pd.read_csv(fpath)
         if 'L_over_D' not in df_c.columns or 'filename' not in df_c.columns:
             print(f"  WARNING: {fpath.name} missing required columns, skipping")
@@ -615,7 +805,7 @@ def run_phase2_averaging_only():
         ld_col = [c for c in df_c.columns if c.startswith('LD_')][0]
         df_avg = df_avg.merge(df_c[['filename', ld_col]], on='filename', how='left')
 
-    # Collect ld_cols from what's actually in df_avg -- avoids KeyError
+    # Collect ld_cols from what's actually in df_avg
     ld_cols = [c for c in df_avg.columns if c.startswith('LD_')]
     print(f"Averaging across {len(ld_cols)} conditions:")
     for col in ld_cols:
@@ -625,19 +815,58 @@ def run_phase2_averaging_only():
     df_avg['mean_L_over_D'] = df_avg[ld_cols].mean(axis=1, skipna=True)
     df_avg['min_L_over_D']  = df_avg[ld_cols].min(axis=1, skipna=True)
     df_avg['n_valid']       = df_avg[ld_cols].notna().sum(axis=1)
+
+    # [FIX 3/3/26] Add geometry validity
+    df_avg['geom_valid'] = df_avg['filename'].map(geom_valid_map).fillna(False)
+    df_avg['max_camber'] = df_avg['filename'].map(
+        lambda f: geom_info_map.get(f, {}).get('max_camber', 999.0)
+    )
+    df_avg['peak_thickness'] = df_avg['filename'].map(
+        lambda f: geom_info_map.get(f, {}).get('t_max', 0.0)
+    )
+
     df_avg = df_avg.sort_values('mean_L_over_D', ascending=False, na_position='last')
 
     avg_file = OUTPUT_DIR / "lookup_table_averaged_all_conditions.csv"
     df_avg.to_csv(avg_file, index=False)
     print(f"Saved averaged ranking -> {avg_file.name}")
 
-    best_avg = df_avg.dropna(subset=['mean_L_over_D']).iloc[0]
+    # Pick best with geometry filter
+    df_geom_valid = df_avg[df_avg['geom_valid'] == True].copy()
+    df_geom_valid = df_geom_valid.dropna(subset=['mean_L_over_D'])
+
+    if df_geom_valid.empty:
+        print("⚠️  WARNING: No foils pass geometry filter! Using unfiltered best.")
+        best_avg = df_avg.dropna(subset=['mean_L_over_D']).iloc[0]
+        geom_filtered = False
+    else:
+        best_avg = df_geom_valid.iloc[0]
+        geom_filtered = True
+        unfiltered_best = df_avg.dropna(subset=['mean_L_over_D']).iloc[0]
+        if unfiltered_best['filename'] != best_avg['filename']:
+            print(f"\n⚠️  GEOMETRY FILTER CHANGED THE BASELINE:")
+            print(f"   Without filter: {unfiltered_best['filename']}  "
+                  f"mean L/D={unfiltered_best['mean_L_over_D']:.1f}  "
+                  f"camber={unfiltered_best['max_camber']*100:.1f}%c")
+            print(f"   With filter:    {best_avg['filename']}  "
+                  f"mean L/D={best_avg['mean_L_over_D']:.1f}  "
+                  f"camber={best_avg['max_camber']*100:.1f}%c")
+
     latent_cols = [f'p{i}' for i in range(1, 7)]
     best_avg_dict = {
         'filename':           best_avg['filename'],
         'mean_L_over_D':      float(best_avg['mean_L_over_D']),
         'min_L_over_D':       float(best_avg['min_L_over_D']),
         'n_conditions_valid': int(best_avg['n_valid']),
+        'geometry_filtered':  geom_filtered,
+        'max_camber_actual':  float(best_avg.get('max_camber', 999.0)),
+        'peak_thickness':     float(best_avg.get('peak_thickness', 0.0)),
+        'geometry_limits': {
+            'max_camber':        DEFAULT_MAX_CAMBER,
+            'min_max_thickness': DEFAULT_MIN_MAX_THICKNESS,
+            'min_thickness':     DEFAULT_MIN_THICKNESS,
+            'max_thickness':     DEFAULT_MAX_THICKNESS,
+        },
         'latent': [float(best_avg[c]) for c in latent_cols if c in best_avg.index],
     }
     best_avg_file = OUTPUT_DIR / "best_baseline_foil_averaged.json"
@@ -645,14 +874,20 @@ def run_phase2_averaging_only():
         json.dump(best_avg_dict, f, indent=2)
     print(f"Saved best all-around  -> {best_avg_file.name}")
     print()
-    print("TOP 5 ALL-AROUND FOILS:")
-    show_cols = ['filename', 'mean_L_over_D', 'min_L_over_D', 'n_valid']
-    show_cols = [c for c in show_cols if c in df_avg.columns]
-    print(df_avg[show_cols].head(5).to_string(index=False))
+
+    print("TOP 5 ALL-AROUND FOILS (geometry-filtered):")
+    if not df_geom_valid.empty:
+        show_cols = ['filename', 'mean_L_over_D', 'min_L_over_D', 'max_camber', 'peak_thickness', 'n_valid']
+        show_cols = [c for c in show_cols if c in df_geom_valid.columns]
+        print(df_geom_valid[show_cols].head(5).to_string(index=False))
+    else:
+        print("  (none pass geometry filter)")
+
     print()
     print(f"Best foil: {best_avg_dict['filename']}  "
           f"mean L/D={best_avg_dict['mean_L_over_D']:.1f}  "
-          f"min L/D={best_avg_dict['min_L_over_D']:.1f}")
+          f"min L/D={best_avg_dict['min_L_over_D']:.1f}  "
+          f"camber={best_avg_dict.get('max_camber_actual', 0)*100:.1f}%c")
 
 
 if __name__ == "__main__":
@@ -663,18 +898,6 @@ if __name__ == "__main__":
         run_phase2_averaging_only()
 
     elif "--rebaseline" in sys.argv:
-        # ACTION ITEM (2/23): Re-pick best baseline JSONs with camber filter.
-        # Use this when you want a low-camber starting point for NOM without
-        # re-running the full 2-hour Phase 1 evaluation.
-        #
-        # Usage:
-        #   python tools/build_lookup_table.py --rebaseline
-        #   python tools/build_lookup_table.py --rebaseline --max-camber 0.03
-        #
-        # BUG FIX: default max_camber raised from 0.04 → 0.08 to match
-        # nom_driver.py and constraints.py. At 0.04, the HQ-series baseline
-        # (hq358, ~7-8%c) was being filtered out, forcing NOM to start from
-        # a worse foil. All three files must use the same threshold.
         max_camber = 0.08
         if "--max-camber" in sys.argv:
             idx = sys.argv.index("--max-camber")
@@ -682,7 +905,7 @@ if __name__ == "__main__":
                 max_camber = float(sys.argv[idx + 1])
             except (IndexError, ValueError):
                 print("WARNING: --max-camber needs a value (e.g. --max-camber 0.03)")
-                print("Using default: 0.04")
+                print("Using default: 0.08")
         rebaseline_with_camber_filter(max_camber=max_camber)
 
     else:

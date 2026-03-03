@@ -342,7 +342,7 @@ def eval_all_conditions(
                                  "CL": np.nan, "CD": np.nan, "cd_cl": np.nan})
                 continue
 
-            cd_cl = CD / (CL + 1e-9)
+            cd_cl = default_objective(CL, CD)
             per_cond.append({"alpha": alpha, "Re": Re, "CL": CL,
                              "CD": CD, "cd_cl": cd_cl, "coords": coords})
             cd_cl_vals.append(cd_cl)
@@ -515,6 +515,7 @@ class NOMModel(tf.keras.Model):
         self._cl_min     = cl_min          # CL floor for takeoff condition
         self._fd_eps     = fd_eps          # FD perturbation size
         self._bounds_lam = bounds_lam      # lambda for out-of-bounds penalty
+        self._initial_lr = None            # set after compile() — used for LR decay
 
         # Track the best result found across all train_step calls
         self.best_result = None
@@ -560,6 +561,28 @@ class NOMModel(tf.keras.Model):
         b_np   = self.latent_layer.b.numpy().astype(np.float64)
         z_init = self.latent_layer._z_init.numpy().astype(np.float64)
         z_eff  = w_np * z_init + b_np
+
+        # ------------------------------------------------------------------
+        # FIX: Cosine learning rate decay.
+        #
+        # WHY: With fixed lr=5e-4, the optimizer overshoots after the initial
+        # fast improvement (~30 iters), then oscillates for 470 wasted iters.
+        # Cosine decay smoothly reduces lr from initial → 10% of initial,
+        # allowing fine-grained exploration in later iterations.
+        #
+        # FORMULA: lr(t) = lr_min + 0.5*(lr_max - lr_min)*(1 + cos(pi*t/T))
+        #   where t = current iter, T = total iters
+        #   This starts at lr_max, smoothly decays to lr_min.
+        # ------------------------------------------------------------------
+        iter_num_for_lr = int(self.optimizer.iterations.numpy())
+        n_total_lr = max(getattr(self, "_n_iters", 500), 1)
+        if self._initial_lr is None:
+            self._initial_lr = float(self.optimizer.learning_rate)
+        lr_max = self._initial_lr
+        lr_min = lr_max * 0.05  # decay to 5% of initial
+        progress = min(iter_num_for_lr / n_total_lr, 1.0)
+        new_lr = lr_min + 0.5 * (lr_max - lr_min) * (1.0 + np.cos(np.pi * progress))
+        self.optimizer.learning_rate.assign(new_lr)
 
         # ------------------------------------------------------------------
         # Step 2: loss_at helper.
@@ -650,20 +673,36 @@ class NOMModel(tf.keras.Model):
         grad_w_np = np.zeros(6, dtype=np.float64)
         grad_b_np = np.zeros(6, dtype=np.float64)
 
+        # ------------------------------------------------------------------
+        # FIX: Scale FD epsilon per dimension for w perturbations.
+        #
+        # WHY THIS MATTERS:
+        #   dz_eff = dw * z_init[i].  If z_init[i] is tiny (e.g. -0.0026),
+        #   perturbing w by 0.01 gives dz = 0.000026 — below NeuralFoil's
+        #   numerical precision. The gradient is pure noise.
+        #   Scaling eps inversely with |z_init| ensures each dimension
+        #   gets a meaningful perturbation in z-space.
+        #
+        #   For b perturbations, dz = db directly, so no scaling needed.
+        # ------------------------------------------------------------------
         for i in range(6):
+            # Scale w epsilon so dz_eff ≈ fd_eps regardless of z_init magnitude
+            z_mag = max(abs(z_init[i]), 0.01)  # floor to prevent division issues
+            w_eps_i = self._fd_eps / z_mag      # larger eps when z_init is small
+
             # Perturb w[i] in both directions
-            w_plus  = w_np.copy(); w_plus[i]  += self._fd_eps
-            w_minus = w_np.copy(); w_minus[i] -= self._fd_eps
+            w_plus  = w_np.copy(); w_plus[i]  += w_eps_i
+            w_minus = w_np.copy(); w_minus[i] -= w_eps_i
             loss_plus  = loss_at(w_plus  * z_init + b_np)
             loss_minus = loss_at(w_minus * z_init + b_np)
 
             # Central diff if both sides finite; fall back to one-sided if one is inf
             if np.isfinite(loss_plus) and np.isfinite(loss_minus):
-                grad_w_np[i] = (loss_plus - loss_minus) / (2.0 * self._fd_eps)
+                grad_w_np[i] = (loss_plus - loss_minus) / (2.0 * w_eps_i)
             elif np.isfinite(loss_plus):
-                grad_w_np[i] = (loss_plus  - loss_0) / self._fd_eps   # forward fallback
+                grad_w_np[i] = (loss_plus  - loss_0) / w_eps_i   # forward fallback
             elif np.isfinite(loss_minus):
-                grad_w_np[i] = (loss_0 - loss_minus) / self._fd_eps   # backward fallback
+                grad_w_np[i] = (loss_0 - loss_minus) / w_eps_i   # backward fallback
             # else: both inf → grad stays 0 (truly boxed in on this dimension)
 
         for i in range(6):
@@ -825,6 +864,7 @@ class NOMModel(tf.keras.Model):
               f"  {status}"
               f"  valid={self.n_valid}/{iter_num}"
               f"  ETA {eta_str}"
+              f"  lr={float(self.optimizer.learning_rate):.1e}"
               f"{improved}")
 
 
@@ -912,7 +952,7 @@ def nom_optimize(
 
     # [2/19]: "Lookup_table_path Line 202: take out None"
     # Defaults to "" — path auto-constructed from design point conditions
-    lookup_baseline_path: str = "",
+    lookup_baseline_path: str = "outputs/best_baseline_foil_averaged.json", #change to "" to auto-construct from conditions
 
     out_path: str | Path = "outputs",
 ):
@@ -957,7 +997,7 @@ def nom_optimize(
     print(f"FD epsilon: {fd_eps}")
     print(f"Conditions ({len(conditions)}):")
     for a, r in conditions:
-        print(f"    alpha={a}°   Re={r:.0e}")
+        print(f"    alpha={a}°   Re={r:,.0f}")
     print(f"Objective: average CD/CL across all {len(conditions)} conditions")
     print(f"CL floor:  CL >= {cl_min} at TAKEOFF only (last condition = hard reject)")
     print("=" * 70)
@@ -1020,8 +1060,66 @@ def nom_optimize(
             ld_s = (f"{c['CL']/c['CD']:.1f}"
                     if np.isfinite(c.get("CL", np.nan)) and
                        np.isfinite(c.get("CD", np.nan)) and c["CD"] > 0 else "N/A")
-            print(f"    α={c['alpha']}°  Re={c['Re']:.0e}  CL={cl_s}  L/D={ld_s}")
+            print(f"    α={c['alpha']}°  Re={c['Re']:,.0f}  CL={cl_s}  L/D={ld_s}")
     print()
+
+    # ------------------------------------------------------------------
+    # [FIX 3/3/26] BASELINE CONSTRAINT VALIDATION
+    #
+    # Check if the loaded baseline itself violates geometry constraints.
+    # If it does, NOM will get penalty=1000 on every epoch and never
+    # improve (n_improved=0 for all iterations). This was the root cause
+    # of the as6097 failure: 9.78% camber > 8% max_camber limit.
+    #
+    # Detect this BEFORE wasting compute time and print a clear warning.
+    # ------------------------------------------------------------------
+    if baseline_result is not None and baseline_result.get("coords") is not None:
+        _bl_pen_kw = dict(
+            lam_bounds=lam_bounds, lam_geom=lam_geom, lam_cl=lam_cl,
+            min_thickness=min_thickness, max_thickness=max_thickness,
+            te_gap_max=te_gap_max, min_max_thickness=min_max_thickness,
+            max_camber=max_camber, cl_min=cl_min, cl_max=cl_max,
+        )
+        baseline_pen, baseline_geom_info = total_penalty(
+            latent_vec=latent_baseline,
+            coords=baseline_result["coords"],
+            CL=float(baseline_result.get("CL", 0)),
+            lat_lo=lat_lo, lat_hi=lat_hi,
+            **_bl_pen_kw,
+        )
+        if baseline_pen >= 1000.0:
+            print("!" * 70)
+            print("⚠️  BASELINE FOIL VIOLATES GEOMETRY CONSTRAINTS")
+            print("!" * 70)
+            print(f"  Baseline: {baseline.get('filename', 'unknown')}")
+            print(f"  Penalty:  {baseline_pen}")
+            print(f"  Reason:   {baseline_geom_info.get('reason', 'unknown')}")
+            if 'max_camber_actual' in baseline_geom_info:
+                print(f"  Camber:   {baseline_geom_info['max_camber_actual']*100:.1f}%c  "
+                      f"(limit: {max_camber*100:.0f}%c)")
+            if 't_max' in baseline_geom_info:
+                print(f"  t_max:    {baseline_geom_info['t_max']*100:.2f}%c  "
+                      f"(min required: {min_max_thickness*100:.1f}%c)")
+            if 't_min' in baseline_geom_info:
+                print(f"  t_min:    {baseline_geom_info['t_min']*100:.2f}%c  "
+                      f"(min required: {min_thickness*100:.2f}%c)")
+            print()
+            print("  NOM will get penalty=1000 every epoch and n_improved=0.")
+            print("  FIX: Re-run build_lookup_table.py --phase2 to pick a")
+            print("  geometry-valid baseline, then re-run NOM.")
+            print()
+            print("  Or use a per-condition baseline instead:")
+            print("    nom_optimize(lookup_baseline_path='')")
+            print("!" * 70)
+            print()
+        elif baseline_pen > 0:
+            print(f"  ⚠️  Baseline has soft penalty = {baseline_pen:.4f}")
+            print(f"     Reason: {baseline_geom_info.get('reason', 'soft_violations')}")
+            print(f"     (NOM can still optimize from here — soft penalty is fine)")
+            print()
+        else:
+            print(f"  ✓ Baseline passes all geometry constraints (penalty = 0)")
+            print()
 
     penalty_kwargs = dict(
         lam_bounds=lam_bounds, lam_geom=lam_geom, lam_cl=lam_cl,
@@ -1053,7 +1151,29 @@ def nom_optimize(
     nom(None)   # single dummy forward pass to build all layers → enables summary()
 
     # Initialize best to baseline values so we improve from a known starting point
-    nom.best_loss   = baseline_avg_cd_cl
+    # FIX: Compute full loss (obj + penalty + bounds penalty) for baseline,
+    # not just raw avg_cd_cl. This ensures the first train_step comparison
+    # is apples-to-apples: new_loss = obj+pen+bp vs best_loss = obj+pen+bp.
+    # If baseline has penalty=0, this is the same as before. But if the
+    # baseline foil has any geometry violations, this prevents a false
+    # "improvement" on the first step.
+    baseline_full_loss = baseline_avg_cd_cl
+    if baseline_result is not None and not baseline_result["cl_fail"]:
+        try:
+            bl_pen, _ = total_penalty(
+                latent_vec=latent_baseline, coords=baseline_result["coords"],
+                CL=float(baseline_result["CL"]),
+                lat_lo=lat_lo, lat_hi=lat_hi,
+                **penalty_kwargs,
+            )
+            bl_bp = bounds_lam * float(np.sum(
+                np.maximum(0.0, lat_lo - latent_baseline) +
+                np.maximum(0.0, latent_baseline - lat_hi)
+            ))
+            baseline_full_loss = baseline_avg_cd_cl + bl_pen + bl_bp
+        except Exception:
+            pass  # fall back to raw objective if penalty computation fails
+    nom.best_loss   = baseline_full_loss
     nom.best_result = {
         "latent":    latent_baseline.copy(),
         "coords":    baseline_result["coords"] if baseline_result else None,
@@ -1220,7 +1340,7 @@ def nom_optimize(
     for c in per_cond_summary:
         ld = f"{c['LD']:.1f}" if c["LD"] else "N/A"
         cl = f"{c['CL']:.4f}" if c["CL"] else "N/A"
-        print(f"  α={c['alpha']}°  Re={c['Re']:.0e}  CL={cl}  L/D={ld}")
+        print(f"  α={c['alpha']}°  Re={c['Re']:,.0f}  CL={cl}  L/D={ld}")
     print()
     print(f"Valid steps:  {nom.n_valid}  |  "
           f"Skipped: {nom.n_skipped}  |  "
