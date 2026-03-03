@@ -223,7 +223,7 @@ def compute_max_camber(coords: np.ndarray,
     return float(np.max(np.abs(camber_line[mask])))
 
 
-def rebaseline_with_camber_filter(max_camber: float = 0.04):
+def rebaseline_with_camber_filter(max_camber: float = 0.08):
     """
     ACTION ITEM (2/23): Re-pick best baseline JSONs from existing lookup CSVs,
     applying a camber filter so NOM starts from a manufacturable foil.
@@ -242,8 +242,11 @@ def rebaseline_with_camber_filter(max_camber: float = 0.04):
       python tools/build_lookup_table.py --rebaseline --max-camber 0.03
 
     INPUTS:
-      max_camber -- hard camber limit (default 0.04 = 4%c)
-        Blocks Eppler 61 class (7.4%c), allows NACA 4412 (4%c) and below.
+      max_camber -- hard camber limit (default 0.08 = 8%c)
+        BUG FIX: raised from 0.04 → 0.08 to match nom_driver.py and constraints.py.
+        At 0.04, the HQ-series baseline (hq358, ~7-8%c camber) was being filtered
+        out and NOM was forced to start from a worse foil. All three files must
+        use the same threshold so the baseline selected here can actually be used.
     """
     print("=" * 60)
     print(f"REBASELINE WITH CAMBER FILTER (max_camber={max_camber:.2f} = {max_camber*100:.0f}%c)")
@@ -668,9 +671,11 @@ if __name__ == "__main__":
         #   python tools/build_lookup_table.py --rebaseline
         #   python tools/build_lookup_table.py --rebaseline --max-camber 0.03
         #
-        # Default max_camber = 0.04 (4%c): blocks Eppler/highly cambered foils,
-        # allows NACA 4-series and below. Adjust with --max-camber if needed.
-        max_camber = 0.04
+        # BUG FIX: default max_camber raised from 0.04 → 0.08 to match
+        # nom_driver.py and constraints.py. At 0.04, the HQ-series baseline
+        # (hq358, ~7-8%c) was being filtered out, forcing NOM to start from
+        # a worse foil. All three files must use the same threshold.
+        max_camber = 0.08
         if "--max-camber" in sys.argv:
             idx = sys.argv.index("--max-camber")
             try:

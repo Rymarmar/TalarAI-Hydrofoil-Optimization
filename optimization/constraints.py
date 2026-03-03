@@ -110,18 +110,15 @@ def geometry_penalty(coords: np.ndarray,
                      # Hard rejects foils whose peak thickness is too thin (e.g. slivers
                      # that pass the local min_thickness check but have no structural depth).
                      min_max_thickness: float = 0.06,
-                     # ACTION ITEM (2/19 meeting): "No cambered foils please -- NACA foils
-                     # easier to 3D print / hard to manufacture cambered foils"
-                     # INTERPRETATION A (confirmed 2/23): not "zero camber only", but
-                     # "no extreme camber that's hard to 3D print."
-                     # Threshold set to 0.04 (4%c) based on NACA family reference:
-                     #   NACA 0012 = 0.00  (symmetric, easiest)
-                     #   NACA 2412 = 0.02  (slight camber, fine)
-                     #   NACA 4412 = 0.04  ← cutoff here
-                     #   NACA 6412 = 0.06  (harder to print, warping risk)
-                     #   Eppler 61 = 0.07+ (too cambered, blocked)
-                     # The current best foil (7.4%c) will now be correctly rejected.
-                     max_camber: float = 0.04,
+                     # FIX #3 — max_camber raised from 0.04 → 0.08
+                     # The HQ-series baseline foil (hq358) has ~7-8% camber.
+                     # At 0.04 (4%c), the baseline and all nearby foils were
+                     # immediately hard-rejected after any perturbation, causing
+                     # the optimizer to see loss=inf in every direction and
+                     # roll back endlessly. Raised to 0.08 (8%c) so the
+                     # optimizer can explore the neighborhood of the baseline.
+                     # If you switch to a symmetric NACA baseline, lower back to 0.04.
+                     max_camber: float = 0.08,
                      ) -> tuple[float, dict]:
     """
     Check foil geometry. SIMPLIFIED per prof feedback.
@@ -276,15 +273,22 @@ def geometry_penalty(coords: np.ndarray,
     # 3D printing struggles with foils above ~4%c camber due to warping and
     # support structure requirements on the concave lower surface.
     #
+    # FIX #3 — default threshold raised from 0.04 → 0.08 in nom_driver.py
+    #   The HQ-series baseline (hq358) has ~7-8% camber. At the old 4% limit,
+    #   every perturbation of the baseline triggered a hard reject (1000 penalty),
+    #   making all FD gradients = inf and causing endless rollbacks. The threshold
+    #   is now passed in from nom_driver (default 0.08); this function still
+    #   enforces whatever value is passed — the logic here is unchanged.
+    #
     # HOW CAMBER IS COMPUTED:
     #   Camber line = midpoint between upper and lower surface at each x.
     #   For a perfectly symmetric foil (NACA 00xx), camber = 0 everywhere.
     #   We check the interior only [0.05, 0.90] -- near LE/TE every foil
     #   taper closes so tiny apparent camber there is noise, not real camber.
     #
-    # THRESHOLD: max_camber=0.04 (4%c)
-    #   Allows: NACA 0012 (0%), NACA 2412 (2%), NACA 4412 (4%)
-    #   Blocks:  NACA 6412 (6%), Eppler 61 (7.4%), other high-camber foils
+    # THRESHOLD: max_camber (default now 0.08 = 8%c)
+    #   Allows: NACA 0012 (0%), NACA 2412 (2%), NACA 4412 (4%), HQ358 (~8%)
+    #   Blocks: extreme high-camber foils above 8%c
     camber_line = (yu + yl) / 2.0          # shape (40,) -- midpoint at each x
     camber_interior = camber_line[mask]     # restrict to x in [0.05, 0.90]
     max_camber_actual = float(np.max(np.abs(camber_interior)))
@@ -381,7 +385,11 @@ def total_penalty(*,
                   te_gap_max: float = 0.01,
                   # ACTION ITEM (2/19 meeting): new manufacturing constraints
                   min_max_thickness: float = 0.06,   # peak thickness floor (structural depth)
-                  max_camber: float = 0.04,           # 4%c -- blocks Eppler/highly cambered, allows NACA 4-series and below
+                  # BUG FIX: was 0.04, now synced to match geometry_penalty() and nom_driver.py.
+                  # total_penalty() is always called from nom_driver via **penalty_kwargs which
+                  # passes max_camber=0.08 explicitly — but the default here must also match
+                  # so any direct call to total_penalty() without that kwarg behaves correctly.
+                  max_camber: float = 0.08,           # 8%c -- allows HQ-series baseline (hq358 ~7-8%c)
                   
                   # CL window
                   cl_min: float | None = None,

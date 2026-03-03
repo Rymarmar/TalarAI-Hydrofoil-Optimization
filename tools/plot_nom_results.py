@@ -280,6 +280,11 @@ def main(
         f"  Re     {Re_val:.2e}"
     )
 
+    # BUG FIX: was hardcoded "≤4%c" — now reads from summary so it reflects
+    # whatever max_camber was actually used during the NOM run (e.g. 8%c).
+    camber_limit_str = (f"≤{summary.get('max_camber', 0.08)*100:.0f}%c"
+                        if summary else "≤8%c")
+
     col_mid = (
         f"  GEOMETRY\n"
         f"  Max thickness  {max_thick_val*100:.2f}%c  @ x={max_thick_x:.2f}c\n"
@@ -287,7 +292,7 @@ def main(
         f"  TE gap         {te_gap_val*100:.3f}%c\n"
         f"  Limit t_min    {(summary.get('min_thickness',0) if summary else 0)*100:.2f}%c\n"
         f"  Limit t_max    {(summary.get('max_thickness',0) if summary else 0)*100:.2f}%c\n"
-        f"  Limit camber   ≤4%c\n"
+        f"  Limit camber   {camber_limit_str}\n"
         f"  Unified loop   {n_ep} iters  lr={lr_tf}"
     ) if summary else "  GEOMETRY\n  (no summary)"
 
