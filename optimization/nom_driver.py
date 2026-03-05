@@ -949,7 +949,7 @@ def nom_optimize(
 
     # [2/19]: "Lookup_table_path Line 202: take out None"
     # Defaults to "" — path auto-constructed from design point conditions
-    lookup_baseline_path: str = "outputs/best_baseline_foil_averaged.json", #change to "" to auto-construct from conditions
+    lookup_baseline_path: str = "", #change to "" to auto-construct from conditions
 
     out_path: str | Path = "outputs",
 ):
