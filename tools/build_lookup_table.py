@@ -65,7 +65,7 @@ CHANGE LOG:
 HOW TO RUN:
   python tools/build_lookup_table.py
 
-  Runtime: ~20 minutes (12 conditions x 1647 foils).
+  Runtime: ~20 minutes (42 conditions x 1647 foils).
   Run once, results are saved. Re-run only if alpha/Re grid changes.
 """
 
@@ -95,8 +95,9 @@ OUTPUT_DIR = PROJECT_ROOT / "outputs"
 OUTPUT_DIR.mkdir(exist_ok=True)
 
 # 6x4 = 24 conditions total.
-ALPHA_LIST = [0.5, 1.0, 1.5, 2.0, 3.0, 4.0]  # degrees -- 1.0 is design point
-RE_LIST = [150000, 250000, 350000, 450000]
+# 3/5 Added 0 as an angle of attack
+ALPHA_LIST = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0]  # degrees -- 1.0 is design point 
+RE_LIST = [50000, 100000, 150000, 250000, 350000, 450000]  # [3/5/26] Added 50k, 100k for physical testing
 
 # ---------------------------------------------------------------------------
 # GEOMETRY FILTER DEFAULTS

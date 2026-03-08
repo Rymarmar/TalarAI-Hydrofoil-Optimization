@@ -185,7 +185,7 @@ except ModuleNotFoundError:
 #   This fixes the ~47% skip rate from the old code (see eval_all_conditions).
 #
 # Each entry: (alpha_degrees, Reynolds_number)
-OPERATING_CONDITIONS = [
+OPERATING_CONDITIONS = [ #comment others out if want to just test one condition, but also try AoA = 0
     (1.0, 450_000),   # max speed / design point  — CL naturally low here, NO floor check
     (2.0, 350_000),   # cruise
     (3.0, 250_000),   # mid-speed

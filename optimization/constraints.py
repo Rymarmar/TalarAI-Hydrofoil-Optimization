@@ -8,11 +8,11 @@ WHAT THIS FILE DOES:
   gets a penalty score >= 0 added to its CD/CL objective.
 
 KEY CHANGES from old version:
-  ✓ Removed all camber checks (prof: "too complicated, skip for now")
+  ✓ Camber check added back (2/19: "no cambered foils, hard to 3D print")
   ✓ Removed LE gap check (prof: "only check TE gap")
   ✓ Removed inf returns (prof: "use 1000 for hard rejects")
   ✓ Check thickness only in interior x ∈ [0.05, 0.90] (prof: line 408 feedback)
-  ✓ Simplified geometry_penalty to ONLY return thickness violation
+  ✓ Added min-max thickness check (2/19: "minimum of the maximum thickness")
   ✓ Lambda weights auto-normalized so Σ(λ_i) = 1
   
   
@@ -100,8 +100,8 @@ def latent_bounds_penalty(latent_vec: np.ndarray,
 # ===========================================================================
 
 def geometry_penalty(coords: np.ndarray,
-                     min_thickness: float = 0.04,
-                     max_thickness: float = 0.14,
+                     min_thickness: float = 0.006,
+                     max_thickness: float = 0.157,
                      te_gap_max: float = 0.01,
                      thickness_x_min: float = 0.05,
                      thickness_x_max: float = 0.90,
@@ -109,7 +109,7 @@ def geometry_penalty(coords: np.ndarray,
                      # thickness of the foil -- at least this for the max thickness"
                      # Hard rejects foils whose peak thickness is too thin (e.g. slivers
                      # that pass the local min_thickness check but have no structural depth).
-                     min_max_thickness: float = 0.06,
+                     min_max_thickness: float = 0.04,
                      # FIX #3 — max_camber raised from 0.04 → 0.08
                      # The HQ-series baseline foil (hq358) has ~7-8% camber.
                      # At 0.04 (4%c), the baseline and all nearby foils were
@@ -297,7 +297,7 @@ def geometry_penalty(coords: np.ndarray,
                         "max_camber_actual": max_camber_actual,
                         "max_camber_limit": max_camber}
     
-    # --- CHECK 5: TE gap (soft penalty) ---
+    # --- CHECK 7: TE gap (soft penalty) ---
     # ACTION ITEM #8: "No need for leading edge line 404, only trailing edge"
     # ACTION ITEM #9: "Line 408 no need for interpolation"
     # Prof: Check TE gap directly from coords, no interpolation needed.
@@ -379,12 +379,12 @@ def total_penalty(*,
                   lam_geom: float = 25.0,
                   lam_cl: float = 50.0,
                   
-                  # Geometry limits
-                  min_thickness: float = 0.04,
-                  max_thickness: float = 0.14,
+                  # Geometry limits (must match nom_driver.py defaults)
+                  min_thickness: float = 0.006,
+                  max_thickness: float = 0.157,
                   te_gap_max: float = 0.01,
                   # ACTION ITEM (2/19 meeting): new manufacturing constraints
-                  min_max_thickness: float = 0.06,   # peak thickness floor (structural depth)
+                  min_max_thickness: float = 0.04,   # peak thickness floor (structural depth)
                   # BUG FIX: was 0.04, now synced to match geometry_penalty() and nom_driver.py.
                   # total_penalty() is always called from nom_driver via **penalty_kwargs which
                   # passes max_camber=0.08 explicitly — but the default here must also match
