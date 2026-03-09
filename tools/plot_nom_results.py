@@ -153,7 +153,7 @@ def main(
     CL        = summary.get("best_CL", 0)          if summary else 0
     CD        = summary.get("best_CD", 0)          if summary else 0
     LD        = CL / CD                             if CD > 0 else 0
-    avg_LD    = summary.get("best_avg_LD", None)   if summary else None
+    avg_LD    = summary.get("best_LD", summary.get("best_avg_LD", None))   if summary else None
     alpha_val = summary.get("alpha", "?")          if summary else "?"
     Re_val    = summary.get("Re",    0)            if summary else 0
     n_ep      = summary.get("n_iters", "?")         if summary else "?"
@@ -269,7 +269,7 @@ def main(
     # clearly visible instead of being squashed at the bottom by outliers.
     if ax_conv is not None and history:
         iters = [h["iter"]      for h in history]
-        objs  = [h.get("avg_cd_cl", 0) for h in history]
+        objs  = [h.get("cd_cl", h.get("avg_cd_cl", 0)) for h in history]
 
         best_curve = []
         cur = float("inf")
