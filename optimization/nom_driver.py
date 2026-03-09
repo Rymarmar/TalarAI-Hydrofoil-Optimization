@@ -736,4 +736,4 @@ def nom_optimize(
 
 
 if __name__ == "__main__":
-    nom_optimize(tf_learning_rate=0.0005)
+    nom_optimize()

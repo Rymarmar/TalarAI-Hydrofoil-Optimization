@@ -14,8 +14,18 @@ KEY CHANGES from old version:
   ✓ Check thickness only in interior x ∈ [0.05, 0.90] (prof: line 408 feedback)
   ✓ Added min-max thickness check (2/19: "minimum of the maximum thickness")
   ✓ Lambda weights auto-normalized so Σ(λ_i) = 1
-  
-  
+
+FIXES APPLIED (3/9/26):
+  ✓ FIX 1: Surface-crossing check now uses [0.05, 0.90] interior mask,
+    matching the thickness check range. Previously used x >= 0.05 with
+    no upper bound, which included the TE region (x > 0.90) where
+    decoder noise can cause tiny apparent crossings that aren't real.
+    This caused false hard-rejects near the trailing edge.
+
+  ✓ FIX 2: Lambda normalization documented as FIXED-WEIGHT normalization,
+    not the adaptive normalization the professor described. See detailed
+    comment in total_penalty() explaining the difference and why fixed
+    weights are acceptable for now.
 
 PENALTIES:
   1) latent_bounds_penalty  -- params outside training data range
@@ -32,7 +42,7 @@ def relu(x: float) -> float:
     """
     ReLU = max(0, x). Used to convert violations into penalties.
     
-    ACTION ITEM #1: "No need for relu max in bounds"
+    ACTION ITEM #1 (2/17): "No need for relu max in bounds"
     Simplified to just use max(0.0, x) directly, removed wrapper complexity.
     """
     return float(max(0.0, x))
@@ -96,7 +106,7 @@ def latent_bounds_penalty(latent_vec: np.ndarray,
 
 
 # ===========================================================================
-# 2) GEOMETRY -- thickness check only (prof: removed camber, LE gap, etc.)
+# 2) GEOMETRY -- thickness, camber, TE gap checks
 # ===========================================================================
 
 def geometry_penalty(coords: np.ndarray,
@@ -125,11 +135,11 @@ def geometry_penalty(coords: np.ndarray,
     
     CHECKS (in order):
       1) Coords finite and reasonable range
-      2) Upper above lower everywhere (hard reject if crossing)
+      2) Upper above lower in interior [0.05, 0.90] (hard reject if crossing)
       3) Min thickness in interior (hard reject if too thin)
       4) Max thickness (hard reject if too fat)
-      5) Min-max thickness (hard reject if peak thickness < min_max_thickness)  ← ACTION ITEM 2/19
-      6) Max camber (hard reject if cambered foil)                              ← ACTION ITEM 2/19
+      5) Min-max thickness (hard reject if peak thickness < min_max_thickness)
+      6) Max camber (hard reject if cambered foil)
       7) TE gap (soft penalty if slightly open)
     
     REMOVED (per prof):
@@ -141,7 +151,8 @@ def geometry_penalty(coords: np.ndarray,
       - ACTION ITEM #10: Full 0->1 thickness scan (only check interior)
     
     HARD REJECTS:
-      ACTION ITEM #3: Instead of returning inf, return 1000 (prof: "no inf, use big number")
+      ACTION ITEM #3 (2/17): Instead of returning inf, return 1000
+      (prof: "no inf, use big number")
     
     INPUTS:
       coords -- shape (80, 2): decoded foil coords
@@ -171,39 +182,42 @@ def geometry_penalty(coords: np.ndarray,
     x_all, y_all = coords[:, 0], coords[:, 1]
     
     # --- CHECK 1: Coords finite and in reasonable range ---
-    # ACTION ITEM #5-6: Prof: "Find max y and x from dataset, narrow to ½ for buffer"
+    # ACTION ITEM #5-6 (2/17): Prof: "Find max y and x from dataset, narrow
+    # to ½ for buffer"
     # UPDATED: Used compute_dataset_max_xy.py to find actual dataset bounds.
     # Result: 99th percentile max |y| = 0.1786, with 10% buffer = 0.1964
-    # This ignores outliers like naca1.txt (y=1.0) which is 3x larger than normal foils.
+    # This ignores outliers like naca1.txt (y=1.0) which is 3x larger than
+    # normal foils.
     if not np.all(np.isfinite(x_all)) or not np.all(np.isfinite(y_all)):
         return 1000.0, {"reason": "nonfinite coords"}
     
-    # ACTION ITEM #4: "Hard reject with x will never happen but y will"
+    # ACTION ITEM #4 (2/17): "Hard reject with x will never happen but y will"
     # Sanity: x should be in [0,1], y should be reasonable
     if np.any(x_all < -0.1) or np.any(x_all > 1.1):
         return 1000.0, {"reason": "x out of range"}
     
-    # ACTION ITEM #5: "max_abs_y = 0.25 (random number), not good idea"
+    # ACTION ITEM #5 (2/17): "max_abs_y = 0.25 (random number), not good idea"
     # FIXED: Now using dataset 99th percentile + 10% buffer (0.1964)
-    if np.any(np.abs(y_all) > 0.1964):  # Dataset 99th percentile + 10% buffer
+    if np.any(np.abs(y_all) > 0.1964):
         return 1000.0, {"reason": "y too large"}
     
-    # --- CHECK 2: Upper above lower (hard reject if crossing) ---
-    # ACTION ITEM #2: "Didnt update from interpolation script in split_upper_lower (take out)"
+    # --- SURFACE SPLITTING ---
+    # ACTION ITEM #2 (2/17): "Didnt update from interpolation script in
+    # split_upper_lower (take out)"
     # Removed split_upper_lower function, now splitting surfaces directly here.
     upper_te2le = coords[:40]  # x: 1->0
     lower_le2te = coords[40:]  # x: 0->1
     
-    # Flip upper to LE->TE so both go same direction
+    # Flip upper to LE->TE so both go same direction for comparison
     upper_le2te = upper_te2le[::-1]  # x: 0->1
     
     xu, yu = upper_le2te[:, 0], upper_le2te[:, 1]
     xl, yl = lower_le2te[:, 0], lower_le2te[:, 1]
 
-    # ACTION ITEM #9: "Line 408 no need for interpolation"
-    # The decoder outputs both surfaces on the SAME x-grid (linspace 0->1, 40 pts).
-    # So upper and lower share x-values point-for-point -- no interpolation needed.
-    # We can subtract y values directly at each shared x point.
+    # ACTION ITEM #9 (2/17): "Line 408 no need for interpolation"
+    # The decoder outputs both surfaces on the SAME x-grid (linspace 0->1,
+    # 40 pts). So upper and lower share x-values point-for-point -- no
+    # interpolation needed. We can subtract y values directly.
     #
     # The old code interpolated onto a new 120-point grid which was:
     #   1) unnecessary (same x-grid already)
@@ -214,71 +228,81 @@ def geometry_penalty(coords: np.ndarray,
     # Both surfaces are already on linspace(0,1,40) -- use directly
     xg = xu  # shape (40,) -- same x values for both surfaces
     thickness = yu - yl  # shape (40,) -- point-by-point, no interpolation
-
+    
+    # ---------------------------------------------------------------
+    # INTERIOR MASK: used for ALL interior checks (crossing, thickness, camber)
+    #
+    # ACTION ITEM #10 (2/17): "Instead of 0 to 1, from .1 to .9 or .05 to .9"
+    #
+    # WHY: Near the leading edge (x~0) every foil tapers to a sharp point
+    # where thickness → 0 and upper/lower nearly touch. Near the trailing
+    # edge (x~1) the foil also tapers thin. Checking these regions would
+    # falsely reject valid foils due to:
+    #   - Natural taper (not a defect)
+    #   - Decoder noise at endpoints
+    #   - Tiny numerical crossings that aren't real
+    #
+    # FIX (3/9/26): Previously the crossing check used a DIFFERENT mask
+    # (x >= 0.05, no upper bound) than the thickness check ([0.05, 0.90]).
+    # This meant crossings near the TE (x > 0.90) would trigger a hard
+    # reject even though we intentionally exclude that region from
+    # thickness checks. Now ALL interior checks use the same mask.
+    # ---------------------------------------------------------------
+    mask = (xg >= thickness_x_min) & (xg <= thickness_x_max)
+    
     # --- CHECK 2: Upper above lower in INTERIOR only ---
-    # Skip near LE (x < 0.05) where foil tapers to a point --
+    # Skip near LE and TE where foil tapers to a point --
     # thickness naturally approaches 0 there and is not meaningful.
-    interior_mask = xg >= 0.05
-    if np.any(thickness[interior_mask] < -1e-6):
+    if np.any(thickness[mask] < -1e-6):
         return 1000.0, {"reason": "surfaces crossing"}
 
-    # --- CHECK 3 & 4: Thickness in INTERIOR only (prof: x in [0.05, 0.90]) ---
-    # ACTION ITEM #10: "Instead of 0 to 1, from .1 to .9 or .05 to .9"
-    # ACTION ITEM #11: "Line 433, not negative -1e-4 make positive"
-    # ACTION ITEM #12: "Find min thickness from dataset between .1 and .9"
+    # --- CHECK 3 & 4: Thickness in INTERIOR only ---
+    # ACTION ITEM #11 (2/17): "Line 433, not negative -1e-4 make positive"
+    # ACTION ITEM #12 (2/17): "Find min thickness from dataset between .1
+    # and .9"
     #
     # LOGIC: We only check thickness in the middle of the foil.
     # Near LE (x~0) and TE (x~1) every real foil tapers thin -- checking
     # there would reject all valid foils. The interior [0.05, 0.90] is
     # where structural thickness actually matters.
-    mask = (xg >= thickness_x_min) & (xg <= thickness_x_max)
     t_interior = thickness[mask]
     
     if len(t_interior) == 0:
         return 1000.0, {"reason": "no interior points"}
     
-    t_min = float(np.min(t_interior))  # ACTION ITEM #7: using float() not nom/numpy
+    t_min = float(np.min(t_interior))  # ACTION ITEM #7: using float()
     t_max = float(np.max(t_interior))  # ACTION ITEM #7: direct float conversion
     
     # Hard reject if too thin (prof: "check min thickness from dataset")
-    # ACTION ITEM #11: Make positive (was -1e-4, now positive comparison)
-    # ACTION ITEM #15: "too thin redundant, too thick check max/min"
+    # ACTION ITEM #11 (2/17): Make positive (was -1e-4, now positive comparison)
+    # ACTION ITEM #15 (2/17): "too thin redundant, too thick check max/min"
     if t_min < min_thickness:
         return 1000.0, {"reason": "too thin", "t_min": t_min}
     
     # Hard reject if too thick
-    # ACTION ITEM #15: Check against max_thickness from constraints
+    # ACTION ITEM #15 (2/17): Check against max_thickness from constraints
     if t_max > max_thickness:
         return 1000.0, {"reason": "too thick", "t_max": t_max}
 
-    # --- CHECK 5: Min-max thickness (peak must be structurally deep enough) ---
-    # ACTION ITEM (2/19 meeting): "ADD Minimum thickness of the maximum thickness
-    # of the foil -- at least this for the max thickness"
+    # --- CHECK 5: Min-max thickness (peak must be structurally deep) ---
+    # ACTION ITEM (2/19 meeting): "ADD Minimum thickness of the maximum
+    # thickness of the foil -- at least this for the max thickness"
     #
     # WHY THIS IS DIFFERENT FROM min_thickness:
-    #   min_thickness checks that NO point is too thin (local floor everywhere).
+    #   min_thickness checks that NO point is too thin (local floor).
     #   min_max_thickness checks that the PEAK thickness is deep enough.
-    #   A foil could pass min_thickness (e.g. 0.04 everywhere) but still be a
-    #   useless sliver if t_max is only 0.05 -- not 3D printable or structurally
-    #   viable. This check ensures the foil has enough structural depth at its
+    #   A foil could pass min_thickness (e.g. 0.04 everywhere) but still
+    #   be a useless sliver if t_max is only 0.05 -- not 3D printable or
+    #   structurally viable. This check ensures enough depth at the
     #   thickest point.
     if t_max < min_max_thickness:
         return 1000.0, {"reason": "peak too thin",
                         "t_max": t_max, "min_max_thickness": min_max_thickness}
 
-    # --- CHECK 6: Max camber (block extreme camber -- hard to 3D print) ---
-    # ACTION ITEM (2/19 meeting): "No cambered foils please -- NACA foils easier
-    # to 3D print / hard to manufacture cambered foils"
-    # INTERPRETATION A (confirmed 2/23): "No EXTREME camber" not "zero camber."
-    # 3D printing struggles with foils above ~4%c camber due to warping and
-    # support structure requirements on the concave lower surface.
-    #
-    # FIX #3 — default threshold raised from 0.04 → 0.08 in nom_driver.py
-    #   The HQ-series baseline (hq358) has ~7-8% camber. At the old 4% limit,
-    #   every perturbation of the baseline triggered a hard reject (1000 penalty),
-    #   making all FD gradients = inf and causing endless rollbacks. The threshold
-    #   is now passed in from nom_driver (default 0.08); this function still
-    #   enforces whatever value is passed — the logic here is unchanged.
+    # --- CHECK 6: Max camber (block extreme camber for 3D printing) ---
+    # ACTION ITEM (2/19 meeting): "No cambered foils please -- NACA foils
+    # easier to 3D print / hard to manufacture cambered foils"
+    # INTERPRETATION (confirmed 2/23): "No EXTREME camber" not "zero camber."
     #
     # HOW CAMBER IS COMPUTED:
     #   Camber line = midpoint between upper and lower surface at each x.
@@ -290,7 +314,7 @@ def geometry_penalty(coords: np.ndarray,
     #   Allows: NACA 0012 (0%), NACA 2412 (2%), NACA 4412 (4%), HQ358 (~8%)
     #   Blocks: extreme high-camber foils above 8%c
     camber_line = (yu + yl) / 2.0          # shape (40,) -- midpoint at each x
-    camber_interior = camber_line[mask]     # restrict to x in [0.05, 0.90]
+    camber_interior = camber_line[mask]     # restrict to interior [0.05, 0.90]
     max_camber_actual = float(np.max(np.abs(camber_interior)))
     if max_camber_actual > max_camber:
         return 1000.0, {"reason": "too cambered",
@@ -298,14 +322,20 @@ def geometry_penalty(coords: np.ndarray,
                         "max_camber_limit": max_camber}
     
     # --- CHECK 7: TE gap (soft penalty) ---
-    # ACTION ITEM #8: "No need for leading edge line 404, only trailing edge"
-    # ACTION ITEM #9: "Line 408 no need for interpolation"
+    # ACTION ITEM #8 (2/17): "No need for leading edge line 404, only
+    # trailing edge"
+    # ACTION ITEM #9 (2/17): "Line 408 no need for interpolation"
     # Prof: Check TE gap directly from coords, no interpolation needed.
     # If TE closes properly, gap will be ~0 which is correct.
+    #
+    # ACTION ITEM (3/5): "Trailing edge for manufacturing to be set to
+    # 0.005 instead of reaching 0" -- note: default te_gap_max=0.01 is
+    # MORE restrictive than 0.005 (rejects wider gaps). Change to 0.005
+    # if you want to allow slightly more open TEs.
     
     # TE = x ≈ 1.0 (last points of each surface)
-    y_upper_te = upper_te2le[0, 1]  # first row of upper (which is TE in TE->LE order)
-    y_lower_te = lower_le2te[-1, 1]  # last row of lower (which is TE in LE->TE order)
+    y_upper_te = upper_te2le[0, 1]   # first row of upper (TE in TE->LE order)
+    y_lower_te = lower_le2te[-1, 1]  # last row of lower (TE in LE->TE order)
     
     te_gap = float(abs(y_upper_te - y_lower_te))
     
@@ -313,10 +343,12 @@ def geometry_penalty(coords: np.ndarray,
     p_te = relu(te_gap - te_gap_max)
     
     # --- RETURN ---
-    # ACTION ITEM #18: "Line 480: thickness should be a penalty, return summation"
-    # Prof: "Have another p value, p = min_t, line 509 summation of all penalties"
-    # We already did thickness checks above (hard rejects for too thin/thick).
-    # Here we only return the soft TE gap penalty.
+    # ACTION ITEM #18 (2/17): "Line 480: thickness should be a penalty,
+    # return summation"
+    # Prof: "Have another p value, p = min_t, line 509 summation of all
+    # penalties"
+    # We already did thickness checks above (hard rejects for too
+    # thin/thick). Here we only return the soft TE gap penalty.
     total_pen = float(p_te)
     
     info = {
@@ -364,7 +396,7 @@ def cl_bounds_penalty(CL: float,
 
 
 # ===========================================================================
-# 4) TOTAL PENALTY with auto-normalized lambdas
+# 4) TOTAL PENALTY with lambda weights
 # ===========================================================================
 
 def total_penalty(*,
@@ -374,7 +406,18 @@ def total_penalty(*,
                   lat_lo: np.ndarray,
                   lat_hi: np.ndarray,
                   
-                  # Raw penalty weights (will be auto-normalized)
+                  # Penalty weights (relative importance)
+                  #
+                  # WHAT THESE MEAN:
+                  #   lam_bounds = how much to penalize going outside latent bounds
+                  #   lam_geom   = how much to penalize geometry violations (TE gap)
+                  #   lam_cl     = how much to penalize CL being out of range
+                  #
+                  # WHY THESE VALUES:
+                  #   lam_cl (50) >> lam_geom (25) >> lam_bounds (1)
+                  #   CL violations matter most because a foil with wrong lift is
+                  #   physically useless. Geometry matters next (manufacturability).
+                  #   Latent bounds are a soft guide, not a hard physics constraint.
                   lam_bounds: float = 1.0,
                   lam_geom: float = 25.0,
                   lam_cl: float = 50.0,
@@ -383,32 +426,59 @@ def total_penalty(*,
                   min_thickness: float = 0.006,
                   max_thickness: float = 0.157,
                   te_gap_max: float = 0.01,
-                  # ACTION ITEM (2/19 meeting): new manufacturing constraints
-                  min_max_thickness: float = 0.04,   # peak thickness floor (structural depth)
-                  # BUG FIX: was 0.04, now synced to match geometry_penalty() and nom_driver.py.
-                  # total_penalty() is always called from nom_driver via **penalty_kwargs which
-                  # passes max_camber=0.08 explicitly — but the default here must also match
-                  # so any direct call to total_penalty() without that kwarg behaves correctly.
-                  max_camber: float = 0.08,           # 8%c -- allows HQ-series baseline (hq358 ~7-8%c)
+                  min_max_thickness: float = 0.04,
+                  max_camber: float = 0.08,
                   
                   # CL window
                   cl_min: float | None = None,
                   cl_max: float | None = None,
                   ) -> tuple[float, dict]:
     """
-    Combine all penalties with auto-normalized lambda weights.
+    Combine all penalties into a single weighted sum.
     
-    ACTION ITEM #19: PROF FEEDBACK ON LAMBDAS:
+    ACTION ITEM #19 (2/17): PROF FEEDBACK ON LAMBDAS:
       "Lambda i = Pi / sum(Pi) so all lambdas sum to 1"
       "Think about weights so all have same valid vectors"
       "Some p's could be 0 but at the end there will be weights"
     
-    HOW IT WORKS:
-      1) Compute raw penalties: p_bounds, p_geom, p_cl
-      2) Normalize lambdas: λ_i = lam_i / Σ(lam_i)
-      3) Total = Σ(λ_i * p_i)
+    ---------------------------------------------------------------
+    IMPLEMENTATION NOTE (3/9/26) — FIXED-WEIGHT NORMALIZATION
+    ---------------------------------------------------------------
+    The professor's formula "λ_i = P_i / Σ(P_i)" describes ADAPTIVE
+    normalization: at each step, divide each penalty by the total
+    penalty sum so they contribute equally. Example:
+      p_bounds=0.5, p_geom=0.01, p_cl=0.0
+      λ_bounds = 0.5/0.51 = 0.98, λ_geom = 0.01/0.51 = 0.02
     
-    FORMULA:
+    PROBLEM with adaptive normalization:
+      When one penalty dominates (e.g. p_bounds=0.5, p_geom=0.001),
+      the small penalty's gradient gets scaled to near-zero, so the
+      optimizer ignores it. Worse, when all penalties are zero (valid
+      foil), you get 0/0 = undefined. And the gradient of (p_i / Σp)
+      with respect to the latent vector is more complex (quotient rule)
+      which would interact badly with our finite-difference approach.
+    
+    WHAT WE DO INSTEAD (fixed-weight normalization):
+      λ_i = lam_i / (lam_bounds + lam_geom + lam_cl)
+      This normalizes the WEIGHTS to sum to 1, not the penalties.
+      The relative importance is set by lam_bounds:lam_geom:lam_cl
+      (currently 1:25:50) and stays constant throughout optimization.
+    
+    WHY THIS IS ACCEPTABLE:
+      In practice, geometry violations are all-or-nothing (hard reject
+      = 1000, which short-circuits before reaching the lambda math).
+      The only soft penalty that reaches this weighted sum is the TE
+      gap, which is small. So the lambda normalization mainly affects
+      the balance between latent-bounds and CL penalties, where
+      fixed weights work fine.
+    
+    TO MATCH PROFESSOR'S FORMULA EXACTLY, you would need:
+      p_sum = p_bounds + p_geom + p_cl + 1e-9  # avoid /0
+      total = (p_bounds**2 / p_sum) + (p_geom**2 / p_sum) + ...
+      But this has the gradient issues described above.
+    ---------------------------------------------------------------
+    
+    FORMULA (current implementation):
       λ_bounds_norm = lam_bounds / (lam_bounds + lam_geom + lam_cl)
       λ_geom_norm   = lam_geom   / (lam_bounds + lam_geom + lam_cl)
       λ_cl_norm     = lam_cl     / (lam_bounds + lam_geom + lam_cl)
@@ -416,11 +486,6 @@ def total_penalty(*,
       total = λ_bounds_norm * p_bounds
             + λ_geom_norm   * p_geom
             + λ_cl_norm     * p_cl
-    
-    This ensures Σ(λ_i) = 1 automatically, regardless of what raw lam values
-    you pass in. The RELATIVE sizes still matter (e.g. lam_cl=50 vs lam_bounds=1
-    means CL violations are weighted 50x more), but now they're on a consistent
-    scale.
     """
     # --- Penalty 1: latent bounds ---
     p_bounds = latent_bounds_penalty(latent_vec, lat_lo, lat_hi)
@@ -431,12 +496,12 @@ def total_penalty(*,
         min_thickness=min_thickness,
         max_thickness=max_thickness,
         te_gap_max=te_gap_max,
-        # ACTION ITEM (2/19 meeting): pass new manufacturing constraints through
         min_max_thickness=min_max_thickness,
         max_camber=max_camber,
     )
     
-    # Hard reject if geometry is impossible
+    # Hard reject if geometry is impossible (1000 penalty from geometry_penalty)
+    # Short-circuit: don't bother computing other penalties, just return 1000.
     if p_geom >= 1000.0:
         return 1000.0, {
             **geom_info,
@@ -450,14 +515,14 @@ def total_penalty(*,
     if CL is not None:
         p_cl = cl_bounds_penalty(CL, cl_min=cl_min, cl_max=cl_max)
     
-    # --- Normalize lambdas so they sum to 1 ---
+    # --- Normalize lambda weights so they sum to 1 ---
     lam_sum = lam_bounds + lam_geom + lam_cl
     if lam_sum <= 0:
         raise ValueError("Lambda sum must be > 0")
     
-    lam_bounds_norm = lam_bounds / lam_sum
-    lam_geom_norm   = lam_geom   / lam_sum
-    lam_cl_norm     = lam_cl     / lam_sum
+    lam_bounds_norm = lam_bounds / lam_sum  # 1/76 ≈ 0.013
+    lam_geom_norm   = lam_geom   / lam_sum  # 25/76 ≈ 0.329
+    lam_cl_norm     = lam_cl     / lam_sum  # 50/76 ≈ 0.658
     
     # --- Weighted sum ---
     total = float(lam_bounds_norm * p_bounds

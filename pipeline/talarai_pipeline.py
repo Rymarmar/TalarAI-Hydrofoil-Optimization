@@ -38,6 +38,58 @@ def _to_float(x) -> float:
     return float(arr.reshape(-1)[0])
 
 
+def _prep_coords_for_neuralfoil(coords: np.ndarray, n_points: int = 40) -> np.ndarray:
+    """
+    Clean up decoded coordinates so NeuralFoil's Kulfan fitter doesn't crash.
+
+    PROBLEM:
+      The decoder outputs 80 points: 40 upper (TE->LE) + 40 lower (LE->TE).
+      Both surfaces use x_grid = linspace(0, 1, 40), so:
+        - Row 39 (upper end) and row 40 (lower start) both have x=0.0
+          → duplicate leading edge point
+        - Exact x=0.0 and x=1.0 create degenerate rows in the Kulfan
+          basis C(x) = x^0.5 * (1-x)^1.0 (evaluates to exactly 0)
+        - Open trailing edge (upper TE y ≠ lower TE y)
+
+      These cause numpy.linalg.lstsq to fail with "SVD did not converge",
+      which shows up as the "DLASCLS parameter 4" error spam.
+
+    FIX:
+      1) Remove the duplicate LE point (drop first point of lower surface)
+      2) Nudge x values: clamp to [1e-6, 1-1e-6] so basis functions
+         never hit exactly 0
+      3) Close the trailing edge: average upper/lower TE y-values so
+         the airfoil loop closes properly
+
+    This produces a clean 79-point airfoil loop (TE -> LE -> TE) that
+    AeroSandbox's Kulfan fitter can handle reliably.
+
+    INPUT:  coords shape (80, 2) — original decoder output
+    OUTPUT: cleaned coords shape (79, 2) — ready for NeuralFoil
+    """
+    coords = np.array(coords, dtype=np.float64)
+
+    upper = coords[:n_points]       # rows 0-39: TE->LE (x: 1->0)
+    lower = coords[n_points:]       # rows 40-79: LE->TE (x: 0->1)
+
+    # 1) Remove duplicate LE point: upper ends at x=0, lower starts at x=0.
+    #    Drop the first row of lower so the LE appears only once.
+    lower_no_dup = lower[1:]        # rows 41-79 (39 points)
+
+    # 2) Close trailing edge: average upper TE (row 0) and lower TE (last row)
+    te_y_avg = (upper[0, 1] + lower_no_dup[-1, 1]) / 2.0
+    upper[0, 1] = te_y_avg
+    lower_no_dup[-1, 1] = te_y_avg
+
+    # 3) Reassemble the loop
+    clean = np.vstack([upper, lower_no_dup])  # 40 + 39 = 79 points
+
+    # 4) Nudge x away from exact 0 and 1 to avoid degenerate Kulfan basis
+    clean[:, 0] = np.clip(clean[:, 0], 1e-6, 1.0 - 1e-6)
+
+    return clean.astype(np.float64)
+
+
 class TalarAIPipeline:
     """
     Owns:
@@ -168,15 +220,38 @@ class TalarAIPipeline:
         """
         coords = self.latent_to_coordinates(latent_vec, debug=debug)
 
+        # -----------------------------------------------------------------
+        # FIX (3/9/26): Clean up coordinates before NeuralFoil.
+        #
+        # NeuralFoil internally converts coordinates to Kulfan parameters
+        # using a least-squares fit with basis functions:
+        #   C(x) = x^0.5 * (1-x)^1.0
+        #
+        # This fails (SVD did not converge / DLASCLS error) when:
+        #   1) Duplicate points at LE (x=0 appears twice — upper end
+        #      and lower start) create rank-deficient rows in the matrix
+        #   2) Exact x=0.0 or x=1.0 make the basis function evaluate
+        #      to exactly 0, creating degenerate rows
+        #
+        # The fix:
+        #   a) Remove the duplicate LE point (drop first row of lower)
+        #   b) Clamp x slightly away from exact 0 and 1
+        #   c) Close the TE by averaging upper/lower TE y-values
+        #
+        # This does NOT change `coords` (which is used for geometry
+        # checks in constraints.py). It only affects what NeuralFoil sees.
+        # -----------------------------------------------------------------
+        nf_coords = _prep_coords_for_neuralfoil(coords, self.n_points)
+
         aero = nf.get_aero_from_coordinates(
-            coordinates=coords,
+            coordinates=nf_coords,
             alpha=float(alpha),
             Re=float(Re),
             model_size=model_size,
         )
 
         out = aero if isinstance(aero, dict) else dict(aero)
-        out["coords"] = coords
+        out["coords"] = coords  # return original coords (not cleaned)
         out["CL"] = _to_float(out.get("CL"))
         out["CD"] = _to_float(out.get("CD"))
         return out
