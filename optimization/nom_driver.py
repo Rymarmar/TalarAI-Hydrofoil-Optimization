@@ -279,15 +279,30 @@ class NOMModel(tf.keras.Model):
         if not hasattr(self, "_t_start"):
             self._t_start = time.time()
 
-        # Cosine LR decay
+        # Cosine LR decay with warmup
+        # [FIX 3/9/26] Previous schedule was too aggressive: LR decayed to 5%
+        # of starting value, and by iteration 50/100 it was already at 50%.
+        # This gave the optimizer almost no time to explore before the brakes
+        # were applied, resulting in only 3 improvements in 100 iterations.
+        #
+        # NEW SCHEDULE:
+        #   - First 10% of iterations: flat at lr_max (warmup / exploration)
+        #   - Remaining 90%: cosine decay from lr_max to lr_max * 0.15
+        #   - Floor raised from 5% to 15% so late iterations can still step
         it = int(self.optimizer.iterations.numpy())
-        n_total = max(getattr(self, "_n_iters", 100), 1)
+        n_total = max(getattr(self, "_n_iters", 500), 1)
         if self._initial_lr is None:
             self._initial_lr = float(self.optimizer.learning_rate)
         lr_max = self._initial_lr
-        lr_min = lr_max * 0.05
-        progress = min(it / n_total, 1.0)
-        new_lr = lr_min + 0.5 * (lr_max - lr_min) * (1 + np.cos(np.pi * progress))
+        lr_min = lr_max * 0.15      # was 0.05 — raised so late iters can still move
+        warmup_frac = 0.10           # flat LR for first 10% of iterations
+        warmup_end = int(n_total * warmup_frac)
+
+        if it < warmup_end:
+            new_lr = lr_max          # flat during warmup
+        else:
+            progress = min((it - warmup_end) / max(n_total - warmup_end, 1), 1.0)
+            new_lr = lr_min + 0.5 * (lr_max - lr_min) * (1 + np.cos(np.pi * progress))
         self.optimizer.learning_rate.assign(new_lr)
 
         model = self  # capture for nested function
@@ -486,7 +501,7 @@ def nom_optimize(
     alpha: float = DEFAULT_ALPHA,
     Re: float = DEFAULT_RE,
 
-    n_iters: int = 100,
+    n_iters: int = 500,
     tf_learning_rate: float = 0.0005,
     fd_eps: float = 0.01,
     bounds_lam: float = 10.0,
@@ -542,7 +557,7 @@ def nom_optimize(
     if not lookup_baseline_path:
         a_s = min(_VALID_ALPHAS, key=lambda a: abs(a - alpha))
         r_s = min(_VALID_RES,    key=lambda r: abs(r - Re))
-        tag = f"alpha{a_s:.1f}_Re{r_s:.0e}"
+        tag = f"alpha{a_s:.1f}_Re{r_s:.1e}"
         lookup_baseline_path = f"outputs/best_baseline_foil_{tag}.json"
         print(f"Auto path: {lookup_baseline_path}")
 

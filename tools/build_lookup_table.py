@@ -307,7 +307,7 @@ def build_lookup_table():
     for alpha in ALPHA_LIST:
         for Re in RE_LIST:
             done += 1
-            tag = f"alpha{alpha:.1f}_Re{Re:.0e}"
+            tag = f"alpha{alpha:.1f}_Re{Re:.1e}"
             print("=" * 60)
             print(f"[{done}/{total_conditions}]  alpha={alpha}deg  Re={Re:.0e}")
             print("=" * 60)
@@ -402,7 +402,7 @@ def build_lookup_table():
     all_dfs = []
     for alpha in ALPHA_LIST:
         for Re in RE_LIST:
-            tag = f"alpha{alpha:.1f}_Re{Re:.0e}"
+            tag = f"alpha{alpha:.1f}_Re{Re:.1e}"
             fpath = OUTPUT_DIR / f"lookup_table_{tag}.csv"
             if fpath.exists():
                 df_c = pd.read_csv(fpath)[
