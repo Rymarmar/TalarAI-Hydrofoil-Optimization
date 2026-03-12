@@ -4,9 +4,39 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import random
 from sklearn.preprocessing import StandardScaler
+import tensorflow as tf
 from tensorflow.keras.models import Model, load_model
 from tensorflow.keras.layers import Input, Dense
 from tensorflow.keras.optimizers import Adam
+
+# ============================================================
+# REPRODUCIBILITY SEEDS  [FIX: added to match encoder.py]
+#
+# WHY THIS MATTERS:
+#   Without seeds, every retraining on a new device starts from
+#   different random weights and converges to a different local
+#   minimum. This changes the latent->y80 mapping, which changes
+#   which foil NeuralFoil scores highest, which changes the
+#   baseline selected from the lookup table.
+#
+# WHY SEEDS ALONE ARE NOT ENOUGH:
+#   TF's oneDNN backend (visible in terminal: "oneDNN custom ops")
+#   uses different floating-point operation orderings on different
+#   CPUs (Intel vs AMD vs Apple Silicon). Seeds control random
+#   INITIALIZATION, not rounding. Two CPUs with seed=42 will get
+#   the same starting weights but slightly different gradients,
+#   and may converge to slightly different solutions.
+#
+# CORRECT FIX: Train once, then COPY these files to all devices:
+#   - autoencoder_6params.weights.h5
+#   - encoder_6params.weights.h5
+#   - decoder_model_6x100x1000x80.weights.h5  (see save fix below)
+#   - airfoil_latent_params_6.csv
+#   - outputs/best_baseline_foil_*.json
+# ============================================================
+np.random.seed(42)
+tf.random.set_seed(42)
+random.seed(42)
 
 # -----------------------------
 # Step 1: Load dataset
@@ -51,10 +81,24 @@ if not os.path.exists(model_path):
         verbose=1
     )
 
-    decoder.save(model_path)
+    # [FIX] Use save_weights() instead of save() to match the .weights.h5
+    # filename. decoder.save() saves the full model (architecture + weights)
+    # in Keras format, but the filename ends in .weights.h5 which implies
+    # weights-only format. On different TF versions, save() behaves
+    # differently with this extension, causing load_model() to fail or
+    # produce corrupted state on other devices.
+    # save_weights() + load_weights() is consistent across TF versions.
+    decoder.save_weights(model_path)
 else:
     print("\n Found trained model. Loading it instead...")
-    decoder = load_model(model_path,compile=False)
+    # Rebuild the same architecture, then load the saved weights.
+    # This is required when using save_weights() instead of save().
+    inp = Input(shape=(6,), name="params6")
+    x = Dense(100, activation="relu")(inp)
+    x = Dense(1000, activation="relu")(x)
+    out = Dense(80, activation="linear")(x)
+    decoder = Model(inp, out, name="testdecoder_6x100x1000x80")
+    decoder.load_weights(model_path)
 
 # -----------------------------
 # Step 3: Predict and plot every 500th airfoil

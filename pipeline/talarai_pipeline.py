@@ -22,7 +22,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import numpy as np
-from tensorflow.keras.models import load_model
+# load_model removed: decoder now loaded via load_weights() in __init__
 import neuralfoil as nf
 
 
@@ -127,7 +127,21 @@ class TalarAIPipeline:
                 )
 
         self.decoder_path = found
-        self.decoder = load_model(str(found), compile=False)
+
+        # [FIX] decoder.py now saves with save_weights() not save(), so we
+        # must rebuild the architecture then call load_weights().
+        # load_model() only works with full Keras format -- using it on a
+        # .weights.h5 file will fail or silently load wrong weights depending
+        # on TF version. This is exactly what caused different baselines
+        # across devices. rebuild + load_weights() is version-safe.
+        from tensorflow.keras.layers import Input, Dense
+        from tensorflow.keras.models import Model as _Model
+        _inp = Input(shape=(6,), name="params6")
+        _x   = Dense(100,  activation="relu")(_inp)
+        _x   = Dense(1000, activation="relu")(_x)
+        _out = Dense(80,   activation="linear")(_x)
+        self.decoder = _Model(_inp, _out, name="testdecoder_6x100x1000x80")
+        self.decoder.load_weights(str(found))
 
     def latent_to_y(self, latent_vec: np.ndarray, debug: bool = False) -> np.ndarray:
         """

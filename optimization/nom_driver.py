@@ -141,7 +141,7 @@ except ModuleNotFoundError:
 # DEFAULT OPERATING POINT  [3/5/26: single condition, no averaging]
 # ===========================================================================
 DEFAULT_ALPHA = 2.0
-DEFAULT_RE    = 350_000
+DEFAULT_RE    = 150_000
 
 # Valid grid values for snapping (must match build_lookup_table.py)
 _VALID_ALPHAS = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 5.0]
@@ -262,7 +262,7 @@ class NOMModel(tf.keras.Model):
         self.n_improved  = 0
         self.n_valid     = 0
         self.n_skipped   = 0
-        self._n_iters    = 500
+        self._n_iters    = 250
         self._initial_lr = None
 
     def call(self, inputs=None, training=False):
@@ -356,7 +356,7 @@ class NOMModel(tf.keras.Model):
 
         # --- Learning rate schedule (cosine with warmup) ---
         it      = int(self.optimizer.iterations.numpy())
-        n_total = max(getattr(self, "_n_iters", 500), 1)
+        n_total = max(getattr(self, "_n_iters", 250), 1)
         if self._initial_lr is None:
             self._initial_lr = float(self.optimizer.learning_rate)
         lr_max    = self._initial_lr
@@ -369,6 +369,12 @@ class NOMModel(tf.keras.Model):
             progress = min((it - warmup_end) / max(n_total - warmup_end, 1), 1.0)
             new_lr = lr_min + 0.5 * (lr_max - lr_min) * (1.0 + np.cos(np.pi * progress))
         self.optimizer.learning_rate.assign(new_lr)
+
+        # Safe defaults in case forward_pass raises before setting these.
+        # Without this, an early exception would cause an AttributeError
+        # at line "if not np.isfinite(self._fwd_loss)" below.
+        self._fwd_loss = float("inf")
+        self._fwd_info = None
 
         # Save current z before the step so we can rollback if needed
         z_saved = self.z.numpy().copy().astype(np.float64)
@@ -525,7 +531,7 @@ class NOMModel(tf.keras.Model):
     def _print_step(self, iter_num, loss_0, dbg,
                     skipped=False, step_ok=True):
         """Print one-line progress for this iteration."""
-        n_total = getattr(self, "_n_iters", 500)
+        n_total = getattr(self, "_n_iters", 250)
         elapsed = time.time() - getattr(self, "_t_start", time.time())
         secs_per = elapsed / max(iter_num, 1)
         eta      = secs_per * (n_total - iter_num)
@@ -568,7 +574,7 @@ def nom_optimize(
     alpha: float = DEFAULT_ALPHA,
     Re:    float = DEFAULT_RE,
 
-    n_iters:          int   = 500,
+    n_iters:          int   = 250,
     tf_learning_rate: float = 0.0005,  # lr=0.0005 -- lowered from 0.005.
                                         # WHY: at lr=0.005 the optimizer found
                                         # L/D=143.4 at iter 3 but immediately
@@ -592,7 +598,11 @@ def nom_optimize(
     # Geometry limits  -- CHANGE min_max_thickness for your 3D printer
     min_thickness:     float = 0.006,
     max_thickness:     float = 0.157,
-    te_gap_max:        float = 0.01,
+    # [ACTION ITEM 3/5/26] Tightened from 0.01 to 0.005 for manufacturing:
+    # A trailing edge gap of 1%c is too open to 3D print cleanly.
+    # 0.5%c (0.005) is a tighter but still achievable manufacturing tolerance.
+    # The optimizer will now penalize (softly) any TE gap above 0.5%c.
+    te_gap_max:        float = 0.005,
     min_max_thickness: float = 0.04,   # <- TUNE: minimum peak thickness
     # max_camber raised to 0.10 from 0.08.
     # WHY: e61 baseline has 7.08% camber. At 0.08 the buffer was only

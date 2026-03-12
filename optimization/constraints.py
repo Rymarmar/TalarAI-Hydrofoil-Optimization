@@ -425,9 +425,17 @@ def total_penalty(*,
                   # Geometry limits (must match nom_driver.py defaults)
                   min_thickness: float = 0.006,
                   max_thickness: float = 0.157,
-                  te_gap_max: float = 0.01,
+                  # [ACTION ITEM 3/5/26] Tightened from 0.01 to 0.005 to match
+                  # nom_driver.py manufacturing tolerance fix.
+                  te_gap_max: float = 0.005,
                   min_max_thickness: float = 0.04,
-                  max_camber: float = 0.08,
+                  # [BUG FIX] Synced from 0.08 to 0.10 to match geometry_penalty()
+                  # default and nom_driver.py default. Previously total_penalty()
+                  # used 0.08 while geometry_penalty() used 0.10, meaning if
+                  # nom_driver did NOT explicitly pass max_camber, total_penalty
+                  # would silently apply a tighter limit than intended.
+                  # Now all three defaults are consistent at 0.10.
+                  max_camber: float = 0.10,
                   
                   # CL window
                   cl_min: float | None = None,
