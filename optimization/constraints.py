@@ -128,7 +128,7 @@ def geometry_penalty(coords: np.ndarray,
                      # roll back endlessly. Raised to 0.08 (8%c) so the
                      # optimizer can explore the neighborhood of the baseline.
                      # If you switch to a symmetric NACA baseline, lower back to 0.04.
-                     max_camber: float = 0.08,
+                     max_camber: float = 0.10,
                      ) -> tuple[float, dict]:
     """
     Check foil geometry. SIMPLIFIED per prof feedback.
