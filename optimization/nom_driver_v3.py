@@ -1,5 +1,5 @@
 """
-optimization/nom_driver_v3.py
+optimization/nom_driver.py
 
 ===========================================================================
 THE IDEA: CAN WE AUTO-DIFF THROUGH NEURALFOIL?
@@ -35,7 +35,7 @@ WHY THIS IS BETTER THAN nom_driver.py's @tf.custom_gradient:
   nom_driver.py puts the FD loop INSIDE train_step, which makes
   train_step long and the gradient logic entangled with the step logic.
 
-  v3 separates them:
+  This version separates them:
     - NeuralFoilLossOp: a standalone class that wraps NF + FD gradient
     - train_step: just `with tape: loss = nf_op(z)` + tape.gradient
     - Clean, readable, matches the TF guide structure exactly
@@ -50,7 +50,7 @@ STRUCTURE
          FORWARD:  z -> NF -> CD/CL + penalty  (NumPy, via .numpy())
          BACKWARD: central differences over CD/CL + penalty
 
-  NOMModelV3.train_step:
+  NOMModel.train_step:
     with tf.GradientTape() as tape:
         loss = self.nf_op(self.z)    # all gradient machinery is in nf_op
     grads = tape.gradient(loss, [self.z])
@@ -310,10 +310,10 @@ class NeuralFoilLossOp:
 
 
 # ===========================================================================
-# NOM MODEL V3
+# NOM MODEL
 # ===========================================================================
 
-class NOMModelV3(tf.keras.Model):
+class NOMModel(tf.keras.Model):
     """
     NOM optimizer using GradientTape + NeuralFoilLossOp.
 
@@ -375,7 +375,7 @@ class NOMModelV3(tf.keras.Model):
     def call(self, inputs=None, training=False):
         # Decoder forward pass (not used for gradient here, kept for build())
         z_batched = tf.expand_dims(self.z, axis=0)
-        # We don't use the decoder directly in v3 -- the pipeline does that
+        # We don't use the decoder directly -- the pipeline does that
         # internally inside NeuralFoilLossOp._evaluate.
         # Return z for shape compatibility.
         return self.z
@@ -528,7 +528,7 @@ class NOMModelV3(tf.keras.Model):
 # MAIN OPTIMIZATION FUNCTION
 # ===========================================================================
 
-def nom_optimize_v3(
+def nom_optimize(
     *,
     alpha: float = DEFAULT_ALPHA,
     Re:    float = DEFAULT_RE,
@@ -551,7 +551,7 @@ def nom_optimize_v3(
     out_path:              str | Path = "outputs",
 ):
     """
-    Run NOM optimization V3.
+    Run NOM optimization.
 
     Same math as nom_driver.py (NeuralFoil + FD gradients), but with
     a cleaner architecture:
@@ -563,7 +563,7 @@ def nom_optimize_v3(
     out_path.mkdir(exist_ok=True)
 
     print("=" * 70)
-    print("NOM V3  --  NeuralFoilLossOp + clean GradientTape train_step")
+    print("NOM  --  NeuralFoilLossOp + clean GradientTape train_step")
     print("=" * 70)
     print(f"  Iterations:     {n_iters}")
     print(f"  Learning rate:  {tf_learning_rate}")
@@ -627,7 +627,7 @@ def nom_optimize_v3(
         bounds_lam=bounds_lam,
     )
 
-    nom = NOMModelV3(
+    nom = NOMModel(
         nf_op=nf_op,
         z_init=latent_baseline,
         pipeline=pipeline,
@@ -673,23 +673,23 @@ def nom_optimize_v3(
     # Save results
     best = nom.best_result
     if best is None or best.get("coords") is None:
-        print("NOM V3 found 0 valid candidates.")
+        print("NOM found 0 valid candidates.")
         return
 
-    np.savetxt(out_path / "best_latent_nom_v3.csv",
+    np.savetxt(out_path / "best_latent_nom.csv",
                best["latent"].reshape(1, -1),
                delimiter=",", header="p1,p2,p3,p4,p5,p6", comments="")
-    np.save(out_path / "best_latent_nom_v3.npy", best["latent"])
-    np.savetxt(out_path / "best_coords_nom_v3.csv",
+    np.save(out_path / "best_latent_nom.npy", best["latent"])
+    np.savetxt(out_path / "best_coords_nom.csv",
                best["coords"], delimiter=",", header="x,y", comments="")
 
-    with open(out_path / "nom_history_v3.json", "w") as f:
+    with open(out_path / "nom_history.json", "w") as f:
         json.dump(nom.history_log, f, indent=2)
 
     best_LD = best["CL"] / best["CD"] if best["CD"] > 0 else 0.0
 
     print("=" * 70)
-    print("NOM V3 COMPLETE")
+    print("NOM COMPLETE")
     print("=" * 70)
     print(f"  BASELINE:  L/D={bl_LD:.1f}  CL={bl_CL:.4f}  CD={bl_CD:.6f}")
     print(f"  OPTIMIZED: L/D={best_LD:.1f}  CL={best['CL']:.4f}  CD={best['CD']:.6f}")
@@ -700,4 +700,4 @@ def nom_optimize_v3(
 
 
 if __name__ == "__main__":
-    nom_optimize_v3()
+    nom_optimize()
