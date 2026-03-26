@@ -312,7 +312,7 @@ def main(
                      alpha=0.8)
 
     # -- Stats panel -------------------------------------------------------
-    avg_ld_str = f"{avg_LD:.1f}" if avg_LD else f"{LD:.1f}"
+    avg_ld_str = f"{avg_LD:.1f}" if avg_LD is not None else f"{LD:.1f}"
 
     col_left = (
         f"  AERODYNAMICS\n"
