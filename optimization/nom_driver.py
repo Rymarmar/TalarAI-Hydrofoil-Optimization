@@ -81,7 +81,7 @@ except ModuleNotFoundError:
 # DEFAULT OPERATING POINT
 # ===========================================================================
 DEFAULT_ALPHA = 2.0
-DEFAULT_RE    = 250_000
+DEFAULT_RE    = 100_000
 
 _VALID_ALPHAS = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 5.0]
 _VALID_RES    = [50_000, 100_000, 150_000, 250_000, 350_000, 450_000]

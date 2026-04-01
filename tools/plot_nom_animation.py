@@ -327,7 +327,7 @@ def interactive_viewer(outputs_dir: Path):
             f"CL={CL:.4f}   CD={CD:.6f}   L/D={ld:.1f}   "
             f"Best L/D so far={best_ld_here:.1f}   "
             f"vs baseline: {pct:+.1f}%   |   "
-            f"alpha={alpha}°  Re={Re:.0e}"
+            f"alpha={alpha}°  Re={Re/1000:.0f}k"
         )
 
         fig.canvas.draw_idle()
