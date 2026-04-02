@@ -120,15 +120,34 @@ def geometry_penalty(coords: np.ndarray,
                      # Hard rejects foils whose peak thickness is too thin (e.g. slivers
                      # that pass the local min_thickness check but have no structural depth).
                      min_max_thickness: float = 0.04,
-                     # FIX #3 — max_camber raised from 0.04 → 0.08
-                     # The HQ-series baseline foil (hq358) has ~7-8% camber.
-                     # At 0.04 (4%c), the baseline and all nearby foils were
-                     # immediately hard-rejected after any perturbation, causing
-                     # the optimizer to see loss=inf in every direction and
-                     # roll back endlessly. Raised to 0.08 (8%c) so the
-                     # optimizer can explore the neighborhood of the baseline.
-                     # If you switch to a symmetric NACA baseline, lower back to 0.04.
-                     max_camber: float = 0.10,
+                     # REVISION (4/1/26): max_camber tightened from 0.10 → 0.05 (5%c).
+                     #
+                     # WHY 0.10 was too loose:
+                     #   At 10%c the optimizer converged to 8.3% camber at alpha=2,
+                     #   Re=150k. That foil is great at alpha=2 but stalls much
+                     #   earlier and drags heavily at alpha=4-5, which is a real
+                     #   operating condition when the boat accelerates. The optimizer
+                     #   was legally exploiting the camber allowance to win at the
+                     #   single design point.
+                     #
+                     # WHY 0.05 (5%c):
+                     #   Allows NACA 2412 (2%), NACA 4412 (4%), and mild camber
+                     #   similar to e63 (~4.5%). These are aerodynamically useful
+                     #   shapes that still perform acceptably across alpha=1..5.
+                     #   Blocks the aggressive >5% shapes that are over-tuned to
+                     #   one operating point and are harder to 3D-print cleanly.
+                     #
+                     # If the optimizer rejects the baseline with this limit, raise
+                     # to 0.06 as a fallback. For NACA 0012, you could go as low
+                     # as 0.02 since it has zero camber.
+                     max_camber: float = 0.06,
+                     # ACTION ITEM (4/1/26): Force leading edge near y=0.
+                     # The TE is already averaged/closed in talarai_pipeline.py.
+                     # This mirrors that logic on the LE side: if the LE y drifts
+                     # above max_le_y (2%c), hard-reject the candidate.
+                     # Prevents the optimizer from "lifting the nose" even when
+                     # doing so technically improves CD/CL.
+                     max_le_y: float = 0.01,
                      ) -> tuple[float, dict]:
     """
     Check foil geometry. SIMPLIFIED per prof feedback.
@@ -320,8 +339,38 @@ def geometry_penalty(coords: np.ndarray,
         return 1000.0, {"reason": "too cambered",
                         "max_camber_actual": max_camber_actual,
                         "max_camber_limit": max_camber}
-    
-    # --- CHECK 7: TE gap (soft penalty) ---
+
+    # --- CHECK 7: Leading edge must stay at y ≈ 0 (action item 4/1/26) ---
+    #
+    # WHY THIS IS NEEDED:
+    #   The optimizer can improve CD/CL by "lifting the nose" — raising the
+    #   LE y above 0. This is physically wrong: in the standard foil definition
+    #   the chord line runs from (0,0) to (1,0), so the LE should sit at y=0.
+    #   Visually it makes the foil look like it is flying at a tilt even in
+    #   the shape plot, which confused the professor in earlier runs.
+    #
+    # HOW WE COMPUTE IT:
+    #   upper_le2te[0] is the LE point of the upper surface (x≈0).
+    #   lower_le2te[0] is the LE point of the lower surface (x≈0).
+    #   We average the two LE y-values — this is the camber line at x=0.
+    #   If that average drifts above max_le_y (default 2%c), hard reject.
+    #
+    # NOTE: TE is already closed in talarai_pipeline._prep_coords_for_neuralfoil
+    #   by averaging upper/lower TE y. This check is the LE equivalent.
+    le_y_upper = float(yu[0])                    # upper surface y at x≈0
+    le_y_lower = float(yl[0])                    # lower surface y at x≈0
+    le_y_avg   = (le_y_upper + le_y_lower) / 2.0
+
+    if abs(le_y_avg) > max_le_y:
+        return 1000.0, {
+            "reason":     "LE too far from y=0",
+            "le_y_avg":   le_y_avg,
+            "le_y_upper": le_y_upper,
+            "le_y_lower": le_y_lower,
+            "max_le_y":   max_le_y,
+        }
+
+    # --- CHECK 8: TE gap (soft penalty) ---
     # ACTION ITEM #8 (2/17): "No need for leading edge line 404, only
     # trailing edge"
     # ACTION ITEM #9 (2/17): "Line 408 no need for interpolation"
@@ -427,7 +476,11 @@ def total_penalty(*,
                   max_thickness: float = 0.157,
                   te_gap_max: float = 0.01,
                   min_max_thickness: float = 0.04,
-                  max_camber: float = 0.08,
+                  # REVISION (4/1/26): aligned with geometry_penalty() → 0.05.
+                  # Was 0.08 (stale mismatch — nom_driver was passing 0.10
+                  # explicitly so this default was never actually used).
+                  max_camber: float = 0.06,
+                  max_le_y: float = 0.02,
                   
                   # CL window
                   cl_min: float | None = None,
@@ -498,6 +551,7 @@ def total_penalty(*,
         te_gap_max=te_gap_max,
         min_max_thickness=min_max_thickness,
         max_camber=max_camber,
+        max_le_y=max_le_y,
     )
     
     # Hard reject if geometry is impossible (1000 penalty from geometry_penalty)

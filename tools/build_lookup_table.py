@@ -73,7 +73,7 @@ RE_LIST    = [50000, 100000, 150000, 250000, 350000, 450000]
 # the baseline selected here is guaranteed to pass NOM's constraint checks.
 # If you change these in nom_driver.py, update them here too.
 # ---------------------------------------------------------------------------
-DEFAULT_MAX_CAMBER        = 0.08   # 8%c — same as nom_driver.py default
+DEFAULT_MAX_CAMBER        = 0.06   # 8%c — same as nom_driver.py default
 DEFAULT_MIN_MAX_THICKNESS = 0.04   # same as nom_driver.py default
 DEFAULT_MIN_THICKNESS     = 0.006  # same as nom_driver.py default
 DEFAULT_MAX_THICKNESS     = 0.157  # same as nom_driver.py default

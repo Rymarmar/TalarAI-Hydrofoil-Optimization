@@ -81,7 +81,7 @@ except ModuleNotFoundError:
 # DEFAULT OPERATING POINT
 # ===========================================================================
 DEFAULT_ALPHA = 2.0
-DEFAULT_RE    = 100_000
+DEFAULT_RE    = 150_000
 
 _VALID_ALPHAS = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 5.0]
 _VALID_RES    = [50_000, 100_000, 150_000, 250_000, 350_000, 450_000]
@@ -269,7 +269,7 @@ class NOMModel(tf.keras.Model):
         self.n_valid       = 0
         self.n_skipped     = 0
         self.n_improved    = 0
-        self._n_iters      = 250
+        self._n_iters      = 500
         self._t_start      = None
         self._last_improved = False
 
@@ -550,7 +550,7 @@ class NOMModel(tf.keras.Model):
 
     def _print_step(self, iter_num, loss_0, info,
                     skipped=False, step_ok=True):
-        n_total  = getattr(self, "_n_iters", 250)
+        n_total  = getattr(self, "_n_iters", 500)
         elapsed  = time.time() - (self._t_start or time.time())
         secs_per = elapsed / max(iter_num, 1)
         eta      = secs_per * (n_total - iter_num)
@@ -591,7 +591,7 @@ def nom_optimize(
     *,
     alpha: float = DEFAULT_ALPHA,
     Re:    float = DEFAULT_RE,
-    n_iters:          int   = 250,
+    n_iters:          int   = 500,
     tf_learning_rate: float = 0.0005,
     fd_eps:     float = 0.01,
     bounds_lam: float = 10.0,
@@ -602,7 +602,16 @@ def nom_optimize(
     max_thickness:     float = 0.157,
     te_gap_max:        float = 0.005,
     min_max_thickness: float = 0.04,
-    max_camber:        float = 0.10,
+    # REVISION (4/1/26): set to 0.06 (6%c).
+    # MUST match DEFAULT_MAX_CAMBER in build_lookup_table.py -- if these
+    # differ, the baseline foil picked by the lookup table may fail the
+    # optimizer's own constraint check on iteration 1, causing pen=1000
+    # every iteration and valid=0. They are kept in sync at 0.06.
+    #
+    # Why 0.06: goe803h (~6-7% camber) is a common high-performing baseline.
+    # 0.05 was too tight and blocked it. 0.10 was too loose (optimizer hit 8.3%).
+    # 0.06 allows the baseline neighborhood while capping exploitation.
+    max_camber:        float = 0.06,
     cl_min: float = 0.15,
     cl_max: float | None = None,
     csv_path:              str       = "data/airfoil_latent_params_6.csv",
