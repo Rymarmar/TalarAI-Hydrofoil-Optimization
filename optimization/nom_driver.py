@@ -617,6 +617,55 @@ def nom_optimize(
     csv_path:              str       = "data/airfoil_latent_params_6.csv",
     lookup_baseline_path:  str       = "",
     out_path:              str | Path = "outputs",
+    # =======================================================================
+    # STARTING POINT OPTIONS  (choose ONE — priority order shown below)
+    # =======================================================================
+    #
+    #  OPTION A — foil_name (specific foil from the training database)
+    #  ---------------------------------------------------------------
+    #  Pass the filename exactly as it appears in airfoils_png/, e.g.:
+    #    nom_optimize(foil_name="n0012.png")
+    #    nom_optimize(foil_name="e63.png")
+    #    nom_optimize(foil_name="goe451.png")
+    #
+    #  HOW IT WORKS:
+    #    Looks up the foil name in airfoil_latent_params_6.csv and grabs
+    #    the 6 pre-computed latent parameters for that foil. Those 6 numbers
+    #    become z_init — the starting point for the optimizer.
+    #
+    #  WHY the CSV (not the .dat or .png file):
+    #    The optimizer lives entirely in 6D latent space. The decoder already
+    #    maps those 6 numbers → foil shape. Using the CSV means we skip
+    #    re-running the encoder and use the exact same latent vector that was
+    #    used during training. The .dat and .png files are the raw foil data
+    #    BEFORE encoding — they're only useful if you want to add a new foil
+    #    that isn't in the dataset yet (which would require running encoder.py).
+    #
+    #  NACA 0012 latent vector (from airfoil_latent_params_6.csv):
+    #    n0012.png → [-0.0418, 0.0750, -0.0075, -0.0419, 0.1131, -0.0874]
+    #
+    #  OPTION B — z_init_csv (resume from a previous run's best result)
+    #  ---------------------------------------------------------------
+    #  Pass the path to a previous run's best_latent_nom.csv, e.g.:
+    #    nom_optimize(z_init_csv="outputs/best_latent_nom.csv")
+    #
+    #  USE THIS WHEN:
+    #    You want to continue optimizing from where a previous run ended,
+    #    or re-run the same foil under different constraints (e.g. tighter
+    #    camber limit or different alpha/Re condition).
+    #
+    #  OPTION C — lookup_baseline_path or auto-select (default behavior)
+    #  ---------------------------------------------------------------
+    #  Leave foil_name="" and z_init_csv="" and the optimizer will:
+    #    1) Use lookup_baseline_path if provided, OR
+    #    2) Auto-select the best geometry-filtered foil from build_lookup_table
+    #       outputs (outputs/best_baseline_foil_alpha{a}_Re{Re}.json)
+    #
+    #  PRIORITY ORDER (if multiple are set):
+    #    z_init_csv > foil_name > lookup_baseline_path > auto-select
+    # =======================================================================
+    foil_name:  str = "",   # e.g. "n0012.png" — looks up latent in csv_path
+    z_init_csv: str = "",   # e.g. "outputs/best_latent_nom.csv" — resume run
     # -----------------------------------------------------------------------
     # Action Item 1: live display + frame saving
     #   live_display=True   -> opens a matplotlib popup window during training
@@ -665,20 +714,70 @@ def nom_optimize(
     pipeline = TalarAIPipeline()
     print(f"  Pipeline ready (decoder: {pipeline.decoder_path.name})\n")
 
-    if not lookup_baseline_path:
-        a_s = min(_VALID_ALPHAS, key=lambda a: abs(a - alpha))
-        r_s = min(_VALID_RES,    key=lambda r: abs(r - Re))
-        tag = f"alpha{a_s:.1f}_Re{r_s:.1e}"
-        lookup_baseline_path = f"outputs/best_baseline_foil_{tag}.json"
+    # ------------------------------------------------------------------
+    # RESOLVE STARTING LATENT  (priority: z_init_csv > foil_name > lookup)
+    # ------------------------------------------------------------------
+    latent_baseline  = None
+    baseline_filename = "?"
 
-    baseline = load_best_baseline(lookup_baseline_path)
-    if baseline is None:
-        print("  No baseline. Run build_lookup_table.py first.")
-        return
+    # Priority 1: z_init_csv — resume from a previous run's best result
+    if z_init_csv:
+        p = Path(z_init_csv)
+        if p.exists():
+            arr = np.loadtxt(str(p), delimiter=",", skiprows=1)
+            if arr.ndim > 1:
+                arr = arr[0]
+            z = arr.astype(float)
+            if z.shape[0] == 6:
+                latent_baseline   = z
+                baseline_filename = f"prev_run:{p.name}"
+                print(f"  [start] Loaded previous-run latent: {p.name}")
+            else:
+                print(f"  WARNING: z_init_csv has {z.shape[0]} values (need 6). Ignored.")
+        else:
+            print(f"  WARNING: z_init_csv not found: {z_init_csv}. Falling through.")
 
-    latent_baseline = np.array(baseline["latent"], dtype=float)
-    baseline_filename = baseline.get("filename", "?")
-    print(f"  Baseline: {baseline_filename}")
+    # Priority 2: foil_name — look up specific foil in the latent CSV
+    if latent_baseline is None and foil_name:
+        try:
+            df_csv = pd.read_csv(csv_path)
+            # Try exact match first, then case-insensitive match without .png
+            rows = df_csv[df_csv["filename"] == foil_name]
+            if rows.empty:
+                needle = foil_name.lower().replace(".png", "")
+                rows   = df_csv[
+                    df_csv["filename"].str.lower().str.replace(".png","",regex=False) == needle
+                ]
+            if rows.empty:
+                print(f"  WARNING: foil '{foil_name}' not found in {csv_path}.")
+                print(f"  Check exact filename in airfoils_png/ (e.g. 'n0012.png').")
+                print(f"  Falling back to lookup table baseline.")
+            else:
+                r = rows.iloc[0]
+                latent_baseline   = r[[f"p{i}" for i in range(1, 7)]].values.astype(float)
+                baseline_filename = str(r["filename"])
+                print(f"  [start] Database foil selected: {baseline_filename}")
+                print(f"  z_init: {np.round(latent_baseline, 4)}")
+        except Exception as e:
+            print(f"  WARNING: foil lookup failed ({e}). Falling back to lookup table.")
+
+    # Priority 3: lookup table baseline (original default behavior)
+    if latent_baseline is None:
+        if not lookup_baseline_path:
+            a_s = min(_VALID_ALPHAS, key=lambda a: abs(a - alpha))
+            r_s = min(_VALID_RES,    key=lambda r: abs(r - Re))
+            tag = f"alpha{a_s:.1f}_Re{r_s:.1e}"
+            lookup_baseline_path = f"outputs/best_baseline_foil_{tag}.json"
+
+        baseline = load_best_baseline(lookup_baseline_path)
+        if baseline is None:
+            print("  No baseline. Run build_lookup_table.py first.")
+            return
+
+        latent_baseline   = np.array(baseline["latent"], dtype=float)
+        baseline_filename = baseline.get("filename", "?")
+        print(f"  [start] Lookup-table baseline: {baseline_filename}")
+
     print(f"  z_init:   {np.round(latent_baseline, 4)}\n")
 
     try:
@@ -845,4 +944,5 @@ def nom_optimize(
 
 
 if __name__ == "__main__":
-    nom_optimize()
+    nom_optimize(foil_name="n0012.png", alpha=2.0, Re=150000)
+    # for example:nom_optimize(foil_name="n0012.png", alpha=2.0, Re=150000)
