@@ -598,7 +598,16 @@ def nom_optimize(
     lam_bounds: float = 1.0,
     lam_geom:   float = 25.0,
     lam_cl:     float = 50.0,
-    min_thickness:     float = 0.006,
+    # THREE-ZONE THICKNESS  (action item 4/6/26 -- see constraints.py for details)
+    # Change these numbers once physical manufacturing constraints are known.
+    # Current defaults are calibrated to NACA 0012 with ~30-40% headroom:
+    #   LE  zone x∈[0.05,0.15]: NACA 0012 has ~7%c here  → floor 2.5%c
+    #   Mid zone x∈(0.15,0.75]: NACA 0012 has ~6-12%c    → floor 3.0%c
+    #   TE  zone x∈(0.75,0.95]: NACA 0012 has ~1.6-6%c   → floor 0.8%c
+    #     (TE zone extended from old 0.90 to 0.95 to prevent razor TE)
+    min_thickness_le:  float = 0.025,
+    min_thickness_mid: float = 0.030,
+    min_thickness_te:  float = 0.008,
     max_thickness:     float = 0.157,
     te_gap_max:        float = 0.005,
     min_max_thickness: float = 0.04,
@@ -612,6 +621,10 @@ def nom_optimize(
     # 0.05 was too tight and blocked it. 0.10 was too loose (optimizer hit 8.3%).
     # 0.06 allows the baseline neighborhood while capping exploitation.
     max_camber:        float = 0.06,
+    # MINIMUM TE WEDGE ANGLE  (action item 4/6/26 -- see constraints.py for details)
+    # NACA 0012 has ~15.5 deg. Floor at 6 deg is very permissive but hard-rejects
+    # true knife edges. Raise to 8-10 if the TE is still too sharp after testing.
+    min_te_angle_deg:  float = 6.0,
     cl_min: float = 0.15,
     cl_max: float | None = None,
     csv_path:              str       = "data/airfoil_latent_params_6.csv",
@@ -797,9 +810,13 @@ def nom_optimize(
 
     penalty_kwargs = dict(
         lam_bounds=lam_bounds, lam_geom=lam_geom, lam_cl=lam_cl,
-        min_thickness=min_thickness, max_thickness=max_thickness,
+        min_thickness_le=min_thickness_le,
+        min_thickness_mid=min_thickness_mid,
+        min_thickness_te=min_thickness_te,
+        max_thickness=max_thickness,
         te_gap_max=te_gap_max, min_max_thickness=min_max_thickness,
-        max_camber=max_camber, cl_min=cl_min, cl_max=cl_max,
+        max_camber=max_camber, min_te_angle_deg=min_te_angle_deg,
+        cl_min=cl_min, cl_max=cl_max,
     )
 
     nf_op = NeuralFoilLossOp(
@@ -905,11 +922,14 @@ def nom_optimize(
         "fd_eps":                  fd_eps,
         "valid_evals":             nom.n_valid,
         "skipped":                 nom.n_skipped,
-        "n_improved":              nom.n_improved,   # <-- the field the plotter uses
-        "min_thickness":           min_thickness,
+        "n_improved":              nom.n_improved,
+        "min_thickness_le":        min_thickness_le,
+        "min_thickness_mid":       min_thickness_mid,
+        "min_thickness_te":        min_thickness_te,
         "max_thickness":           max_thickness,
         "min_max_thickness":       min_max_thickness,
         "max_camber":              max_camber,
+        "min_te_angle_deg":        min_te_angle_deg,
         "conditions": [{"alpha": alpha, "Re": Re}],
         # Baseline coords stored so animation can draw it without re-running NF
         "baseline_coords": bl_coords.tolist() if bl_coords is not None else None,

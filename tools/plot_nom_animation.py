@@ -463,7 +463,7 @@ def export_video(outputs_dir: Path, fps: int = 30, out_name: str = "nom_optimiza
         title.set_text(
             f"TalarAI NOM  |  iter {it}/{iters[-1]}  "
             f"L/D={ld:.1f}  best={best_here:.1f}  vs baseline: {pct:+.1f}%  "
-            f"|  alpha={alpha}°  Re={Re:.0e}")
+            f"|  alpha={alpha}°  Re={Re/1000:.0f}k")
 
         return line_upper, line_lower, cursor_dot, title
 

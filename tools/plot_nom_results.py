@@ -325,17 +325,35 @@ def main(
     if conditions:
         col_left += f"  Operating conditions:\n"
         for c in conditions:
-            col_left += f"    a={c['alpha']}  Re={c['Re']:.0e}\n"
+            col_left += f"    a={c['alpha']}  Re={c['Re']/1000:.0f}k\n"
     else:
         col_left += f"  a      {alpha_val} deg\n"
-        col_left += f"  Re     {Re_val:.2e}\n"
+        col_left += f"  Re     {Re_val/1000:.0f}k\n"
 
     # Geometry box: show actual values AND constraint limits
     camber_limit_str = (f"{summary.get('max_camber', 0.08)*100:.0f}%c"
                         if summary else "8%c")
-    min_t_limit = (summary.get('min_thickness', 0) if summary else 0) * 100
     max_t_limit = (summary.get('max_thickness', 0) if summary else 0) * 100
     min_max_t   = (summary.get('min_max_thickness', 0) if summary else 0) * 100
+    te_angle_lim = summary.get('min_te_angle_deg', None) if summary else None
+
+    # Three-zone thickness limits (new format from constraints.py overhaul 4/6/26)
+    # Fall back to legacy single min_thickness key if running old summary files
+    if summary and summary.get('min_thickness_le') is not None:
+        t_le_lim  = summary['min_thickness_le']  * 100
+        t_mid_lim = summary['min_thickness_mid'] * 100
+        t_te_lim  = summary['min_thickness_te']  * 100
+        t_limits_str = (
+            f"  t_min LE  [0.05-0.15]  {t_le_lim:.1f}%c\n"
+            f"  t_min Mid (0.15-0.75]  {t_mid_lim:.1f}%c\n"
+            f"  t_min TE  (0.75-0.95]  {t_te_lim:.1f}%c\n"
+        )
+    else:
+        legacy = (summary.get('min_thickness', 0) if summary else 0) * 100
+        t_limits_str = f"  t_min limit    {legacy:.2f}%c\n"
+
+    te_angle_str = (f"  min TE angle   {te_angle_lim:.0f} deg\n"
+                    if te_angle_lim is not None else "")
 
     col_mid = (
         f"  GEOMETRY (optimized foil)\n"
@@ -345,9 +363,10 @@ def main(
         f"  TE gap         {te_gap_val*100:.3f}%c\n"
         f"\n"
         f"  CONSTRAINTS\n"
-        f"  t_min limit    {min_t_limit:.2f}%c\n"
+        + t_limits_str +
         f"  t_max limit    {max_t_limit:.1f}%c\n"
         f"  min peak t     {min_max_t:.1f}%c\n"
+        + te_angle_str +
         f"  max camber     {camber_limit_str}\n"
         f"  Unified loop   {n_ep} iters  lr={lr_tf}"
     ) if summary else "  GEOMETRY\n  (no summary)"
@@ -359,7 +378,7 @@ def main(
         for c in per_cond_list:
             cl_s = f"{c['CL']:.4f}" if c.get("CL") else "N/A "
             ld_s = f"{c['LD']:.1f}"  if c.get("LD") else "N/A"
-            cond_lines += f"  a={c['alpha']}  Re={c['Re']:.0e}  CL={cl_s}  L/D={ld_s}\n"
+            cond_lines += f"  a={c['alpha']}  Re={c['Re']/1000:.0f}k  CL={cl_s}  L/D={ld_s}\n"
         cond_lines += (
             f"\n  NOM SEARCH\n"
             f"  Valid    {summary.get('valid_evals','?')}/{summary.get('n_iters','?')}\n"
