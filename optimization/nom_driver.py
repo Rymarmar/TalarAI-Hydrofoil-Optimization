@@ -80,7 +80,7 @@ except ModuleNotFoundError:
 # ===========================================================================
 # DEFAULT OPERATING POINT
 # ===========================================================================
-DEFAULT_ALPHA = 2.0
+DEFAULT_ALPHA = 4.0
 DEFAULT_RE    = 150_000
 
 _VALID_ALPHAS = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 5.0]
@@ -583,6 +583,91 @@ class NOMModel(tf.keras.Model):
               f"{star}")
 
 
+def _calibrate_constraints_from_baseline(coords: np.ndarray, n_points: int = 40) -> dict:
+    """
+    Derive geometry constraint floors from a baseline foil's actual shape.
+
+    WHY THIS EXISTS:
+      Hardcoded floors work for the foil they were tuned on but hard-reject
+      thin foils from the lookup table. For example, floors calibrated to
+      NACA 0012 (12% thick) immediately reject goe451 (4.78% thick) because
+      its interior thickness is below the NACA 0012-based mid-zone floor.
+
+    HOW IT WORKS:
+      1) Split the baseline coords into upper/lower surfaces.
+      2) Compute point-by-point thickness in each zone.
+      3) Set each floor = max(SCALE * zone_min, HARDFLOOR).
+         SCALE = 0.70 → optimizer has 30% room to thin the foil from baseline.
+         HARDFLOOR = absolute physics minimum (not a manufacturing limit yet;
+                     update these once you know your 3D-printer's min wall).
+
+    RETURNS:
+      dict with keys: min_thickness_le, min_thickness_mid, min_thickness_te,
+                      min_max_thickness, min_te_angle_deg
+      (These are passed directly into total_penalty / nom_optimize penalty_kwargs.)
+    """
+    SCALE     = 0.70    # allow 30% thinning from baseline before hard-reject
+    HARD_LE   = 0.003   # absolute LE floor: 0.3%c (~0.6mm at 200mm chord)
+    HARD_MID  = 0.003   # absolute Mid floor: 0.3%c
+    HARD_TE   = 0.002   # absolute TE floor: 0.2%c
+    HARD_PEAK = 0.015   # absolute peak thickness floor: 1.5%c
+    HARD_ANGL = 3.0     # absolute TE angle floor: 3 degrees
+
+    coords = np.asarray(coords, dtype=float)
+    if coords.shape != (80, 2):
+        # fallback: return conservative defaults that won't hard-reject anything reasonable
+        return dict(min_thickness_le=HARD_LE, min_thickness_mid=HARD_MID,
+                    min_thickness_te=HARD_TE, min_max_thickness=HARD_PEAK,
+                    min_te_angle_deg=HARD_ANGL)
+
+    upper_te2le = coords[:n_points]
+    lower_le2te = coords[n_points:]
+    upper_le2te = upper_te2le[::-1]
+
+    xg        = upper_le2te[:, 0]
+    thickness = upper_le2te[:, 1] - lower_le2te[:, 1]
+
+    # Zone masks (same as constraints.py)
+    le_mask  = (xg >= 0.05) & (xg <= 0.15)
+    mid_mask = (xg >  0.15) & (xg <= 0.75)
+    te_mask  = (xg >  0.75) & (xg <= 0.95)
+    int_mask = (xg >= 0.05) & (xg <= 0.95)
+
+    t_le  = float(np.min(thickness[le_mask]))  if le_mask.any()  else HARD_LE  / SCALE
+    t_mid = float(np.min(thickness[mid_mask])) if mid_mask.any() else HARD_MID / SCALE
+    t_te  = float(np.min(thickness[te_mask]))  if te_mask.any()  else HARD_TE  / SCALE
+    t_max = float(np.max(thickness[int_mask])) if int_mask.any() else HARD_PEAK / SCALE
+
+    # TE wedge angle from last 3 points of each surface
+    yu = upper_le2te[:, 1]
+    yl = lower_le2te[:, 1]
+    dx = float(xg[-1] - xg[-3])
+    if dx > 1e-9:
+        te_angle = float(np.degrees(
+            np.arctan(abs((yu[-1] - yu[-3]) / dx)) +
+            np.arctan(abs((yl[-1] - yl[-3]) / dx))
+        ))
+    else:
+        te_angle = HARD_ANGL / SCALE
+
+    result = dict(
+        min_thickness_le  = max(SCALE * t_le,    HARD_LE),
+        min_thickness_mid = max(SCALE * t_mid,   HARD_MID),
+        min_thickness_te  = max(SCALE * t_te,    HARD_TE),
+        min_max_thickness = max(SCALE * t_max,   HARD_PEAK),
+        min_te_angle_deg  = max(SCALE * te_angle, HARD_ANGL),
+    )
+
+    print(f"  [auto-constraints] Calibrated from baseline geometry:")
+    print(f"    t_le_min={t_le*100:.2f}%c → floor {result['min_thickness_le']*100:.2f}%c")
+    print(f"    t_mid_min={t_mid*100:.2f}%c → floor {result['min_thickness_mid']*100:.2f}%c")
+    print(f"    t_te_min={t_te*100:.2f}%c → floor {result['min_thickness_te']*100:.2f}%c")
+    print(f"    t_max={t_max*100:.2f}%c → peak floor {result['min_max_thickness']*100:.2f}%c")
+    print(f"    te_angle={te_angle:.1f}° → angle floor {result['min_te_angle_deg']:.1f}°")
+
+    return result
+
+
 # ===========================================================================
 # MAIN OPTIMIZATION FUNCTION
 # ===========================================================================
@@ -599,18 +684,26 @@ def nom_optimize(
     lam_geom:   float = 25.0,
     lam_cl:     float = 50.0,
     # THREE-ZONE THICKNESS  (action item 4/6/26 -- see constraints.py for details)
-    # Change these numbers once physical manufacturing constraints are known.
-    # Current defaults are calibrated to NACA 0012 with ~30-40% headroom:
-    #   LE  zone x∈[0.05,0.15]: NACA 0012 has ~7%c here  → floor 2.5%c
-    #   Mid zone x∈(0.15,0.75]: NACA 0012 has ~6-12%c    → floor 3.0%c
-    #   TE  zone x∈(0.75,0.95]: NACA 0012 has ~1.6-6%c   → floor 0.8%c
-    #     (TE zone extended from old 0.90 to 0.95 to prevent razor TE)
-    min_thickness_le:  float = 0.025,
-    min_thickness_mid: float = 0.030,
-    min_thickness_te:  float = 0.008,
+    #
+    # DEFAULT = None  → AUTO-CALIBRATED from baseline foil geometry.
+    #   When None, each floor is set to max(0.70 * baseline_zone_min, hardfloor)
+    #   where hardfloor is an absolute physics minimum (0.3%c LE/Mid, 0.2%c TE).
+    #
+    # WHY AUTO-CALIBRATE:
+    #   Hardcoded floors (e.g. mid=3.0%c) work for NACA 0012 (12% thick) but
+    #   immediately hard-reject thin foils like goe451 (4.78% thick) that the
+    #   lookup table picks as baselines. Auto-calibration scales the floors to
+    #   each baseline, so any foil in the dataset is a valid starting point.
+    #
+    # TO OVERRIDE: pass explicit floats, e.g. min_thickness_mid=0.030
+    #   These override auto-calibration and are used as-is. Useful when you
+    #   know your manufacturing minimum (e.g. 1.5mm at 200mm chord = 0.0075).
+    min_thickness_le:  float | None = None,   # LE  zone: x ∈ [0.05, 0.15]
+    min_thickness_mid: float | None = None,   # Mid zone: x ∈ (0.15, 0.75]
+    min_thickness_te:  float | None = None,   # TE  zone: x ∈ (0.75, 0.95]
     max_thickness:     float = 0.157,
     te_gap_max:        float = 0.005,
-    min_max_thickness: float = 0.04,
+    min_max_thickness: float | None = None,   # peak thickness floor (None = auto)
     # REVISION (4/1/26): set to 0.06 (6%c).
     # MUST match DEFAULT_MAX_CAMBER in build_lookup_table.py -- if these
     # differ, the baseline foil picked by the lookup table may fail the
@@ -622,9 +715,8 @@ def nom_optimize(
     # 0.06 allows the baseline neighborhood while capping exploitation.
     max_camber:        float = 0.06,
     # MINIMUM TE WEDGE ANGLE  (action item 4/6/26 -- see constraints.py for details)
-    # NACA 0012 has ~15.5 deg. Floor at 6 deg is very permissive but hard-rejects
-    # true knife edges. Raise to 8-10 if the TE is still too sharp after testing.
-    min_te_angle_deg:  float = 6.0,
+    # None = auto-calibrate to max(0.70 * baseline_te_angle, 3.0 deg)
+    min_te_angle_deg:  float | None = None,
     cl_min: float = 0.15,
     cl_max: float | None = None,
     csv_path:              str       = "data/airfoil_latent_params_6.csv",
@@ -807,6 +899,38 @@ def nom_optimize(
         bl_cd_cl = float("inf")
         bl_LD = 0.0
         bl_coords = None
+
+    # ------------------------------------------------------------------
+    # AUTO-CALIBRATE CONSTRAINT FLOORS FROM BASELINE GEOMETRY
+    # ------------------------------------------------------------------
+    # If the user left any thickness floor as None, derive it from the
+    # baseline foil's actual shape (70% of zone minimum).
+    # Explicit float values passed by the caller are used as-is.
+    # This ensures any foil in the dataset (thick or thin) is a valid
+    # starting point without manual tuning of constraint values.
+    # ------------------------------------------------------------------
+    if (min_thickness_le is None or min_thickness_mid is None or
+            min_thickness_te is None or min_max_thickness is None or
+            min_te_angle_deg is None):
+        if bl_coords is not None:
+            auto = _calibrate_constraints_from_baseline(bl_coords)
+        else:
+            # No baseline coords available — use conservative hard floors
+            auto = dict(min_thickness_le=0.003, min_thickness_mid=0.003,
+                        min_thickness_te=0.002, min_max_thickness=0.015,
+                        min_te_angle_deg=3.0)
+            print("  [auto-constraints] No baseline coords — using conservative floors.")
+
+        if min_thickness_le  is None: min_thickness_le  = auto["min_thickness_le"]
+        if min_thickness_mid is None: min_thickness_mid = auto["min_thickness_mid"]
+        if min_thickness_te  is None: min_thickness_te  = auto["min_thickness_te"]
+        if min_max_thickness is None: min_max_thickness = auto["min_max_thickness"]
+        if min_te_angle_deg  is None: min_te_angle_deg  = auto["min_te_angle_deg"]
+    else:
+        print(f"  [constraints] Using manually specified floors:")
+        print(f"    LE={min_thickness_le*100:.2f}%c  Mid={min_thickness_mid*100:.2f}%c  "
+              f"TE={min_thickness_te*100:.2f}%c  peak={min_max_thickness*100:.2f}%c  "
+              f"TE_angle={min_te_angle_deg:.1f}°")
 
     penalty_kwargs = dict(
         lam_bounds=lam_bounds, lam_geom=lam_geom, lam_cl=lam_cl,
