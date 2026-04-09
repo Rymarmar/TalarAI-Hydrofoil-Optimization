@@ -14,10 +14,11 @@ Usage:
 
 from __future__ import annotations
 import sys, json, time, uuid, queue, threading, traceback, argparse
+from datetime import datetime
 from pathlib import Path
 
 _HERE        = Path(__file__).resolve().parent
-PROJECT_ROOT = _HERE.parent.parent
+PROJECT_ROOT = _HERE.parent
 OUTPUTS_DIR  = PROJECT_ROOT / "outputs"
 CSV_PATH     = str(PROJECT_ROOT / "data" / "airfoil_latent_params_6.csv")
 
@@ -88,7 +89,7 @@ def optimize_start():
     body   = request.get_json(force=True) or {}
     job_id = str(uuid.uuid4())
 
-    run_dir      = OUTPUTS_DIR / f"run_{job_id[:8]}"
+    run_dir      = OUTPUTS_DIR / ("run_" + datetime.now().strftime("%Y%m%d_%H%M%S"))
     summary_path = run_dir / "nom_summary.json"
     run_dir.mkdir(parents=True, exist_ok=True)
 
@@ -99,9 +100,7 @@ def optimize_start():
 
     bl_override = body.get("lookup_baseline_path", "").strip()
     if not bl_override:
-        from optimization.nom_driver import snap_condition
-        a_s, r_s = snap_condition(alpha, Re)
-        bl_path  = str(OUTPUTS_DIR / f"best_baseline_foil_alpha{a_s:.1f}_Re{r_s:.1e}.json")
+        bl_path = ""   # will use foil_name="n0012.png" below
     else:
         bl_path = bl_override
 
@@ -117,10 +116,19 @@ def optimize_start():
             "n_iters":      n_iters,
         }
 
+    rod_a_x    = float(body.get("rod_a_x",    0.50))
+    rod_a_diam = float(body.get("rod_a_diam", 0.08))
+    rod_b_x    = float(body.get("rod_b_x",    0.25))
+    rod_b_diam = float(body.get("rod_b_diam", 0.06))
+
     kwargs = dict(
         alpha=alpha, Re=Re, n_iters=n_iters, tf_learning_rate=lr,
-        csv_path=CSV_PATH, lookup_baseline_path=bl_path,
+        csv_path=CSV_PATH,
+        foil_name="" if bl_path else "n0012.png",
+        lookup_baseline_path=bl_path,
         out_path=str(run_dir), live_display=False, save_frames=False,
+        rod_a_x=rod_a_x, rod_a_diam=rod_a_diam,
+        rod_b_x=rod_b_x, rod_b_diam=rod_b_diam,
     )
 
     t = threading.Thread(target=_run_nom, args=(job_id, q, kwargs), daemon=True)
@@ -133,17 +141,29 @@ def optimize_start():
 
 def _run_nom(job_id: str, q: queue.Queue, kwargs: dict):
     try:
-        import optimization.nom_driver as nd
+        import optimization.ui_nom_driver as nd
 
         cancel_event = threading.Event()
 
+        class _CancelledError(Exception):
+            pass
+
         class _StreamingNOMModel(nd.NOMModel):
-            """Identical to NOMModel — pushes each entry to the queue and checks for cancellation."""
+            """Pushes each entry to the queue and checks for cancellation between and within iterations."""
             def train_step(self, data):
                 if cancel_event.is_set():
-                    # Raise to break out of nom.fit() cleanly
-                    raise StopIteration("cancelled by user")
-                result = super().train_step(data)
+                    raise _CancelledError("cancelled by user")
+                # Wrap nf_op._evaluate so cancel is checked between each FD call too
+                _orig_eval = self.nf_op._evaluate
+                def _cancellable_eval(z):
+                    if cancel_event.is_set():
+                        raise _CancelledError("cancelled mid-iteration")
+                    return _orig_eval(z)
+                self.nf_op._evaluate = _cancellable_eval
+                try:
+                    result = super().train_step(data)
+                finally:
+                    self.nf_op._evaluate = _orig_eval
                 if self.history_log:
                     entry = dict(self.history_log[-1])
                     if entry.get("coords") is not None:
@@ -165,7 +185,7 @@ def _run_nom(job_id: str, q: queue.Queue, kwargs: dict):
         nd.NOMModel = _StreamingNOMModel
         try:
             nd.nom_optimize(**kwargs)
-        except StopIteration:
+        except _CancelledError:
             print(f"[server] Job {job_id[:8]} cancelled by user")
         finally:
             nd.NOMModel = _Orig
@@ -206,8 +226,9 @@ def optimize_stream():
     summary_path = job["summary_path"]
 
     def generate():
-        best_LD = 0.0
-        sent    = 0
+        best_LD     = 0.0
+        best_coords = None
+        sent        = 0
 
         while True:
             try:
@@ -230,7 +251,8 @@ def optimize_stream():
             pen   = float(entry.get("pen",   0) or 0)
             LD    = CL / CD if CD > 0 else 0.0
             if LD > best_LD:
-                best_LD = LD
+                best_LD     = LD
+                best_coords = entry.get("coords")
             sent += 1
 
             event = {
@@ -257,7 +279,7 @@ def optimize_stream():
             pass
         with _jobs_lock:
             _jobs[job_id]["result"] = summary
-        yield f"data: {json.dumps({**summary, 'done': True, 'final': True})}\n\n"
+        yield f"data: {json.dumps({**summary, 'done': True, 'final': True, 'best_coords': best_coords})}\n\n"
 
     return Response(
         stream_with_context(generate()),
@@ -270,30 +292,56 @@ def optimize_stream():
 
 @app.route("/api/baseline")
 def baseline():
-    """Return coords + metadata for the best baseline foil at given alpha/Re."""
-    alpha = float(request.args.get("alpha", 2.0))
-    Re    = float(request.args.get("Re",    100_000))
+    """Return coords + metadata for a foil at given alpha/Re.
+    If foil_name is given (e.g. 'n0012.png'), look it up in the latent CSV.
+    Otherwise fall back to the lookup-table best baseline file.
+    """
+    alpha      = float(request.args.get("alpha",     2.0))
+    Re         = float(request.args.get("Re",         100_000))
+    foil_name  = request.args.get("foil_name", "").strip()
 
-    from optimization.nom_driver import snap_condition
+    from optimization.ui_nom_driver import snap_condition
     a_s, r_s = snap_condition(alpha, Re)
-    bl_path  = OUTPUTS_DIR / f"best_baseline_foil_alpha{a_s:.1f}_Re{r_s:.1e}.json"
 
-    if not bl_path.exists():
-        return jsonify({"error": f"No baseline for alpha={a_s} Re={r_s}"}), 404
+    import numpy as np
+    import pandas as pd
 
-    with open(bl_path) as f:
-        bl = json.load(f)
-
-    # Decode coords from latent using the pipeline
-    pipeline, err = None, None
     try:
         from pipeline.talarai_pipeline import TalarAIPipeline
         pipeline = TalarAIPipeline()
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-    import numpy as np
-    z = np.array(bl["latent"], dtype=float)
+    # --- Resolve latent vector ---
+    z        = None
+    filename = foil_name or "?"
+
+    if foil_name:
+        # Look up the named foil in the latent CSV
+        try:
+            df = pd.read_csv(CSV_PATH)
+            rows = df[df["filename"] == foil_name]
+            if rows.empty:
+                needle = foil_name.lower().replace(".png", "")
+                rows = df[df["filename"].str.lower().str.replace(".png","",regex=False) == needle]
+            if not rows.empty:
+                z = rows.iloc[0][[f"p{i}" for i in range(1,7)]].values.astype(float)
+                filename = str(rows.iloc[0]["filename"])
+        except Exception as e:
+            return jsonify({"error": f"CSV lookup failed: {e}"}), 500
+        if z is None:
+            return jsonify({"error": f"Foil '{foil_name}' not found in latent CSV"}), 404
+    else:
+        # Fall back to lookup-table JSON
+        bl_path = OUTPUTS_DIR / f"best_baseline_foil_alpha{a_s:.1f}_Re{r_s:.1e}.json"
+        if not bl_path.exists():
+            return jsonify({"error": f"No baseline for alpha={a_s} Re={r_s}"}), 404
+        with open(bl_path) as f:
+            bl = json.load(f)
+        z        = np.array(bl["latent"], dtype=float)
+        filename = bl.get("filename", "?")
+
+    # --- Decode and evaluate ---
     try:
         out    = pipeline.eval_latent_with_neuralfoil(z, alpha=a_s, Re=r_s)
         coords = out.get("coords")
@@ -304,13 +352,13 @@ def baseline():
         return jsonify({"error": str(e)}), 500
 
     return jsonify({
-        "filename":   bl.get("filename", "?"),
-        "alpha":      a_s,
-        "Re":         r_s,
-        "CL":         round(CL, 4),
-        "CD":         round(CD, 6),
-        "LD":         round(LD, 2),
-        "coords":     coords.tolist() if hasattr(coords, "tolist") else coords,
+        "filename": filename,
+        "alpha":    a_s,
+        "Re":       r_s,
+        "CL":       round(CL, 4),
+        "CD":       round(CD, 6),
+        "LD":       round(LD, 2),
+        "coords":   coords.tolist() if hasattr(coords, "tolist") else coords,
     })
 
 
