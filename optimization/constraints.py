@@ -472,7 +472,7 @@ def total_penalty(*,
                   max_le_y:          float = 0.02,
 
                   # TE angle
-                  min_te_angle_deg:  float = 6.0,
+                  min_te_angle_deg:  float = 14.0,
 
                   # CL window
                   cl_min: float | None = None,

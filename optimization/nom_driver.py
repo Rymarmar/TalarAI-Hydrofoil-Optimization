@@ -918,7 +918,7 @@ def nom_optimize(
             # No baseline coords available — use conservative hard floors
             auto = dict(min_thickness_le=0.003, min_thickness_mid=0.003,
                         min_thickness_te=0.002, min_max_thickness=0.015,
-                        min_te_angle_deg=3.0)
+                        min_te_angle_deg=14.0)
             print("  [auto-constraints] No baseline coords — using conservative floors.")
 
         if min_thickness_le  is None: min_thickness_le  = auto["min_thickness_le"]
@@ -1088,5 +1088,5 @@ def nom_optimize(
 
 
 if __name__ == "__main__":
-    nom_optimize(foil_name="n0012.png", alpha=2.0, Re=150000)
+    nom_optimize(foil_name="e61.png", alpha=2.0, Re=150000)
     # for example:nom_optimize(foil_name="n0012.png", alpha=2.0, Re=150000)
