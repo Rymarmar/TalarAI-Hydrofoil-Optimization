@@ -200,8 +200,10 @@ def geometry_penalty(coords: np.ndarray,
                      # TO ADJUST:
                      #   Raise this if the TE is still too sharp after testing.
                      #   A value of 8-10 deg would still easily pass NACA 0012.
+                     # REVISION (4/13/26): raised from 6 → 14 deg based on
+                     #   professor's physical constraint (0.04in wall at c/40 from TE).
                      # ----------------------------------------------------------
-                     min_te_angle_deg: float = 6.0,
+                     min_te_angle_deg: float = 14.0,
                      ) -> tuple[float, dict]:
     """
     Check foil geometry and return (penalty, info_dict).
@@ -471,7 +473,7 @@ def total_penalty(*,
                   max_camber:        float = 0.06,
                   max_le_y:          float = 0.02,
 
-                  # TE angle
+                  # TE angle (raised to 14° per prof 4/13/26 physical constraint)
                   min_te_angle_deg:  float = 14.0,
 
                   # CL window

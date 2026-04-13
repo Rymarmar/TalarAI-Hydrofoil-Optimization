@@ -611,7 +611,13 @@ def _calibrate_constraints_from_baseline(coords: np.ndarray, n_points: int = 40)
     HARD_MID  = 0.003   # absolute Mid floor: 0.3%c
     HARD_TE   = 0.002   # absolute TE floor: 0.2%c
     HARD_PEAK = 0.015   # absolute peak thickness floor: 1.5%c
-    HARD_ANGL = 3.0     # absolute TE angle floor: 3 degrees
+    HARD_ANGL = 14.0    # absolute TE angle floor: 14 deg (prof 4/13/26 physical constraint)
+    # max_camber: allow baseline camber + 15% headroom, with absolute floor of 6%c.
+    # WHY: baseline foils like e61 (6.69%c camber) exceed the old hardcoded 6% limit
+    # and get hard-rejected on iteration 1. Auto-calibration ensures the starting
+    # foil is always a valid point, while still capping large camber excursions.
+    CAMBER_SCALE = 1.15  # optimizer gets 15% more camber than baseline as headroom
+    HARD_CAMBER  = 0.06  # absolute camber floor (never tighter than 6%c)
 
     coords = np.asarray(coords, dtype=float)
     if coords.shape != (80, 2):
@@ -650,12 +656,21 @@ def _calibrate_constraints_from_baseline(coords: np.ndarray, n_points: int = 40)
     else:
         te_angle = HARD_ANGL / SCALE
 
+    # Camber: camber line = (upper + lower) / 2, measured over interior [0.05, 0.95]
+    int_mask    = (xg >= 0.05) & (xg <= 0.95)
+    camber_line = (upper_le2te[:, 1] + lower_le2te[:, 1]) / 2.0
+    if int_mask.any():
+        baseline_camber = float(np.max(np.abs(camber_line[int_mask])))
+    else:
+        baseline_camber = HARD_CAMBER / CAMBER_SCALE
+
     result = dict(
-        min_thickness_le  = max(SCALE * t_le,    HARD_LE),
-        min_thickness_mid = max(SCALE * t_mid,   HARD_MID),
-        min_thickness_te  = max(SCALE * t_te,    HARD_TE),
-        min_max_thickness = max(SCALE * t_max,   HARD_PEAK),
-        min_te_angle_deg  = max(SCALE * te_angle, HARD_ANGL),
+        min_thickness_le  = max(SCALE * t_le,              HARD_LE),
+        min_thickness_mid = max(SCALE * t_mid,             HARD_MID),
+        min_thickness_te  = max(SCALE * t_te,              HARD_TE),
+        min_max_thickness = max(SCALE * t_max,             HARD_PEAK),
+        min_te_angle_deg  = max(SCALE * te_angle,          HARD_ANGL),
+        max_camber        = max(CAMBER_SCALE * baseline_camber, HARD_CAMBER),
     )
 
     print(f"  [auto-constraints] Calibrated from baseline geometry:")
@@ -664,6 +679,7 @@ def _calibrate_constraints_from_baseline(coords: np.ndarray, n_points: int = 40)
     print(f"    t_te_min={t_te*100:.2f}%c → floor {result['min_thickness_te']*100:.2f}%c")
     print(f"    t_max={t_max*100:.2f}%c → peak floor {result['min_max_thickness']*100:.2f}%c")
     print(f"    te_angle={te_angle:.1f}° → angle floor {result['min_te_angle_deg']:.1f}°")
+    print(f"    camber={baseline_camber*100:.2f}%c → camber cap {result['max_camber']*100:.2f}%c")
 
     return result
 
@@ -704,16 +720,13 @@ def nom_optimize(
     max_thickness:     float = 0.157,
     te_gap_max:        float = 0.005,
     min_max_thickness: float | None = None,   # peak thickness floor (None = auto)
-    # REVISION (4/1/26): set to 0.06 (6%c).
-    # MUST match DEFAULT_MAX_CAMBER in build_lookup_table.py -- if these
-    # differ, the baseline foil picked by the lookup table may fail the
-    # optimizer's own constraint check on iteration 1, causing pen=1000
-    # every iteration and valid=0. They are kept in sync at 0.06.
-    #
-    # Why 0.06: goe803h (~6-7% camber) is a common high-performing baseline.
-    # 0.05 was too tight and blocked it. 0.10 was too loose (optimizer hit 8.3%).
-    # 0.06 allows the baseline neighborhood while capping exploitation.
-    max_camber:        float = 0.06,
+    # REVISION (4/13/26): changed from float = 0.06 to float | None = None.
+    # When None, auto-calibrated to max(1.15 * baseline_max_camber, 0.06).
+    # WHY: e61 and other high-camber foils (>6%c) were hard-rejected on
+    # iteration 1 because 0.06 is below their baseline camber. Auto-calibration
+    # ensures the starting foil always passes its own constraint check.
+    # To override: pass e.g. max_camber=0.14 to allow very high camber foils.
+    max_camber:        float | None = None,
     # MINIMUM TE WEDGE ANGLE  (action item 4/6/26 -- see constraints.py for details)
     # None = auto-calibrate to max(0.70 * baseline_te_angle, 3.0 deg)
     min_te_angle_deg:  float | None = None,
@@ -772,6 +785,19 @@ def nom_optimize(
     foil_name:  str = "",   # e.g. "n0012.png" — looks up latent in csv_path
     z_init_csv: str = "",   # e.g. "outputs/best_latent_nom.csv" — resume run
     # -----------------------------------------------------------------------
+    # use_last_optimized: load starting latent from outputs/last_optimized_foil.json
+    #   (written automatically at the end of every successful run).
+    #
+    # USE THIS for manual two-stage runs:
+    #   Step 1: nom_optimize(foil_name="e61.png", alpha=2.0, Re=100_000)
+    #   Step 2: nom_optimize(use_last_optimized=True, alpha=2.0, Re=150_000)
+    #
+    # Unlike z_init_csv, this option preserves the original foil name so
+    # plot_nom_results.py correctly shows e61 as the orange dotted baseline
+    # instead of falling back to NACA 0012.
+    # -----------------------------------------------------------------------
+    use_last_optimized: bool = False,
+    # -----------------------------------------------------------------------
     # Action Item 1: live display + frame saving
     #   live_display=True   -> opens a matplotlib popup window during training
     #   save_frames=True    -> saves PNG frames to outputs/frames/
@@ -824,6 +850,29 @@ def nom_optimize(
     # ------------------------------------------------------------------
     latent_baseline  = None
     baseline_filename = "?"
+
+    # Priority 0: use_last_optimized — load from last_optimized_foil.json
+    # This is the clean way to chain runs without confusing the plot tools.
+    # The original foil name is preserved so plot_nom_results shows the right baseline.
+    if use_last_optimized:
+        last_opt_path = Path(out_path) / "last_optimized_foil.json"
+        if last_opt_path.exists():
+            with open(last_opt_path) as f:
+                last_opt = json.load(f)
+            z = np.array(last_opt["latent"], dtype=float)
+            if z.shape[0] == 6:
+                latent_baseline   = z
+                # Use original foil name so plotter can find its .txt file
+                source_foil = last_opt.get("source_foil", "?")
+                source_re   = last_opt.get("Re", "?")
+                baseline_filename = source_foil  # keep clean name for plotter
+                print(f"  [start] Loaded last optimized latent from: {last_opt_path.name}")
+                print(f"          (Originally: {source_foil}  @Re={source_re:,.0f})")
+            else:
+                print(f"  WARNING: last_optimized_foil.json has {z.shape[0]} values (need 6). Ignored.")
+        else:
+            print(f"  WARNING: use_last_optimized=True but {last_opt_path} not found.")
+            print(f"  Run a first optimization with foil_name=... first to create it.")
 
     # Priority 1: z_init_csv — resume from a previous run's best result
     if z_init_csv:
@@ -911,14 +960,14 @@ def nom_optimize(
     # ------------------------------------------------------------------
     if (min_thickness_le is None or min_thickness_mid is None or
             min_thickness_te is None or min_max_thickness is None or
-            min_te_angle_deg is None):
+            min_te_angle_deg is None or max_camber is None):
         if bl_coords is not None:
             auto = _calibrate_constraints_from_baseline(bl_coords)
         else:
             # No baseline coords available — use conservative hard floors
             auto = dict(min_thickness_le=0.003, min_thickness_mid=0.003,
                         min_thickness_te=0.002, min_max_thickness=0.015,
-                        min_te_angle_deg=14.0)
+                        min_te_angle_deg=14.0, max_camber=0.10)
             print("  [auto-constraints] No baseline coords — using conservative floors.")
 
         if min_thickness_le  is None: min_thickness_le  = auto["min_thickness_le"]
@@ -926,11 +975,12 @@ def nom_optimize(
         if min_thickness_te  is None: min_thickness_te  = auto["min_thickness_te"]
         if min_max_thickness is None: min_max_thickness = auto["min_max_thickness"]
         if min_te_angle_deg  is None: min_te_angle_deg  = auto["min_te_angle_deg"]
+        if max_camber        is None: max_camber        = auto["max_camber"]
     else:
         print(f"  [constraints] Using manually specified floors:")
         print(f"    LE={min_thickness_le*100:.2f}%c  Mid={min_thickness_mid*100:.2f}%c  "
               f"TE={min_thickness_te*100:.2f}%c  peak={min_max_thickness*100:.2f}%c  "
-              f"TE_angle={min_te_angle_deg:.1f}°")
+              f"TE_angle={min_te_angle_deg:.1f}°  max_camber={max_camber*100:.2f}%c")
 
     penalty_kwargs = dict(
         lam_bounds=lam_bounds, lam_geom=lam_geom, lam_cl=lam_cl,
@@ -1062,6 +1112,27 @@ def nom_optimize(
         json.dump(summary_data, f, indent=2)
     print(f"  Wrote nom_summary.json  (n_improved={nom.n_improved})")
 
+    # -----------------------------------------------------------------------
+    # Write last_optimized_foil.json so the next run can use use_last_optimized=True
+    # and still have the correct baseline foil name for plot_nom_results.py.
+    #
+    # source_foil: the original named foil this run started from (e.g. "e61.png").
+    # When use_last_optimized=True loads this, baseline_filename stays "e61.png"
+    # so plot_nom_results.py can find its .txt file and draw the orange baseline.
+    # -----------------------------------------------------------------------
+    last_opt_data = {
+        "latent":      best["latent"].tolist(),
+        "source_foil": baseline_filename,   # original foil name, not "prev_run:..."
+        "alpha":       alpha,
+        "Re":          Re,
+        "CL":          best["CL"],
+        "CD":          best["CD"],
+        "LD":          best_LD,
+    }
+    with open(out_path / "last_optimized_foil.json", "w") as f:
+        json.dump(last_opt_data, f, indent=2)
+    print(f"  Wrote last_optimized_foil.json  (source: {baseline_filename})")
+
     print("=" * 70)
     print("NOM COMPLETE")
     print("=" * 70)
@@ -1088,5 +1159,24 @@ def nom_optimize(
 
 
 if __name__ == "__main__":
-    nom_optimize(foil_name="e61.png", alpha=2.0, Re=150000)
-    # for example:nom_optimize(foil_name="n0012.png", alpha=2.0, Re=150000)
+    # -----------------------------------------------------------------------
+    # HOW TO DO A MANUAL TWO-STAGE RUN (equivalent to the old two_stage helper,
+    # but keeps each stage visible in the plot tools):
+    #
+    #   STEP 1 — Run at Re=100k, starting from the database foil:
+    #     nom_optimize(foil_name="e61.png", alpha=2.0, Re=100_000)
+    #     → outputs/last_optimized_foil.json  (saved automatically after run)
+    #     → plot_nom_results.py will show e61 as baseline  ✓
+    #
+    #   STEP 2 — Run at Re=150k, starting from Step 1's best result:
+    #     nom_optimize(use_last_optimized=True, alpha=2.0, Re=150_000)
+    #     → loads latent from last_optimized_foil.json
+    #     → baseline_filename is still "e61.png (Re=100k opt)" in the plotter  ✓
+    #     → plot_nom_results.py shows the actual e61 shape as orange dotted  ✓
+    #
+    # This produces the same foil as the old two_stage, but each stage is
+    # fully visible in the plot tools with the correct baseline.
+    # -----------------------------------------------------------------------
+    nom_optimize(foil_name="e61.png", alpha=2.0, Re=100_000)
+    # Then run this line next:
+    # nom_optimize(use_last_optimized=True, alpha=2.0, Re=150_000)
