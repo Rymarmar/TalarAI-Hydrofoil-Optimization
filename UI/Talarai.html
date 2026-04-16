@@ -33,11 +33,8 @@
 }
 
 html, body { height:100%; background:var(--paper); color:var(--ink); font-family:'Syne',sans-serif; font-size:14px; line-height:1.5; }
-
 .app { min-height:100vh; display:grid; grid-template-rows:60px 1fr; }
-
 .logo { height: 40px; object-fit: contain; margin-right: 10px; }
-
 nav { display:flex; align-items:center; padding:0 32px; border-bottom:1px solid var(--rule); background:var(--surface); position:sticky; top:0; z-index:100; }
 .nav-logo { font-size:18px; font-weight:800; letter-spacing:-.02em; color:var(--ink); }
 .nav-logo em { color:var(--blue); font-style:normal; }
@@ -48,41 +45,32 @@ nav { display:flex; align-items:center; padding:0 32px; border-bottom:1px solid 
 .srv-dot.err { background:var(--red); }
 .srv-label { font-family:'DM Mono',monospace; font-size:10px; color:var(--ink3); }
 .srv-group { display:flex; align-items:center; gap:6px; }
-
 .workspace { display:grid; grid-template-columns:360px 1fr; gap:0; min-height:calc(100vh - 60px); }
-
 .sidebar { background:var(--surface); border-right:1px solid var(--rule); display:flex; flex-direction:column; overflow-y:auto; overflow-x:hidden; }
 .sidebar::-webkit-scrollbar { width:4px; }
 .sidebar::-webkit-scrollbar-thumb { background:var(--rule); border-radius:2px; }
-
 .sidebar-section { padding:24px 28px; border-bottom:1px solid var(--rule); }
 .sidebar-section:last-child { border-bottom:none; }
-
 .section-head { display:flex; align-items:center; gap:8px; margin-bottom:18px; }
 .section-num { width:22px; height:22px; border-radius:50%; background:var(--blue); color:#fff; font-size:11px; font-weight:700; display:flex; align-items:center; justify-content:center; flex-shrink:0; }
 .section-num.done { background:var(--green); }
 .section-title { font-size:13px; font-weight:700; letter-spacing:.03em; text-transform:uppercase; color:var(--ink2); }
-
 .field { margin-bottom:14px; }
 .field:last-child { margin-bottom:0; }
 .field label { display:block; font-family:'DM Mono',monospace; font-size:10px; font-weight:500; color:var(--ink3); text-transform:uppercase; letter-spacing:.08em; margin-bottom:6px; }
 .field-row { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
-
 input[type=text], input[type=number], select { width:100%; background:var(--paper); border:1.5px solid var(--rule); border-radius:8px; color:var(--ink); font-family:'DM Mono',monospace; font-size:12px; padding:8px 12px; outline:none; transition:border-color .15s, box-shadow .15s; appearance:none; }
 input:focus, select:focus { border-color:var(--blue); box-shadow:0 0 0 3px rgba(26,92,255,.10); }
 select { background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='M1 1l5 5 5-5' fill='none' stroke='%237a8199' stroke-width='1.5' stroke-linecap='round'/%3E%3C/svg%3E"); background-repeat:no-repeat; background-position:right 10px center; padding-right:28px; cursor:pointer; }
-
 .slider-compound { display:flex; align-items:center; gap:10px; }
 .slider-compound input[type=range] { flex:1; -webkit-appearance:none; height:4px; background:var(--rule); border-radius:2px; outline:none; cursor:pointer; border:none; padding:0; box-shadow:none; }
 .slider-compound input[type=range]::-webkit-slider-thumb { -webkit-appearance:none; width:16px; height:16px; border-radius:50%; background:var(--blue); border:3px solid var(--surface); box-shadow:0 0 0 1.5px var(--blue); cursor:pointer; transition:transform .12s; }
 .slider-compound input[type=range]:hover::-webkit-slider-thumb { transform:scale(1.15); }
 .slider-readout { font-family:'DM Mono',monospace; font-size:12px; font-weight:500; color:var(--blue); min-width:48px; text-align:right; }
-
 .srv-field { display:flex; gap:8px; align-items:center; }
 .srv-field input { flex:1; }
 .btn-sm { padding:7px 12px; background:var(--paper); border:1.5px solid var(--rule); border-radius:8px; font-family:'DM Mono',monospace; font-size:11px; color:var(--ink3); cursor:pointer; white-space:nowrap; transition:border-color .15s, color .15s; }
 .btn-sm:hover { border-color:var(--blue); color:var(--blue); }
-
 .constraint-item { display:flex; align-items:center; gap:10px; padding:8px 12px; background:var(--paper); border:1.5px solid var(--rule); border-radius:8px; margin-bottom:8px; transition:border-color .2s; }
 .constraint-item.ok  { border-color:#b0e8d0; background:var(--green-lt); }
 .constraint-item.bad { border-color:#f2b3b3; background:var(--red-lt); }
@@ -92,7 +80,6 @@ select { background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.or
 .cdot-ok   { background:var(--green); }
 .cdot-bad  { background:var(--red); }
 .cdot-idle { background:var(--ink4); }
-
 .btn-run { width:100%; padding:14px; background:var(--blue); color:#fff; border:none; border-radius:var(--radius); font-family:'Syne',sans-serif; font-size:14px; font-weight:700; letter-spacing:.05em; text-transform:uppercase; cursor:pointer; transition:background .15s, transform .1s, box-shadow .15s; box-shadow:0 4px 16px rgba(26,92,255,.30); position:relative; overflow:hidden; }
 .btn-run:hover { background:#1450e0; box-shadow:0 6px 24px rgba(26,92,255,.40); }
 .btn-run:active { transform:scale(.98); }
@@ -101,29 +88,47 @@ select { background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.or
 .btn-run.done    { background:var(--green); box-shadow:0 4px 16px rgba(13,158,110,.30); }
 .btn-run.running::after { content:''; position:absolute; top:0; left:-100%; width:60%; height:100%; background:linear-gradient(90deg,transparent,rgba(255,255,255,.25),transparent); animation:shimmer 1.4s infinite; }
 @keyframes shimmer { to { left:160%; } }
-
 .progress-track { height:3px; background:var(--rule); border-radius:2px; margin-top:10px; overflow:hidden; }
 .progress-fill  { height:100%; background:var(--blue); border-radius:2px; width:0%; transition:width .35s ease; }
 .progress-fill.running { background:var(--amber); }
 .progress-fill.done    { background:var(--green); }
 .run-status { font-family:'DM Mono',monospace; font-size:10px; color:var(--ink3); text-align:center; margin-top:7px; height:14px; }
-
 .main-area { display:flex; flex-direction:column; padding:28px 32px; gap:24px; overflow-y:auto; }
 .main-area::-webkit-scrollbar { width:5px; }
 .main-area::-webkit-scrollbar-thumb { background:var(--rule); border-radius:3px; }
-
 .foil-card { background:var(--surface); border-radius:var(--radius-lg); border:1px solid var(--rule); box-shadow:var(--shadow); overflow:hidden; }
 .foil-card-header { display:flex; align-items:center; justify-content:space-between; padding:16px 22px; border-bottom:1px solid var(--rule); }
 .foil-card-title { font-size:13px; font-weight:700; color:var(--ink2); text-transform:uppercase; letter-spacing:.04em; }
 .foil-meta { display:flex; gap:16px; }
 .meta-pill { font-family:'DM Mono',monospace; font-size:11px; padding:4px 10px; border-radius:6px; background:var(--paper); border:1px solid var(--rule); color:var(--ink3); }
 .meta-pill strong { color:var(--blue); font-weight:500; }
-
-/* foil canvas + overlay */
+.foil-tabs { display:flex; border-bottom:1px solid var(--rule); background:var(--paper); }
+.foil-tab { flex:1; padding:10px 0; font-family:'DM Mono',monospace; font-size:11px; font-weight:500; text-align:center; letter-spacing:.05em; text-transform:uppercase; color:var(--ink3); cursor:pointer; border-bottom:2px solid transparent; transition:color .15s, border-color .15s; user-select:none; }
+.foil-tab.active { color:var(--blue); border-bottom-color:var(--blue); background:var(--surface); }
+.foil-tab:hover:not(.active) { color:var(--ink2); }
+.draw-panel { display:none; flex-direction:column; }
+.draw-panel.active { display:flex; }
+.draw-toolbar { display:flex; align-items:center; gap:8px; padding:10px 16px; border-bottom:1px solid var(--rule); background:var(--paper); flex-wrap:wrap; }
+.draw-tool-btn { padding:5px 11px; background:var(--surface); border:1.5px solid var(--rule); border-radius:7px; font-family:'DM Mono',monospace; font-size:10px; color:var(--ink3); cursor:pointer; transition:border-color .12s, color .12s, background .12s; white-space:nowrap; }
+.draw-tool-btn:hover { border-color:var(--blue); color:var(--blue); }
+.draw-tool-btn.active { background:var(--blue-lt); border-color:var(--blue); color:var(--blue); font-weight:600; }
+.draw-tool-btn.danger { border-color:#f2b3b3; color:var(--red); }
+.draw-tool-btn.danger:hover { background:var(--red-lt); border-color:var(--red); }
+.draw-tool-btn.commit { background:var(--blue); border-color:var(--blue); color:#fff; }
+.draw-tool-btn.commit:hover { background:#1450e0; }
+.draw-tool-btn.commit:disabled { background:var(--ink4); border-color:var(--ink4); cursor:not-allowed; }
+.draw-sep { width:1px; height:20px; background:var(--rule); flex-shrink:0; }
+.draw-hint { font-family:'DM Mono',monospace; font-size:10px; color:var(--ink4); margin-left:auto; }
+canvas#draw-canvas { display:block; width:100%; height:280px; cursor:crosshair; background:#f9fafc; touch-action:none; }
+.draw-status-bar { display:flex; align-items:center; gap:12px; padding:7px 16px; border-top:1px solid var(--rule); background:var(--paper); font-family:'DM Mono',monospace; font-size:10px; color:var(--ink3); }
+.draw-status-bar .dot-count { color:var(--blue); font-weight:500; }
+.draw-status-bar .encode-status { margin-left:auto; }
+.encode-status.ok { color:var(--green); }
+.encode-status.err { color:var(--red); }
+.encode-status.busy { color:var(--amber); }
 .foil-canvas-wrap { position:relative; width:100%; height:240px; }
 canvas#foil-canvas  { display:block; width:100%; height:240px; }
 canvas#foil-overlay { position:absolute; top:0; left:0; width:100%; height:240px; touch-action:none; cursor:default; }
-
 .metrics-grid { display:grid; grid-template-columns:repeat(4,1fr); gap:14px; }
 .metric-card { background:var(--surface); border:1px solid var(--rule); border-radius:var(--radius); padding:18px 20px; box-shadow:var(--shadow); transition:transform .15s, box-shadow .15s; cursor:default; }
 .metric-card:hover { transform:translateY(-2px); box-shadow:var(--shadow-lg); }
@@ -134,13 +139,11 @@ canvas#foil-overlay { position:absolute; top:0; left:0; width:100%; height:240px
 .metric-delta { font-family:'DM Mono',monospace; font-size:11px; margin-top:4px; color:var(--ink4); }
 .metric-delta.pos { color:var(--green); }
 .metric-delta.neg { color:var(--red); }
-
 .charts-row { display:grid; grid-template-columns:1fr 1fr; gap:16px; }
 .chart-card { background:var(--surface); border:1px solid var(--rule); border-radius:var(--radius); padding:18px 20px 14px; box-shadow:var(--shadow); overflow:hidden; }
 .chart-card-title { font-size:12px; font-weight:700; text-transform:uppercase; letter-spacing:.05em; color:var(--ink3); margin-bottom:12px; }
 .chart-canvas-wrap { width:100%; height:160px; overflow:hidden; position:relative; }
 canvas.chart-canvas { display:block; position:absolute; top:0; left:0; }
-
 .log-card { background:var(--surface); border:1px solid var(--rule); border-radius:var(--radius); box-shadow:var(--shadow); overflow:hidden; }
 .log-card-header { display:flex; align-items:center; justify-content:space-between; padding:13px 20px; border-bottom:1px solid var(--rule); background:var(--paper); }
 .log-card-title { font-size:12px; font-weight:700; text-transform:uppercase; letter-spacing:.05em; color:var(--ink3); }
@@ -154,15 +157,12 @@ table.log-table { width:100%; border-collapse:collapse; font-family:'DM Mono',mo
 .log-table .col-ld { color:var(--blue); font-weight:500; }
 .log-table .col-cl { color:var(--green); }
 .log-best td { background:var(--blue-lt) !important; }
-
 .empty-state { display:flex; flex-direction:column; align-items:center; justify-content:center; gap:12px; padding:60px 40px; color:var(--ink4); text-align:center; }
 .empty-icon { width:64px; height:64px; border-radius:50%; background:var(--paper); border:2px dashed var(--rule); display:flex; align-items:center; justify-content:center; font-size:26px; }
 .empty-title { font-size:15px; font-weight:600; color:var(--ink3); }
 .empty-desc { font-size:13px; max-width:280px; line-height:1.6; }
-
 .err-banner { display:none; background:var(--red-lt); border:1.5px solid #f2b3b3; border-radius:var(--radius); padding:12px 16px; font-family:'DM Mono',monospace; font-size:11px; color:var(--red); line-height:1.5; }
 .err-banner.show { display:block; }
-
 @keyframes fadein { from{opacity:0;transform:translateY(8px);} to{opacity:1;transform:none;} }
 .fadein { animation:fadein .4s ease forwards; }
 </style>
@@ -184,7 +184,6 @@ table.log-table { width:100%; border-collapse:collapse; font-family:'DM Mono',mo
   <div class="workspace">
     <aside class="sidebar">
 
-      <!-- 0. SERVER -->
       <div class="sidebar-section">
         <div class="section-head">
           <div class="section-num">⚙</div>
@@ -200,7 +199,6 @@ table.log-table { width:100%; border-collapse:collapse; font-family:'DM Mono',mo
         <div id="err-banner" class="err-banner"></div>
       </div>
 
-      <!-- 1. FOIL CONDITIONS -->
       <div class="sidebar-section">
         <div class="section-head">
           <div class="section-num" id="num-1">1</div>
@@ -226,7 +224,6 @@ table.log-table { width:100%; border-collapse:collapse; font-family:'DM Mono',mo
         </div>
       </div>
 
-      <!-- 2. OBJECTIVE -->
       <div class="sidebar-section">
         <div class="section-head">
           <div class="section-num" id="num-2">2</div>
@@ -262,7 +259,6 @@ table.log-table { width:100%; border-collapse:collapse; font-family:'DM Mono',mo
         </div>
       </div>
 
-      <!-- 3. CONSTRAINTS -->
       <div class="sidebar-section">
         <div class="section-head">
           <div class="section-num" id="num-3">3</div>
@@ -280,24 +276,23 @@ table.log-table { width:100%; border-collapse:collapse; font-family:'DM Mono',mo
         </div>
       </div>
 
-      <!-- 4. MIN THICKNESS CIRCLES -->
       <div class="sidebar-section">
         <div class="section-head">
           <div class="section-num">⬤</div>
           <div class="section-title">Structural Rods</div>
         </div>
-        <!-- Rod A -->
         <div style="padding:10px 12px;background:var(--paper);border:1.5px solid var(--rule);border-radius:8px;margin-bottom:8px;">
           <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;">
             <div style="width:12px;height:12px;border-radius:50%;background:#ff6b35;border:2px solid rgba(0,0,0,.15);flex-shrink:0;"></div>
             <div style="font-family:'DM Mono',monospace;font-size:10px;font-weight:500;color:var(--ink2);flex:1;">Rod A</div>
-            <div style="font-family:'DM Mono',monospace;font-size:9px;color:var(--ink4);">drag · scroll</div>
+            <label style="display:flex;align-items:center;gap:4px;font-family:'DM Mono',monospace;font-size:9px;color:var(--ink3);cursor:pointer;">
+              <input type="checkbox" id="rod-a-enabled" onchange="toggleRod('a',this.checked)" style="width:12px;height:12px;cursor:pointer;">
+              enabled
+            </label>
           </div>
           <div style="display:flex;align-items:center;gap:6px;margin-bottom:6px;">
             <label style="font-family:'DM Mono',monospace;font-size:9px;color:var(--ink3);white-space:nowrap;">⌀ diameter</label>
-            <input type="number" id="rod-a-input" min="0.01" step="0.01" placeholder="auto"
-              style="width:70px;font-size:11px;padding:4px 6px;"
-              oninput="applyRodInput('a', this.value)">
+            <input type="number" id="rod-a-input" min="0.01" step="0.01" placeholder="auto" style="width:70px;font-size:11px;padding:4px 6px;" oninput="applyRodInput('a', this.value)" disabled>
             <span style="font-family:'DM Mono',monospace;font-size:9px;color:var(--ink3);" id="rod-a-unit">cm</span>
           </div>
           <div style="font-family:'DM Mono',monospace;font-size:10px;">
@@ -306,19 +301,18 @@ table.log-table { width:100%; border-collapse:collapse; font-family:'DM Mono',mo
             <span id="tc-a-rcm" style="display:block;color:#ff6b35;font-weight:500;margin-top:2px;">—</span>
           </div>
         </div>
-
-        <!-- Rod B -->
         <div style="padding:10px 12px;background:var(--paper);border:1.5px solid var(--rule);border-radius:8px;margin-bottom:8px;">
           <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;">
             <div style="width:12px;height:12px;border-radius:50%;background:#9b59b6;border:2px solid rgba(0,0,0,.15);flex-shrink:0;"></div>
             <div style="font-family:'DM Mono',monospace;font-size:10px;font-weight:500;color:var(--ink2);flex:1;">Rod B</div>
-            <div style="font-family:'DM Mono',monospace;font-size:9px;color:var(--ink4);">drag · scroll</div>
+            <label style="display:flex;align-items:center;gap:4px;font-family:'DM Mono',monospace;font-size:9px;color:var(--ink3);cursor:pointer;">
+              <input type="checkbox" id="rod-b-enabled" onchange="toggleRod('b',this.checked)" style="width:12px;height:12px;cursor:pointer;">
+              enabled
+            </label>
           </div>
           <div style="display:flex;align-items:center;gap:6px;margin-bottom:6px;">
             <label style="font-family:'DM Mono',monospace;font-size:9px;color:var(--ink3);white-space:nowrap;">⌀ diameter</label>
-            <input type="number" id="rod-b-input" min="0.01" step="0.01" placeholder="auto"
-              style="width:70px;font-size:11px;padding:4px 6px;"
-              oninput="applyRodInput('b', this.value)">
+            <input type="number" id="rod-b-input" min="0.01" step="0.01" placeholder="auto" style="width:70px;font-size:11px;padding:4px 6px;" oninput="applyRodInput('b', this.value)" disabled>
             <span style="font-family:'DM Mono',monospace;font-size:9px;color:var(--ink3);" id="rod-b-unit">cm</span>
           </div>
           <div style="font-family:'DM Mono',monospace;font-size:10px;">
@@ -327,12 +321,10 @@ table.log-table { width:100%; border-collapse:collapse; font-family:'DM Mono',mo
             <span id="tc-b-rcm" style="display:block;color:#9b59b6;font-weight:500;margin-top:2px;">—</span>
           </div>
         </div>
-
-        <div style="font-family:'DM Mono',monospace;font-size:9px;color:var(--ink4);line-height:1.5;">Solid circle = foil thickness · Dashed = rod ⌀ · drag or type to set.</div>
+        <div style="font-family:'DM Mono',monospace;font-size:9px;color:var(--ink4);line-height:1.5;">Enable a rod to add thickness constraints · drag circle to reposition · scroll to resize.</div>
         <div id="tc-violation" style="display:none;font-family:'DM Mono',monospace;font-size:10px;color:var(--red);margin-top:6px;">⚠ Foil too thin to fit rod</div>
       </div>
 
-      <!-- 5. RUN -->
       <div class="sidebar-section">
         <div class="section-head">
           <div class="section-num" id="num-4">4</div>
@@ -358,29 +350,58 @@ table.log-table { width:100%; border-collapse:collapse; font-family:'DM Mono',mo
             <div class="meta-pill">Source = <strong id="hdr-source">demo</strong></div>
           </div>
         </div>
-        <div id="foil-dims-bar" style="display:flex;gap:0;border-bottom:1px solid var(--rule);background:var(--paper);font-family:'DM Mono',monospace;font-size:10px;">
-          <div style="flex:1;padding:8px 16px;border-right:1px solid var(--rule);">
-            <div style="color:var(--ink3);margin-bottom:2px;">MAX THICKNESS</div>
-            <div style="color:var(--ink);font-weight:500;"><span id="dim-tmax-mm">—</span> &nbsp;<span id="dim-tmax-pct" style="color:var(--ink3);font-weight:400;">—</span></div>
-          </div>
 
-          <div style="flex:1;padding:8px 16px;border-right:1px solid var(--rule);">
-            <div style="color:var(--ink3);margin-bottom:2px;">MAX CAMBER</div>
-            <div style="color:var(--ink);font-weight:500;"><span id="dim-camber-mm">—</span> &nbsp;<span id="dim-camber-pct" style="color:var(--ink3);font-weight:400;">—</span></div>
+        <div class="foil-tabs">
+          <div class="foil-tab active" id="tab-view" onclick="switchTab('view')">View</div>
+          <div class="foil-tab" id="tab-draw" onclick="switchTab('draw')">Draw Custom</div>
+        </div>
+
+        <div id="panel-view">
+          <div id="foil-dims-bar" style="display:flex;gap:0;border-bottom:1px solid var(--rule);background:var(--paper);font-family:'DM Mono',monospace;font-size:10px;">
+            <div style="flex:1;padding:8px 16px;border-right:1px solid var(--rule);">
+              <div style="color:var(--ink3);margin-bottom:2px;">MAX THICKNESS</div>
+              <div style="color:var(--ink);font-weight:500;"><span id="dim-tmax-mm">—</span> &nbsp;<span id="dim-tmax-pct" style="color:var(--ink3);font-weight:400;">—</span></div>
+            </div>
+            <div style="flex:1;padding:8px 16px;border-right:1px solid var(--rule);">
+              <div style="color:var(--ink3);margin-bottom:2px;">MAX CAMBER</div>
+              <div style="color:var(--ink);font-weight:500;"><span id="dim-camber-mm">—</span> &nbsp;<span id="dim-camber-pct" style="color:var(--ink3);font-weight:400;">—</span></div>
+            </div>
+            <div style="flex:1;padding:8px 16px;border-right:1px solid var(--rule);">
+              <div style="color:var(--ink3);margin-bottom:2px;">LE RADIUS (est.)</div>
+              <div style="color:var(--ink);font-weight:500;"><span id="dim-le-mm">—</span> &nbsp;<span id="dim-le-pct" style="color:var(--ink3);font-weight:400;">—</span></div>
+            </div>
+            <div style="flex:1;padding:8px 16px;">
+              <div style="color:var(--ink3);margin-bottom:2px;">TE GAP</div>
+              <div style="color:var(--ink);font-weight:500;"><span id="dim-te-mm">—</span> &nbsp;<span id="dim-te-pct" style="color:var(--ink3);font-weight:400;">—</span></div>
+            </div>
           </div>
-          <div style="flex:1;padding:8px 16px;border-right:1px solid var(--rule);">
-            <div style="color:var(--ink3);margin-bottom:2px;">LE RADIUS (est.)</div>
-            <div style="color:var(--ink);font-weight:500;"><span id="dim-le-mm">—</span> &nbsp;<span id="dim-le-pct" style="color:var(--ink3);font-weight:400;">—</span></div>
-          </div>
-          <div style="flex:1;padding:8px 16px;">
-            <div style="color:var(--ink3);margin-bottom:2px;">TE GAP</div>
-            <div style="color:var(--ink);font-weight:500;"><span id="dim-te-mm">—</span> &nbsp;<span id="dim-te-pct" style="color:var(--ink3);font-weight:400;">—</span></div>
+          <div class="foil-canvas-wrap">
+            <canvas id="foil-canvas" width="1200" height="480"></canvas>
+            <canvas id="foil-overlay" width="1200" height="480"></canvas>
           </div>
         </div>
-        <div class="foil-canvas-wrap">
-          <canvas id="foil-canvas" width="1200" height="480"></canvas>
-          <canvas id="foil-overlay" width="1200" height="480"></canvas>
+
+        <div class="draw-panel" id="panel-draw">
+          <div class="draw-toolbar">
+            <button class="draw-tool-btn active" id="dtool-upper" onclick="setDrawMode('upper')">Upper surface</button>
+            <button class="draw-tool-btn" id="dtool-lower" onclick="setDrawMode('lower')">Lower surface</button>
+            <div class="draw-sep"></div>
+            <button class="draw-tool-btn" onclick="undoSurface()">Clear surface</button>
+            <button class="draw-tool-btn danger" onclick="clearDrawing()">Clear all</button>
+            <div class="draw-sep"></div>
+            <button class="draw-tool-btn" id="btn-extra-smooth" onclick="extraSmooth()" disabled>Extra smooth</button>
+            <button class="draw-tool-btn commit" id="btn-encode" onclick="encodeDrawing()" disabled>Encode + use as start</button>
+            <span class="draw-hint">Hold and drag to draw</span>
+          </div>
+          <canvas id="draw-canvas" width="1200" height="560"></canvas>
+          <div class="draw-status-bar">
+            <span>Upper: <span class="dot-count" id="dc-upper">0</span> pts</span>
+            <span>Lower: <span class="dot-count" id="dc-lower">0</span> pts</span>
+            <span id="draw-mode-label" style="color:var(--blue);font-weight:500;">Drawing upper surface</span>
+            <span class="encode-status" id="encode-status"></span>
+          </div>
         </div>
+
       </div>
 
       <div class="metrics-grid">
@@ -399,7 +420,6 @@ table.log-table { width:100%; border-collapse:collapse; font-family:'DM Mono',mo
           <div class="metric-val" id="met-cd">—</div>
           <div class="metric-delta" id="dlt-cd"></div>
         </div>
-
       </div>
 
       <div id="results-area">
@@ -443,9 +463,6 @@ table.log-table { width:100%; border-collapse:collapse; font-family:'DM Mono',mo
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
 <script>
-// ═══════════════════════════════════════════════════════════════════════════
-// CONFIG
-// ═══════════════════════════════════════════════════════════════════════════
 function serverUrl() { return document.getElementById('srv-url').value.trim().replace(/\/$/, ''); }
 function getAlpha()  { return parseFloat(document.getElementById('sl-alpha').value); }
 function getRe()     { return parseInt(document.getElementById('sl-re').value); }
@@ -454,11 +471,8 @@ function getLR()     { return parseFloat(document.getElementById('cfg-lr').value
 function getBaseline(){ return document.getElementById('cfg-baseline').value.trim(); }
 function getUnits(){ return document.getElementById('cfg-units').value; }
 function chordInMm(){ const v=parseFloat(document.getElementById('cfg-chord').value)||20,u=getUnits(); if(u==='cm') return v*10; if(u==='m') return v*1000; if(u==='ft') return v*304.8; if(u==='in') return v*25.4; return v*10; }
-function fmtDim(frac, dec){ const chord=chordInMm(),u=getUnits(); let val=frac*chord; if(u==='cm') val/=10; else if(u==='m') val/=1000; else if(u==='ft') val/=304.8; else if(u==='in') val/=25.4; return val.toFixed(dec)+' '+u; }
+function fmtDim(frac, dec){ const chord=chordInMm(),u=getUnits(); let val=frac*chord; if(u==='cm') val/=10; else if(u==='m') val/=1000; else if(u==='ft') val/=304.8; else if(u==='in') val/=25.4; return val.toFixed(dec)+' '+u; }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// SERVER HEALTH
-// ═══════════════════════════════════════════════════════════════════════════
 let serverOk = false;
 async function checkServer() {
   const dot = document.getElementById('srv-dot'), label = document.getElementById('srv-label');
@@ -479,9 +493,14 @@ async function checkServer() {
 checkServer();
 setInterval(checkServer, 15000);
 
-// ═══════════════════════════════════════════════════════════════════════════
-// FOIL CANVAS
-// ═══════════════════════════════════════════════════════════════════════════
+function switchTab(tab) {
+  document.getElementById('tab-view').classList.toggle('active', tab==='view');
+  document.getElementById('tab-draw').classList.toggle('active', tab==='draw');
+  document.getElementById('panel-view').style.display = tab==='view' ? '' : 'none';
+  document.getElementById('panel-draw').classList.toggle('active', tab==='draw');
+  if (tab==='draw') { resizeDrawCanvas(); renderDrawCanvas(); }
+}
+
 const foilCanvas = document.getElementById('foil-canvas');
 const foilCtx    = foilCanvas.getContext('2d');
 let currentCoords = null;
@@ -510,10 +529,7 @@ function serverCoordsToContour(coords) {
   const lower = coords.slice(40);
   return [...upper.map(p=>({x:p[0],y:p[1]})), ...[...lower].reverse().slice(1).map(p=>({x:p[0],y:p[1]}))];
 }
-
 function drawContourSmooth(ctx, pts, toCanvas) {
-  // Draw a smooth curve through points using midpoint quadratic beziers.
-  // This eliminates the angular look at the LE without needing more data points.
   if(pts.length < 2) return;
   const cp = pts.map(p => toCanvas(p.x, p.y));
   ctx.beginPath();
@@ -523,17 +539,14 @@ function drawContourSmooth(ctx, pts, toCanvas) {
     const my = (cp[i][1] + cp[i+1][1]) / 2;
     ctx.quadraticCurveTo(cp[i][0], cp[i][1], mx, my);
   }
-  // Last point
   ctx.lineTo(cp[cp.length-1][0], cp[cp.length-1][1]);
 }
-
 function drawFoil(alpha=2, coordsOverride=null) {
   const W=foilCanvas.width, H=foilCanvas.height;
   foilCtx.clearRect(0,0,W,H);
   foilCtx.strokeStyle='rgba(0,0,0,.04)'; foilCtx.lineWidth=1;
   for(let x=0;x<W;x+=40){foilCtx.beginPath();foilCtx.moveTo(x,0);foilCtx.lineTo(x,H);foilCtx.stroke();}
   for(let y=0;y<H;y+=40){foilCtx.beginPath();foilCtx.moveTo(0,y);foilCtx.lineTo(W,y);foilCtx.stroke();}
-
   const contour = coordsOverride ? serverCoordsToContour(coordsOverride)
     : (currentCoords ? serverCoordsToContour(currentCoords) : fallbackContour());
   const PAD=80, cx=W/2, cy=H/2, scale=W-2*PAD;
@@ -544,7 +557,6 @@ function drawFoil(alpha=2, coordsOverride=null) {
     const ry=ox*Math.sin(-alphaRad)+oy*Math.cos(-alphaRad);
     return [cx+rx*scale, cy-ry*scale*1.1];
   }
-  // streamlines
   for(let si=0;si<7;si++){
     const yOff=-0.3+si*0.1;
     foilCtx.beginPath(); foilCtx.strokeStyle=`rgba(26,92,255,${0.06+si*0.01})`; foilCtx.lineWidth=1;
@@ -556,12 +568,10 @@ function drawFoil(alpha=2, coordsOverride=null) {
     }
     foilCtx.stroke();
   }
-  // chord line
   const [x0,y0]=toCanvas(0,0),[x1c,y1c]=toCanvas(1,0);
   foilCtx.save(); foilCtx.strokeStyle='rgba(0,0,0,.12)'; foilCtx.lineWidth=1;
   foilCtx.setLineDash([6,4]); foilCtx.beginPath(); foilCtx.moveTo(x0,y0); foilCtx.lineTo(x1c,y1c); foilCtx.stroke();
   foilCtx.setLineDash([]); foilCtx.restore();
-  // baseline foil
   if (baselineCoords) {
     const blContour=serverCoordsToContour(baselineCoords);
     foilCtx.save(); foilCtx.beginPath();
@@ -569,7 +579,6 @@ function drawFoil(alpha=2, coordsOverride=null) {
     foilCtx.closePath(); foilCtx.strokeStyle='rgba(26,92,255,0.25)'; foilCtx.lineWidth=1.5;
     foilCtx.setLineDash([6,4]); foilCtx.stroke(); foilCtx.setLineDash([]); foilCtx.restore();
   }
-  // optimized foil fill
   foilCtx.save();
   drawContourSmooth(foilCtx, contour, toCanvas);
   foilCtx.closePath();
@@ -577,20 +586,17 @@ function drawFoil(alpha=2, coordsOverride=null) {
   grad.addColorStop(0,'rgba(230,238,255,.95)'); grad.addColorStop(1,'rgba(200,215,255,.75)');
   foilCtx.fillStyle=grad; foilCtx.fill();
   foilCtx.strokeStyle='rgba(26,92,255,.7)'; foilCtx.lineWidth=2; foilCtx.stroke(); foilCtx.restore();
-  // alpha arc
   const arcR=36; const [LEX,LEY]=toCanvas(0,0);
   foilCtx.save(); foilCtx.strokeStyle='rgba(26,92,255,.35)'; foilCtx.lineWidth=1.2;
   foilCtx.beginPath(); foilCtx.arc(LEX,LEY,arcR,-alphaRad,0,alphaRad<0); foilCtx.stroke();
   foilCtx.fillStyle='rgba(26,92,255,.6)'; foilCtx.font='11px "DM Mono",monospace';
   foilCtx.fillText(`α=${alpha.toFixed(1)}°`,LEX+arcR+6,LEY+4); foilCtx.restore();
 }
-
 function startAnim() {
   function frame(){ animT+=0.008; drawFoil(getAlpha()); animFrame=requestAnimationFrame(frame); }
   if(animFrame) cancelAnimationFrame(animFrame);
   animFrame=requestAnimationFrame(frame);
 }
-
 function fetchBaseline() {
   const alpha=getAlpha(), Re=getRe();
   fetch(serverUrl()+`/api/baseline?alpha=${alpha}&Re=${Re}&foil_name=n0012.png`)
@@ -599,8 +605,346 @@ function fetchBaseline() {
 function fetchBaselineDebounced() { clearTimeout(baselineFetchTimer); baselineFetchTimer=setTimeout(fetchBaseline,300); }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// CONSTRAINTS + METRICS
+// DRAW CANVAS — FREEHAND
 // ═══════════════════════════════════════════════════════════════════════════
+const drawCanvas = document.getElementById('draw-canvas');
+const drawCtx    = drawCanvas.getContext('2d');
+
+let drawPts = { upper: [], lower: [] };
+let drawMode = 'upper';
+let isDrawing = false;
+let rawStroke = [];
+let encodedZ = null;
+let encodedCoords = null;
+
+function resizeDrawCanvas() {
+  const rect = drawCanvas.getBoundingClientRect();
+  if (!rect.width) return;
+  const dpr = window.devicePixelRatio || 1;
+  drawCanvas.width  = Math.round(rect.width  * dpr);
+  drawCanvas.height = Math.round(rect.height * dpr);
+  drawCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+
+function drawPhysW() { return drawCanvas.getBoundingClientRect().width  || drawCanvas.width; }
+function drawPhysH() { return drawCanvas.getBoundingClientRect().height || drawCanvas.height; }
+
+function canvasToFoil(cx, cy) {
+  const pw = drawPhysW(), ph = drawPhysH();
+  const PAD = 60;
+  const fx = (cx - PAD) / (pw - 2 * PAD);
+  const fy = (ph / 2 - cy) / ((ph - 2 * PAD) * 2.0);
+  return [Math.max(0, Math.min(1, fx)), Math.max(-0.35, Math.min(0.35, fy))];
+}
+function foilToCanvas(fx, fy) {
+  const pw = drawPhysW(), ph = drawPhysH();
+  const PAD = 60;
+  return [PAD + fx * (pw - 2 * PAD), ph / 2 - fy * (ph - 2 * PAD) * 2.0];
+}
+
+function drawCanvasPos(e) {
+  const rect = drawCanvas.getBoundingClientRect();
+  const src = e.touches ? e.touches[0] : e;
+  return [src.clientX - rect.left, src.clientY - rect.top];
+}
+
+drawCanvas.addEventListener('mousedown',  e => startDraw(e));
+drawCanvas.addEventListener('mousemove',  e => { if (isDrawing) continueDraw(e); });
+drawCanvas.addEventListener('mouseup',    () => { if (isDrawing) endDraw(); });
+drawCanvas.addEventListener('mouseleave', () => { if (isDrawing) endDraw(); });
+drawCanvas.addEventListener('touchstart', e => { e.preventDefault(); startDraw(e); },    { passive: false });
+drawCanvas.addEventListener('touchmove',  e => { e.preventDefault(); if (isDrawing) continueDraw(e); }, { passive: false });
+drawCanvas.addEventListener('touchend',   e => { e.preventDefault(); if (isDrawing) endDraw(); },       { passive: false });
+
+function startDraw(e) {
+  isDrawing  = true;
+  rawStroke  = [];
+  encodedZ   = null;
+  encodedCoords = null;
+  document.getElementById('encode-status').textContent = '';
+  document.getElementById('encode-status').className   = 'encode-status';
+  const [px, py] = drawCanvasPos(e);
+  rawStroke.push(canvasToFoil(px, py));
+  renderDrawCanvas();
+}
+
+function continueDraw(e) {
+  const [px, py] = drawCanvasPos(e);
+  const pt   = canvasToFoil(px, py);
+  const last = rawStroke[rawStroke.length - 1];
+  const dx = pt[0] - last[0], dy = pt[1] - last[1];
+  if (dx * dx + dy * dy > 0.000025) {
+    rawStroke.push(pt);
+    renderDrawCanvas();
+  }
+}
+
+function endDraw() {
+  isDrawing = false;
+  if (rawStroke.length >= 3) {
+    drawPts[drawMode] = laplacianSmooth(rawStroke, 2).sort((a, b) => a[0] - b[0]);
+  } else if (rawStroke.length > 0) {
+    drawPts[drawMode] = rawStroke.slice().sort((a, b) => a[0] - b[0]);
+  }
+  rawStroke = [];
+  updateDrawCounts();
+  renderDrawCanvas();
+  updateEncodeButton();
+}
+
+function laplacianSmooth(pts, passes = 3) {
+  if (pts.length < 3) return pts.slice();
+  let out = pts.slice();
+  for (let p = 0; p < passes; p++) {
+    const next = [out[0]];
+    for (let i = 1; i < out.length - 1; i++) {
+      next.push([
+        out[i-1][0] * 0.25 + out[i][0] * 0.5 + out[i+1][0] * 0.25,
+        out[i-1][1] * 0.25 + out[i][1] * 0.5 + out[i+1][1] * 0.25
+      ]);
+    }
+    next.push(out[out.length - 1]);
+    out = next;
+  }
+  return out;
+}
+
+function extraSmooth() {
+  if (drawPts.upper.length >= 3) drawPts.upper = laplacianSmooth(drawPts.upper, 4);
+  if (drawPts.lower.length >= 3) drawPts.lower = laplacianSmooth(drawPts.lower, 4);
+  encodedZ = null;
+  renderDrawCanvas();
+  updateEncodeButton();
+}
+
+function setDrawMode(mode) {
+  drawMode = mode;
+  document.getElementById('dtool-upper').classList.toggle('active', mode === 'upper');
+  document.getElementById('dtool-lower').classList.toggle('active', mode === 'lower');
+  document.getElementById('draw-mode-label').textContent =
+    mode === 'upper' ? 'Drawing upper surface' : 'Drawing lower surface';
+  renderDrawCanvas();
+}
+
+function undoSurface() {
+  drawPts[drawMode] = [];
+  encodedZ = null;
+  encodedCoords = null;
+  updateDrawCounts();
+  renderDrawCanvas();
+  document.getElementById('encode-status').textContent = '';
+  document.getElementById('encode-status').className   = 'encode-status';
+  updateEncodeButton();
+}
+
+function clearDrawing() {
+  drawPts  = { upper: [], lower: [] };
+  rawStroke = [];
+  isDrawing = false;
+  encodedZ  = null;
+  encodedCoords = null;
+  updateDrawCounts();
+  renderDrawCanvas();
+  document.getElementById('encode-status').textContent = '';
+  document.getElementById('encode-status').className   = 'encode-status';
+  document.getElementById('hdr-source').textContent    = 'demo';
+  updateEncodeButton();
+}
+
+function updateDrawCounts() {
+  document.getElementById('dc-upper').textContent = drawPts.upper.length;
+  document.getElementById('dc-lower').textContent = drawPts.lower.length;
+}
+
+function updateEncodeButton() {
+  const total = drawPts.upper.length + drawPts.lower.length;
+  document.getElementById('btn-encode').disabled       = total < 6;
+  document.getElementById('btn-extra-smooth').disabled = total < 6;
+}
+
+function catmullRomPath(ctx, pts) {
+  if (pts.length < 2) return;
+  const cp = pts.map(([fx, fy]) => foilToCanvas(fx, fy));
+  ctx.moveTo(cp[0][0], cp[0][1]);
+  if (cp.length === 2) { ctx.lineTo(cp[1][0], cp[1][1]); return; }
+  for (let i = 0; i < cp.length - 1; i++) {
+    const p0 = cp[Math.max(0, i - 1)];
+    const p1 = cp[i];
+    const p2 = cp[i + 1];
+    const p3 = cp[Math.min(cp.length - 1, i + 2)];
+    const cp1x = p1[0] + (p2[0] - p0[0]) / 6;
+    const cp1y = p1[1] + (p2[1] - p0[1]) / 6;
+    const cp2x = p2[0] - (p3[0] - p1[0]) / 6;
+    const cp2y = p2[1] - (p3[1] - p1[1]) / 6;
+    ctx.bezierCurveTo(cp1x, cp1y, cp2x, cp2y, p2[0], p2[1]);
+  }
+}
+
+function renderDrawCanvas() {
+  const pw = drawPhysW(), ph = drawPhysH();
+  drawCtx.clearRect(0, 0, pw, ph);
+  drawCtx.strokeStyle = 'rgba(0,0,0,.04)'; drawCtx.lineWidth = 1;
+  for (let x = 0; x < pw; x += 60) { drawCtx.beginPath(); drawCtx.moveTo(x,0); drawCtx.lineTo(x,ph); drawCtx.stroke(); }
+  for (let y = 0; y < ph; y += 60) { drawCtx.beginPath(); drawCtx.moveTo(0,y); drawCtx.lineTo(pw,y); drawCtx.stroke(); }
+  const [chx0, chy0] = foilToCanvas(0, 0), [chx1, chy1] = foilToCanvas(1, 0);
+  drawCtx.save();
+  drawCtx.strokeStyle = 'rgba(0,0,0,.12)'; drawCtx.lineWidth = 1; drawCtx.setLineDash([8, 5]);
+  drawCtx.beginPath(); drawCtx.moveTo(chx0, chy0); drawCtx.lineTo(chx1, chy1); drawCtx.stroke();
+  drawCtx.setLineDash([]); drawCtx.restore();
+  drawCtx.fillStyle = 'rgba(122,129,153,.6)'; drawCtx.font = '11px "DM Mono",monospace';
+  drawCtx.fillText('0', chx0 - 4, chy0 + 16);
+  drawCtx.fillText('1', chx1 - 4, chy0 + 16);
+  drawCtx.fillText('x/c', chx1 - 20, chy0 + 28);
+  if (encodedCoords && !isDrawing) {
+    const contour = serverCoordsToContour(encodedCoords);
+    drawCtx.save();
+    drawCtx.beginPath();
+    const first = foilToCanvas(contour[0].x, contour[0].y);
+    drawCtx.moveTo(first[0], first[1]);
+    for (let i = 1; i < contour.length; i++) {
+      const [cx2, cy2] = foilToCanvas(contour[i].x, contour[i].y);
+      drawCtx.lineTo(cx2, cy2);
+    }
+    drawCtx.closePath();
+    drawCtx.fillStyle   = 'rgba(26,92,255,.07)';
+    drawCtx.strokeStyle = 'rgba(26,92,255,.35)';
+    drawCtx.lineWidth   = 1.5;
+    drawCtx.fill();
+    drawCtx.setLineDash([4, 3]);
+    drawCtx.stroke();
+    drawCtx.setLineDash([]);
+    drawCtx.restore();
+  }
+  if (drawPts.upper.length >= 2 && drawPts.lower.length >= 2 && !isDrawing) {
+    const upper = [...drawPts.upper].sort((a,b) => a[0]-b[0]);
+    const lower = [...drawPts.lower].sort((a,b) => a[0]-b[0]);
+    const allX  = upper.map(p=>p[0]).concat(lower.map(p=>p[0]));
+    const xMin  = Math.max(Math.min(...allX), 0);
+    const xMax  = Math.min(Math.max(...allX), 1);
+    if (xMax > xMin) {
+      function interp(pts, x) {
+        if (x <= pts[0][0]) return pts[0][1];
+        if (x >= pts[pts.length-1][0]) return pts[pts.length-1][1];
+        for (let i = 1; i < pts.length; i++) {
+          if (pts[i][0] >= x) {
+            const t = (x - pts[i-1][0]) / (pts[i][0] - pts[i-1][0]);
+            return pts[i-1][1] + t * (pts[i][1] - pts[i-1][1]);
+          }
+        }
+        return 0;
+      }
+      const steps = 80;
+      const xg = Array.from({length: steps}, (_, i) => xMin + (xMax - xMin) * i / (steps - 1));
+      drawCtx.save();
+      drawCtx.beginPath();
+      xg.forEach((x, i) => {
+        const [cx2, cy2] = foilToCanvas(x, interp(upper, x));
+        i === 0 ? drawCtx.moveTo(cx2, cy2) : drawCtx.lineTo(cx2, cy2);
+      });
+      [...xg].reverse().forEach(x => {
+        const [cx2, cy2] = foilToCanvas(x, interp(lower, x));
+        drawCtx.lineTo(cx2, cy2);
+      });
+      drawCtx.closePath();
+      drawCtx.fillStyle = 'rgba(26,92,255,.05)';
+      drawCtx.fill();
+      drawCtx.restore();
+    }
+  }
+  ['upper', 'lower'].forEach(surface => {
+    const pts      = drawPts[surface];
+    const isActive = drawMode === surface;
+    const color    = surface === 'upper' ? '#1a5cff' : '#0d9e6e';
+    if (pts.length >= 2) {
+      drawCtx.save();
+      drawCtx.beginPath();
+      catmullRomPath(drawCtx, pts);
+      drawCtx.strokeStyle  = color;
+      drawCtx.lineWidth    = isActive ? 2.5 : 1.8;
+      drawCtx.globalAlpha  = isActive ? 1.0 : 0.55;
+      drawCtx.stroke();
+      drawCtx.restore();
+    } else if (pts.length === 1) {
+      const [cx2, cy2] = foilToCanvas(pts[0][0], pts[0][1]);
+      drawCtx.beginPath(); drawCtx.arc(cx2, cy2, 4, 0, 2 * Math.PI);
+      drawCtx.fillStyle = color; drawCtx.fill();
+    }
+    if (isDrawing && drawMode === surface && rawStroke.length >= 2) {
+      drawCtx.save();
+      const rcp = rawStroke.map(([fx, fy]) => foilToCanvas(fx, fy));
+      drawCtx.beginPath();
+      drawCtx.moveTo(rcp[0][0], rcp[0][1]);
+      rcp.slice(1).forEach(([x, y]) => drawCtx.lineTo(x, y));
+      drawCtx.strokeStyle = color;
+      drawCtx.lineWidth   = 1.2;
+      drawCtx.globalAlpha = 0.25;
+      drawCtx.setLineDash([3, 3]);
+      drawCtx.stroke();
+      drawCtx.setLineDash([]);
+      drawCtx.restore();
+      if (rawStroke.length >= 4) {
+        const preview = laplacianSmooth(rawStroke, 1);
+        drawCtx.save();
+        drawCtx.beginPath();
+        catmullRomPath(drawCtx, preview);
+        drawCtx.strokeStyle = color;
+        drawCtx.lineWidth   = 2.5;
+        drawCtx.globalAlpha = 1.0;
+        drawCtx.stroke();
+        drawCtx.restore();
+      }
+    }
+  });
+  const labelColor = drawMode === 'upper' ? '#1a5cff' : '#0d9e6e';
+  drawCtx.fillStyle = labelColor;
+  drawCtx.font      = 'bold 11px "DM Mono",monospace';
+  drawCtx.fillText(
+    drawMode === 'upper' ? '↑ upper surface (blue)' : '↓ lower surface (green)',
+    foilToCanvas(0.02, 0)[0], 22
+  );
+}
+
+async function encodeDrawing() {
+  const total = drawPts.upper.length + drawPts.lower.length;
+  if (total < 6) return;
+  const btn    = document.getElementById('btn-encode');
+  const status = document.getElementById('encode-status');
+  btn.disabled = true;
+  btn.textContent = 'Encoding…';
+  status.textContent = 'Sending to server…';
+  status.className   = 'encode-status busy';
+  const allPts = [...drawPts.upper, ...drawPts.lower];
+  try {
+    const resp = await fetch(serverUrl() + '/api/encode', {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({ coords: allPts, alpha: getAlpha(), Re: getRe() }),
+    });
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({ error: resp.statusText }));
+      throw new Error(err.error || resp.statusText);
+    }
+    const data = await resp.json();
+    encodedZ      = data.z;
+    encodedCoords = data.coords;
+    status.textContent = `Encoded — L/D ${data.LD.toFixed(1)} · CL ${data.CL.toFixed(3)}`;
+    status.className   = 'encode-status ok';
+    btn.textContent    = 'Encoded ✓ — use as start';
+    btn.disabled       = false;
+    renderDrawCanvas();
+    currentCoords = encodedCoords;
+    drawFoil(getAlpha(), encodedCoords);
+    document.getElementById('hdr-source').textContent = 'drawn foil';
+    switchTab('view');
+  } catch (e) {
+    status.textContent = 'Encode failed: ' + e.message;
+    status.className   = 'encode-status err';
+    btn.textContent    = 'Encode + use as start';
+    btn.disabled       = false;
+    encodedZ = null;
+  }
+}
+
 function updateConstraints(c) {
   if (!c) {
     ['cl','cd'].forEach(k=>{ document.getElementById('con-'+k).className='constraint-item'; document.getElementById('cdot-'+k).className='cdot cdot-idle'; document.getElementById('cval-'+k).textContent='—'; });
@@ -630,9 +974,6 @@ function updateMetrics(r) {
   prevResult=vals;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// CHARTS
-// ═══════════════════════════════════════════════════════════════════════════
 let chartLD=null, chartPolar=null;
 function initCharts(){
   if(chartLD){chartLD.destroy();chartLD=null;} if(chartPolar){chartPolar.destroy();chartPolar=null;}
@@ -662,9 +1003,6 @@ function addLogRow(ev,isBest) {
   document.getElementById('log-best-label').textContent=`Best L/D: ${bestLD.toFixed(1)} @ iter ${bestIter}`;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// RUN
-// ═══════════════════════════════════════════════════════════════════════════
 let running=false, currentJobId=null;
 function showError(msg){const b=document.getElementById('err-banner');b.textContent=msg;b.className='err-banner show';}
 function clearError(){document.getElementById('err-banner').className='err-banner';}
@@ -684,7 +1022,7 @@ async function startRun() {
   document.getElementById('prog-fill').className='progress-fill running';
   document.getElementById('prog-fill').style.width='0%';
   document.getElementById('run-status').textContent='Starting NOM…';
-  document.getElementById('hdr-source').textContent='NeuralFoil';
+  document.getElementById('hdr-source').textContent = encodedZ ? 'drawn foil' : 'NeuralFoil';
   document.getElementById('empty-state').style.display='none';
   document.getElementById('charts-content').style.display='block';
   document.getElementById('charts-content').classList.add('fadein');
@@ -694,12 +1032,13 @@ async function startRun() {
 
   let jobId;
   try {
-    const body={
-      alpha:getAlpha(), Re:getRe(), n_iters:getEpochs(), tf_learning_rate:getLR(),
-      fd_eps:0.01, cl_min:0.15, lookup_baseline_path:getBaseline(),
-      rod_a_x:circles[0].x,    rod_a_diam:circles[0].minDiam,
-      rod_b_x:circles[1].x,    rod_b_diam:circles[1].minDiam,
+    const body = {
+      alpha: getAlpha(), Re: getRe(), n_iters: getEpochs(), tf_learning_rate: getLR(),
+      fd_eps: 0.01, cl_min: 0.15, lookup_baseline_path: getBaseline(),
+      rod_a_x:    circles[0].x,    rod_a_diam: circles[0].enabled ? circles[0].minDiam : 0,
+      rod_b_x:    circles[1].x,    rod_b_diam: circles[1].enabled ? circles[1].minDiam : 0,
     };
+    if (encodedZ) body.z_init = encodedZ;
     const resp=await fetch(serverUrl()+'/api/optimize/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
     if(!resp.ok){const err=await resp.json().catch(()=>({error:resp.statusText}));throw new Error(err.error||resp.statusText);}
     const data=await resp.json(); jobId=data.job_id; currentJobId=jobId;
@@ -774,9 +1113,6 @@ function resetRunState() {
   document.getElementById('prog-fill').className='progress-fill';
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// SLIDERS
-// ═══════════════════════════════════════════════════════════════════════════
 document.getElementById('sl-alpha').addEventListener('input', function(){
   const v=parseFloat(this.value);
   document.getElementById('ro-alpha').textContent=v.toFixed(1)+'°';
@@ -790,17 +1126,21 @@ document.getElementById('sl-re').addEventListener('change', function(){
   fetchBaselineDebounced();
 });
 
-// ═══════════════════════════════════════════════════════════════════════════
-// THICKNESS CIRCLES
-// ═══════════════════════════════════════════════════════════════════════════
 const overlayCanvas = document.getElementById('foil-overlay');
 const overlayCtx    = overlayCanvas.getContext('2d');
 
 const circles = [
-  { x:0.50, minDiam:0.08, color:'#ff6b35', fill:'rgba(255,107,53,0.15)', label:'A' },
-  { x:0.25, minDiam:0.06, color:'#9b59b6', fill:'rgba(155,89,182,0.15)', label:'B' },
+  { x:0.50, minDiam:0.08, color:'#ff6b35', fill:'rgba(255,107,53,0.15)', label:'A', enabled:false },
+  { x:0.25, minDiam:0.06, color:'#9b59b6', fill:'rgba(155,89,182,0.15)', label:'B', enabled:false },
 ];
 let dragIdx = null;
+
+function toggleRod(ltr, checked) {
+  const idx = ltr === 'a' ? 0 : 1;
+  circles[idx].enabled = checked;
+  document.getElementById('rod-'+ltr+'-input').disabled = !checked;
+  drawCircles();
+}
 
 function getTransform() {
   const W=foilCanvas.width, H=foilCanvas.height;
@@ -839,8 +1179,7 @@ function sampleThickness(x) {
 function circleInside(c) {
   const th=sampleThickness(c.x);
   if(!th) return true;
-  const localT=th.yTop-th.yBot;
-  return localT>=c.minDiam;
+  return (th.yTop-th.yBot)>=c.minDiam;
 }
 
 function drawCircles() {
@@ -849,82 +1188,61 @@ function drawCircles() {
   const {toCanvas,scale}=getTransform();
   let anyBad=false;
   circles.forEach(c=>{
+    if (!c.enabled) return;
     const th=sampleThickness(c.x);
     const localT=th?(th.yTop-th.yBot):c.minDiam;
-    const actualR=localT/2;          // circle fills the foil thickness at this station
+    const actualR=localT/2;
     const yc=th?(th.yTop+th.yBot)/2:0;
     const [cx2,cy2]=toCanvas(c.x,yc);
     const rPx=actualR*scale;
     const valid=circleInside(c);
     if(!valid) anyBad=true;
-    // filled circle = actual foil thickness
     overlayCtx.beginPath(); overlayCtx.arc(cx2,cy2,rPx,0,2*Math.PI);
     overlayCtx.fillStyle=valid?c.fill:'rgba(217,53,53,0.12)'; overlayCtx.fill();
     overlayCtx.strokeStyle=valid?c.color:'#d93535'; overlayCtx.lineWidth=2;
     overlayCtx.setLineDash(valid?[]:[5,3]); overlayCtx.stroke(); overlayCtx.setLineDash([]);
-    // dashed ring = required minimum circle
     const reqRpx=c.minDiam/2*scale;
     overlayCtx.beginPath(); overlayCtx.arc(cx2,cy2,reqRpx,0,2*Math.PI);
     overlayCtx.strokeStyle=valid?c.color+'88':'#d93535';
     overlayCtx.lineWidth=1.5; overlayCtx.setLineDash([4,3]); overlayCtx.stroke(); overlayCtx.setLineDash([]);
-    // radius dimension line: center → right edge of dashed ring (45° diagonal)
     {
-      // Full diameter line through center (left edge → right edge of dashed ring)
-      const dimColor = valid?c.color:'#d93535';
-      const lx = cx2 - reqRpx, rx = cx2 + reqRpx;  // left and right of ring
+      const dimColor=valid?c.color:'#d93535';
+      const lx=cx2-reqRpx, rx=cx2+reqRpx;
       overlayCtx.save();
       overlayCtx.strokeStyle=dimColor; overlayCtx.fillStyle=dimColor;
       overlayCtx.lineWidth=1; overlayCtx.setLineDash([3,3]);
-      overlayCtx.beginPath(); overlayCtx.moveTo(lx, cy2); overlayCtx.lineTo(rx, cy2);
+      overlayCtx.beginPath(); overlayCtx.moveTo(lx,cy2); overlayCtx.lineTo(rx,cy2);
       overlayCtx.stroke(); overlayCtx.setLineDash([]);
-      // arrowheads at both ends
       const aw=5;
-      [[-1, lx],[1, rx]].forEach(([dir, ex2])=>{
-        overlayCtx.beginPath();
-        overlayCtx.moveTo(ex2, cy2);
-        overlayCtx.lineTo(ex2 - dir*aw, cy2 - aw*0.4);
-        overlayCtx.lineTo(ex2 - dir*aw, cy2 + aw*0.4);
+      [[-1,lx],[1,rx]].forEach(([dir,ex2])=>{
+        overlayCtx.beginPath(); overlayCtx.moveTo(ex2,cy2);
+        overlayCtx.lineTo(ex2-dir*aw,cy2-aw*0.4); overlayCtx.lineTo(ex2-dir*aw,cy2+aw*0.4);
         overlayCtx.closePath(); overlayCtx.fill();
       });
-      // small dot at center
       overlayCtx.beginPath(); overlayCtx.arc(cx2,cy2,2,0,2*Math.PI); overlayCtx.fill();
-      // label above the line, with bg
       const rLabel='⌀='+fmtDim(c.minDiam,2);
       overlayCtx.font='10px "DM Mono",monospace';
       const tw=overlayCtx.measureText(rLabel).width;
       overlayCtx.globalAlpha=0.8; overlayCtx.fillStyle='#ffffff';
-      overlayCtx.fillRect(cx2-tw/2-3, cy2-22, tw+6, 14);
+      overlayCtx.fillRect(cx2-tw/2-3,cy2-22,tw+6,14);
       overlayCtx.globalAlpha=1; overlayCtx.fillStyle=dimColor;
       overlayCtx.textAlign='center'; overlayCtx.textBaseline='middle';
-      overlayCtx.fillText(rLabel, cx2, cy2-15);
-      overlayCtx.restore();
+      overlayCtx.fillText(rLabel,cx2,cy2-15); overlayCtx.restore();
     }
     overlayCtx.beginPath(); overlayCtx.arc(cx2,cy2,3.5,0,2*Math.PI);
     overlayCtx.fillStyle=valid?c.color:'#d93535'; overlayCtx.fill();
     const labelColor=valid?c.color:'#d93535';
     const topY2=cy2-Math.max(rPx,reqRpx)-10;
     overlayCtx.textAlign='center'; overlayCtx.textBaseline='bottom';
-
-    // helper: draw text with a white backing rectangle for readability
-    function labelWithBg(text, x, y, font, color) {
-      overlayCtx.font=font;
-      const w=overlayCtx.measureText(text).width;
-      const h=parseInt(font)+2;
-      overlayCtx.save();
-      overlayCtx.globalAlpha=0.72;
-      overlayCtx.fillStyle='#ffffff';
-      overlayCtx.fillRect(x-w/2-4, y-h+1, w+8, h+3);
-      overlayCtx.restore();
-      overlayCtx.fillStyle=color;
-      overlayCtx.font=font;
-      overlayCtx.fillText(text, x, y);
+    function labelWithBg(text,x,y,font,color){
+      overlayCtx.font=font; const w=overlayCtx.measureText(text).width; const h=parseInt(font)+2;
+      overlayCtx.save(); overlayCtx.globalAlpha=0.72; overlayCtx.fillStyle='#ffffff';
+      overlayCtx.fillRect(x-w/2-4,y-h+1,w+8,h+3); overlayCtx.restore();
+      overlayCtx.fillStyle=color; overlayCtx.font=font; overlayCtx.fillText(text,x,y);
     }
-
-    labelWithBg(c.label, cx2, topY2, 'bold 12px "DM Mono",monospace', labelColor);
-    labelWithBg(fmtDim(localT,2), cx2, topY2-17, '11px "DM Mono",monospace', labelColor);
-    if(!valid){
-      labelWithBg('rod ⌀ '+fmtDim(c.minDiam,2)+' — too thin', cx2, topY2-34, '11px "DM Mono",monospace', '#d93535');
-    }
+    labelWithBg(c.label,cx2,topY2,'bold 12px "DM Mono",monospace',labelColor);
+    labelWithBg(fmtDim(localT,2),cx2,topY2-17,'11px "DM Mono",monospace',labelColor);
+    if(!valid) labelWithBg('rod ⌀ '+fmtDim(c.minDiam,2)+' — too thin',cx2,topY2-34,'11px "DM Mono",monospace','#d93535');
     if(th){
       const [,topY]=toCanvas(c.x,th.yTop),[,botY]=toCanvas(c.x,th.yBot);
       overlayCtx.save(); overlayCtx.globalAlpha=0.35; overlayCtx.strokeStyle=c.color; overlayCtx.lineWidth=1;
@@ -943,29 +1261,23 @@ function drawCircles() {
 function computeFoilDims(coords) {
   const arr=coords||currentCoords;
   if(!arr){ ['dim-tmax-pct','dim-tmax-mm','dim-camber-pct','dim-camber-mm','dim-le-pct','dim-le-mm','dim-te-pct','dim-te-mm'].forEach(id=>{document.getElementById(id).textContent='—';}); return; }
-  const chord=chordInMm();
-  const upper=arr.slice(0,40).reverse();
-  const lower=arr.slice(40);
+  const upper=arr.slice(0,40).reverse(), lower=arr.slice(40);
   const n=Math.min(upper.length,lower.length);
-  let tMax=0,tMaxX=0,camberMax=0,camberMaxX=0;
+  let tMax=0,camberMax=0;
   for(let i=0;i<n;i++){
-    const x=upper[i][0],yu=upper[i][1],yl=lower[i][1];
+    const yu=upper[i][1],yl=lower[i][1];
     const t=yu-yl, cam=Math.abs((yu+yl)/2);
-    if(t>tMax){tMax=t;tMaxX=x;}
-    if(cam>camberMax){camberMax=cam;camberMaxX=x;}
+    if(t>tMax) tMax=t;
+    if(cam>camberMax) camberMax=cam;
   }
   const tePtU=arr[0],tePtL=arr[arr.length-1];
   const teGap=Math.abs(tePtU[1]-tePtL[1]);
-  const x0=upper[0][0],x1=upper[1][0],y0=upper[0][1],y1=upper[1][1];
-  const dydx=Math.abs((y1-y0)/(x1-x0||1e-9));
-  const leR=0.5*tMax*tMax/(tMax||1e-9)*0.8;
+  const leEst=tMax*tMax/8;
   const fmt=(v,d)=>isFinite(v)?(v*100).toFixed(d)+'%c':'—';
   document.getElementById('dim-tmax-pct').textContent=fmt(tMax,2);
   document.getElementById('dim-tmax-mm').textContent=isFinite(tMax)?fmtDim(tMax,2):'—';
-
   document.getElementById('dim-camber-pct').textContent=fmt(camberMax,2);
   document.getElementById('dim-camber-mm').textContent=isFinite(camberMax)?fmtDim(camberMax,2):'—';
-  const leEst=tMax*tMax/8;
   document.getElementById('dim-le-pct').textContent=fmt(leEst,2);
   document.getElementById('dim-le-mm').textContent=isFinite(leEst)?fmtDim(leEst,3):'—';
   document.getElementById('dim-te-pct').textContent=fmt(teGap,3);
@@ -981,6 +1293,7 @@ function overlayPos(e) {
 function hitTest(px,py) {
   const {toCanvas,scale}=getTransform();
   for(let i=0;i<circles.length;i++){
+    if (!circles[i].enabled) continue;
     const c=circles[i],th=sampleThickness(c.x),yc=th?(th.yTop+th.yBot)/2:0;
     const [cx2,cy2]=toCanvas(c.x,yc);
     const th2=sampleThickness(c.x),lt=(th2?(th2.yTop-th2.yBot):c.minDiam);
@@ -1000,49 +1313,41 @@ overlayCanvas.addEventListener('touchstart',e=>{ if(e.touches.length===1){const 
 overlayCanvas.addEventListener('touchmove',e=>{ e.preventDefault(); if(e.touches.length===1&&dragIdx!==null){const [px,py]=overlayPos(e);const [fx]=getTransform().fromCanvas(px,py);circles[dragIdx].x=Math.max(0.05,Math.min(0.95,fx));drawCircles();}else if(e.touches.length===2&&dragIdx!==null&&lastPinchDist){const d=Math.hypot(e.touches[0].clientX-e.touches[1].clientX,e.touches[0].clientY-e.touches[1].clientY);circles[dragIdx].minDiam=Math.max(0.01,Math.min(0.30,circles[dragIdx].minDiam*(d/lastPinchDist)));lastPinchDist=d;drawCircles();} },{passive:false});
 overlayCanvas.addEventListener('touchend',()=>{dragIdx=null;lastPinchDist=null;});
 
-// Hook drawFoil so circles + dims always redraw on top
 const _origDrawFoil=drawFoil;
 drawFoil=function(alpha,coordsOverride){ _origDrawFoil(alpha,coordsOverride); drawCircles(); computeFoilDims(coordsOverride||currentCoords); };
 
 document.getElementById('cfg-chord').addEventListener('input', function(){ drawCircles(); computeFoilDims(currentCoords); });
 document.getElementById('cfg-units').addEventListener('change', function(){
-  // Update rod input unit labels
-  const u = getUnits();
-  ['a','b'].forEach(l => {
-    const el = document.getElementById('rod-'+l+'-unit');
-    if(el) el.textContent = u;
-    // Re-apply typed value if present so display stays consistent
-    const inp = document.getElementById('rod-'+l+'-input');
-    if(inp && inp.value) applyRodInput(l, inp.value);
-  });
+  const u=getUnits();
+  ['a','b'].forEach(l=>{ const el=document.getElementById('rod-'+l+'-unit'); if(el) el.textContent=u; const inp=document.getElementById('rod-'+l+'-input'); if(inp&&inp.value&&circles[l==='a'?0:1].enabled) applyRodInput(l,inp.value); });
   drawCircles(); computeFoilDims(currentCoords);
 });
 
 function applyRodInput(ltr, val) {
-  const v = parseFloat(val);
-  if(!isFinite(v) || v <= 0) return;
-  const chord = chordInMm();
-  const u = getUnits();
-  // Convert typed physical value to fraction of chord
-  let physMm = v;
-  if(u==='cm')   physMm = v * 10;
-  else if(u==='m')  physMm = v * 1000;
-  else if(u==='ft') physMm = v * 304.8;
-  else if(u==='in') physMm = v * 25.4;
-  const frac = physMm / chord;
-  const idx = ltr === 'a' ? 0 : 1;
-  circles[idx].minDiam = Math.max(0.001, Math.min(0.50, frac));
+  const v=parseFloat(val); if(!isFinite(v)||v<=0) return;
+  const chord=chordInMm(), u=getUnits();
+  let physMm=v;
+  if(u==='cm') physMm=v*10; else if(u==='m') physMm=v*1000; else if(u==='ft') physMm=v*304.8; else if(u==='in') physMm=v*25.4;
+  const frac=physMm/chord;
+  const idx=ltr==='a'?0:1;
+  circles[idx].minDiam=Math.max(0.001,Math.min(0.50,frac));
   drawCircles();
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// INIT
-// ═══════════════════════════════════════════════════════════════════════════
 startAnim();
 updateConstraints(null);
 updateMetrics(null);
 fetchBaseline();
-setTimeout(()=>{ drawCircles(); computeFoilDims(null); }, 150);
+setTimeout(() => {
+  resizeDrawCanvas();
+  drawCircles();
+  computeFoilDims(null);
+  renderDrawCanvas();
+}, 150);
+window.addEventListener('resize', () => {
+  resizeDrawCanvas();
+  renderDrawCanvas();
+});
 </script>
 </body>
 </html>

@@ -64,7 +64,12 @@ def _preload_pipeline():
             print(f"[server] Pipeline preload failed: {e}")
 
 
-# ── Serve the HTML at / so Flask and the page are same-origin ─────────────
+def _get_pipeline():
+    from pipeline.talarai_pipeline import TalarAIPipeline
+    return TalarAIPipeline()
+
+
+# ── Serve the HTML at / ───────────────────────────────────────────────────
 
 @app.route("/")
 def index():
@@ -72,7 +77,7 @@ def index():
         html_path = _HERE / name
         if html_path.exists():
             return send_file(str(html_path))
-    return "HTML file not found (expected talariai.html or index.html)", 404
+    return "HTML file not found (expected Talarai.html or index.html)", 404
 
 
 # ── Health ─────────────────────────────────────────────────────────────────
@@ -80,6 +85,271 @@ def index():
 @app.route("/api/health")
 def health():
     return jsonify({"ok": True, "pipeline_loaded": _pipeline_loaded})
+
+
+# ── Encoder helpers (live in server, not pipeline) ─────────────────────────
+#
+# The encoder takes 256x256 grayscale PNGs — same as the training pipeline
+# (encode_airfoils.py: airfoil .txt → PNG → CNN encoder → 6 latent params).
+# We reconstruct the architecture here, load the saved weights, and render
+# drawn coords to an in-memory PNG before calling the CNN.
+
+_ENC_IMG_SIZE = 256
+_ENC_N_PARAMS = 6
+_ENCODER_CANDIDATES = [
+    PROJECT_ROOT / "pipeline" / "encoder_6params.weights.h5",
+    PROJECT_ROOT / "encoder_6params.weights.h5",
+    _HERE.parent / "pipeline" / "encoder_6params.weights.h5",
+    _HERE.parent / "encoder_6params.weights.h5",
+    _HERE / "encoder_6params.weights.h5",
+]
+_ENCODER_PATH = next((p for p in _ENCODER_CANDIDATES if p.exists()), None)
+
+_encoder_model  = None
+_encoder_loaded = False
+_encoder_lock   = threading.Lock()
+
+
+def _build_encoder_model():
+    """
+    Exact CNN architecture from encode_airfoils.py.
+    Must match training exactly so saved weights load correctly.
+    """
+    from tensorflow.keras.layers import (
+        Input, Conv2D, MaxPooling2D, Flatten, Dense, Dropout
+    )
+    from tensorflow.keras.models import Model
+
+    inp = Input(shape=(_ENC_IMG_SIZE, _ENC_IMG_SIZE, 1), name="image")
+    x = Conv2D(32,  (3, 3), activation='relu', padding='valid')(inp)
+    x = MaxPooling2D((2, 2))(x)
+    x = Conv2D(64,  (3, 3), activation='relu', padding='valid')(x)
+    x = MaxPooling2D((2, 2))(x)
+    x = Conv2D(128, (3, 3), activation='relu', padding='valid')(x)
+    x = MaxPooling2D((3, 3))(x)
+    x = Conv2D(256, (3, 3), activation='relu', padding='valid')(x)
+    x = MaxPooling2D((3, 3))(x)
+    x = Flatten()(x)
+    x = Dense(1000, activation='relu')(x)
+    x = Dense(100,  activation='relu')(x)
+    x = Dropout(0.05)(x)
+    latent = Dense(_ENC_N_PARAMS, activation='linear',
+                   name=f"latent_{_ENC_N_PARAMS}")(x)
+    return Model(inp, latent, name="encoder")
+
+
+def _load_encoder():
+    """Load encoder weights once, thread-safe."""
+    global _encoder_model, _encoder_loaded
+    with _encoder_lock:
+        if _encoder_loaded:
+            return
+        if _ENCODER_PATH is None:
+            searched = "\n  ".join(str(p) for p in _ENCODER_CANDIDATES)
+            raise FileNotFoundError(
+                f"Encoder weights not found. Searched:\n  {searched}\n"
+                f"Copy encoder_6params.weights.h5 to the pipeline/ folder."
+            )
+        import numpy as np
+        model = _build_encoder_model()
+        # Dummy forward pass builds the graph before loading weights
+        model(np.zeros((1, _ENC_IMG_SIZE, _ENC_IMG_SIZE, 1), dtype="float32"),
+              training=False)
+        model.load_weights(str(_ENCODER_PATH))
+        _encoder_model  = model
+        _encoder_loaded = True
+        print(f"[server] Encoder loaded from {_ENCODER_PATH}")
+
+
+def _coords_to_png_array(coords: "np.ndarray") -> "np.ndarray":
+    """
+    Render (80,2) Selig coords → 256×256 grayscale float32 array in memory.
+
+    Matches the training images exactly:
+      - White filled foil silhouette on black background
+      - x range [-0.05, 1.05],  y range [-0.25, 0.25]
+      - matplotlib Agg backend (no display, no disk I/O)
+    """
+    import numpy as np
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import io
+    from PIL import Image
+
+    coords = np.asarray(coords, dtype=float)
+    upper_le2te = coords[:40][::-1]   # flip upper TE->LE to LE->TE
+    lower_le2te = coords[40:]
+    xc = np.concatenate([upper_le2te[:, 0], lower_le2te[::-1, 0]])
+    yc = np.concatenate([upper_le2te[:, 1], lower_le2te[::-1, 1]])
+    # Negate y: the training PNGs were airfoil images where the profile appears
+    # with the upper surface visually on top (positive y upward in matplotlib).
+    # The Selig coords we build have upper surface at positive y, which renders
+    # at the top — same convention. However the encoder+decoder chain inverts the
+    # camber, so we flip y here so the rendered PNG matches the training orientation
+    # that produces z values which decode to a correctly-oriented foil.
+    yc = -yc
+
+    fig, ax = plt.subplots(figsize=(1, 1), dpi=_ENC_IMG_SIZE)
+    fig.patch.set_facecolor('black')
+    ax.set_facecolor('black')
+    ax.fill(xc, yc, color='white')
+    ax.plot(xc, yc, color='white', linewidth=0.5)
+    ax.set_xlim(-0.05, 1.05)
+    ax.set_ylim(-0.25, 0.25)
+    ax.set_aspect('equal')
+    ax.axis('off')
+    plt.subplots_adjust(left=0, right=1, top=1, bottom=0)
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format='png', dpi=_ENC_IMG_SIZE, bbox_inches='tight',
+                pad_inches=0, facecolor='black')
+    plt.close(fig)
+    buf.seek(0)
+
+    img = Image.open(buf).convert('L').resize((_ENC_IMG_SIZE, _ENC_IMG_SIZE))
+    arr = np.array(img, dtype=np.float32) / 255.0
+    return arr.reshape(_ENC_IMG_SIZE, _ENC_IMG_SIZE, 1)
+
+
+def _encode_selig(selig: "np.ndarray") -> "np.ndarray":
+    """
+    (80,2) Selig coords → latent z (6,) via CNN encoder.
+    Renders to PNG in memory, runs through the loaded encoder model.
+    """
+    import numpy as np
+    _load_encoder()
+    img = _coords_to_png_array(selig)
+    z = _encoder_model.predict(
+        img.reshape(1, _ENC_IMG_SIZE, _ENC_IMG_SIZE, 1), verbose=0
+    )[0]
+    return z.astype(np.float64)
+
+
+# ── Encode drawn foil coords → latent z ───────────────────────────────────
+#
+# POST /api/encode
+# Body: { "coords": [[x,y], ...] }   (sparse drawn points, any order)
+#
+# Pipeline:
+#   1. Normalise chord to [0,1]
+#   2. _resample_to_selig(): extract upper/lower envelopes, interpolate
+#      onto 40-point linspace each → (80,2) Selig-ordered array
+#   3. pipeline.encode_coords(selig):
+#        renders to 256×256 grayscale PNG in memory (matplotlib Agg)
+#        → CNN encoder (same arch as training) → z (6,)
+#   4. pipeline.eval_latent_with_neuralfoil(z): decode z → NeuralFoil → CL/CD
+#
+# The returned z is sent back to /api/optimize/start as z_init, feeding
+# directly into nom_optimize(z_init_array=z) → Priority 0 starting point.
+
+@app.route("/api/encode", methods=["POST"])
+def encode_foil():
+    body   = request.get_json(force=True) or {}
+    coords = body.get("coords")
+    alpha  = float(body.get("alpha", 2.0))
+    Re     = float(body.get("Re", 100_000))
+
+    if not coords or len(coords) < 6:
+        return jsonify({"error": "coords required (min 6 points)"}), 400
+
+    import numpy as np
+
+    try:
+        pipeline = _get_pipeline()
+    except Exception as e:
+        return jsonify({"error": f"Pipeline load failed: {e}"}), 500
+
+    # --- Step 1: normalise chord ---
+    try:
+        pts = np.array(coords, dtype=float)
+        if pts.ndim != 2 or pts.shape[1] != 2:
+            return jsonify({"error": "coords must be [[x,y], ...]"}), 400
+        x_range = pts[:, 0].max() - pts[:, 0].min()
+        if x_range < 1e-6:
+            return jsonify({"error": "All points have the same x — draw a foil shape"}), 400
+        pts[:, 0] = (pts[:, 0] - pts[:, 0].min()) / x_range
+        pts[:, 1] =  pts[:, 1] / x_range
+    except Exception as e:
+        return jsonify({"error": f"Normalisation failed: {e}"}), 400
+
+    # --- Step 2: resample to 80-point Selig format ---
+    try:
+        selig = _resample_to_selig(pts)    # (80, 2)
+    except Exception as e:
+        return jsonify({"error": f"Resampling failed: {e}"}), 400
+
+    # --- Step 3: encode via CNN → latent z ---
+    try:
+        z = _encode_selig(selig)
+        z = np.array(z, dtype=float).reshape(6)
+    except Exception as e:
+        return jsonify({"error": f"Encoding failed: {e}"}), 500
+
+    # --- Step 4: decode z → NeuralFoil for preview aerodynamics ---
+    try:
+        from optimization.ui_nom_driver import snap_condition
+        a_s, r_s = snap_condition(alpha, Re)
+        out    = pipeline.eval_latent_with_neuralfoil(z, alpha=a_s, Re=r_s)
+        CL     = float(out["CL"])
+        CD     = float(out["CD"])
+        LD     = CL / CD if CD > 0 else 0.0
+        decoded_coords = out.get("coords")
+    except Exception as e:
+        CL = CD = LD = 0.0
+        decoded_coords = selig
+
+    # Return the resampled drawn shape (selig) for display — not the decoded shape.
+    # The decoded shape comes from z passing through the decoder, which may look
+    # different from what was drawn. Showing selig gives the user honest feedback
+    # on what they drew. The z vector is still used as the optimizer starting point.
+    display_coords = selig  # always show the drawn shape, not the decoder output
+
+    return jsonify({
+        "z":      z.tolist(),
+        "CL":     round(CL, 4),
+        "CD":     round(CD, 6),
+        "LD":     round(LD, 2),
+        "coords": display_coords.tolist(),
+    })
+
+
+def _resample_to_selig(pts: "np.ndarray") -> "np.ndarray":
+    """
+    Resample an arbitrary cloud of foil points into 80-point Selig order:
+      rows  0-39: upper surface TE→LE  (x decreasing)
+      rows 40-79: lower surface LE→TE  (x increasing)
+
+    Upper surface = highest y at each x station (drawn in blue in the UI).
+    Lower surface = lowest  y at each x station (drawn in green).
+
+    Uses a sliding window of ±0.08 chord to find the local max/min y at
+    each of the 40 evenly-spaced x stations, then np.interp fills any gaps.
+    The window width is generous so sparse hand-drawn points are handled well.
+    """
+    import numpy as np
+
+    xg = np.linspace(0.0, 1.0, 40)
+    pts_sorted = pts[np.argsort(pts[:, 0])]
+    xs, ys = pts_sorted[:, 0], pts_sorted[:, 1]
+
+    yu = np.zeros(40)
+    yl = np.zeros(40)
+    for i, xi in enumerate(xg):
+        mask = np.abs(xs - xi) < 0.08
+        if mask.any():
+            yu[i] = ys[mask].max()
+            yl[i] = ys[mask].min()
+        else:
+            # No points nearby — interpolate from neighbours
+            yu[i] = float(np.interp(xi, xs, ys))
+            yl[i] = yu[i]
+
+    upper_le2te = np.stack([xg, yu], axis=1)
+    lower_le2te = np.stack([xg, yl], axis=1)
+    upper_te2le = upper_le2te[::-1].copy()   # flip to TE→LE
+
+    return np.vstack([upper_te2le, lower_le2te])  # (80, 2)
 
 
 # ── Start optimization ─────────────────────────────────────────────────────
@@ -99,12 +369,18 @@ def optimize_start():
     lr      = float(body.get("tf_learning_rate", 0.0005))
 
     bl_override = body.get("lookup_baseline_path", "").strip()
-    if not bl_override:
-        bl_path = ""   # will use foil_name="n0012.png" below
-    else:
-        bl_path = bl_override
+    bl_path     = bl_override if bl_override else ""
 
-    # Queue that the NOM thread pushes into, SSE thread drains
+    # z_init: optional 6-element list from /api/encode (drawn foil)
+    z_init_raw = body.get("z_init", None)
+    z_init     = None
+    if z_init_raw is not None:
+        try:
+            import numpy as np
+            z_init = list(np.array(z_init_raw, dtype=float).reshape(6))
+        except Exception:
+            z_init = None
+
     q = queue.Queue(maxsize=1000)
 
     with _jobs_lock:
@@ -117,15 +393,17 @@ def optimize_start():
         }
 
     rod_a_x    = float(body.get("rod_a_x",    0.50))
-    rod_a_diam = float(body.get("rod_a_diam", 0.08))
+    rod_a_diam = float(body.get("rod_a_diam", 0.0))   # 0 = disabled
     rod_b_x    = float(body.get("rod_b_x",    0.25))
-    rod_b_diam = float(body.get("rod_b_diam", 0.06))
+    rod_b_diam = float(body.get("rod_b_diam", 0.0))   # 0 = disabled
 
     kwargs = dict(
         alpha=alpha, Re=Re, n_iters=n_iters, tf_learning_rate=lr,
         csv_path=CSV_PATH,
-        foil_name="" if bl_path else "n0012.png",
+        # If z_init supplied (drawn foil), skip foil_name/lookup entirely
+        foil_name="" if (z_init or bl_path) else "n0012.png",
         lookup_baseline_path=bl_path,
+        z_init_array=z_init,          # None when using normal foil_name path
         out_path=str(run_dir), live_display=False, save_frames=False,
         rod_a_x=rod_a_x, rod_a_diam=rod_a_diam,
         rod_b_x=rod_b_x, rod_b_diam=rod_b_diam,
@@ -149,11 +427,9 @@ def _run_nom(job_id: str, q: queue.Queue, kwargs: dict):
             pass
 
         class _StreamingNOMModel(nd.NOMModel):
-            """Pushes each entry to the queue and checks for cancellation between and within iterations."""
             def train_step(self, data):
                 if cancel_event.is_set():
                     raise _CancelledError("cancelled by user")
-                # Wrap nf_op._evaluate so cancel is checked between each FD call too
                 _orig_eval = self.nf_op._evaluate
                 def _cancellable_eval(z):
                     if cancel_event.is_set():
@@ -177,7 +453,6 @@ def _run_nom(job_id: str, q: queue.Queue, kwargs: dict):
                         print("[stream] queue full, dropping entry")
                 return result
 
-        # Swap in our subclass just for this run
         _Orig = nd.NOMModel
         with _jobs_lock:
             _jobs[job_id]["cancel_event"] = cancel_event
@@ -204,7 +479,6 @@ def _run_nom(job_id: str, q: queue.Queue, kwargs: dict):
             pass
 
     finally:
-        # Always signal done so the SSE stream closes cleanly
         try:
             q.put_nowait({"__done__": True})
         except Exception:
@@ -234,7 +508,6 @@ def optimize_stream():
             try:
                 entry = q.get(timeout=2.0)
             except queue.Empty:
-                # Send a comment heartbeat so the connection stays alive
                 yield ": heartbeat\n\n"
                 continue
 
@@ -271,7 +544,6 @@ def optimize_stream():
             }
             yield f"data: {json.dumps(event)}\n\n"
 
-        # Run finished — send summary
         summary = {}
         try:
             summary = json.loads(summary_path.read_text())
@@ -288,14 +560,10 @@ def optimize_stream():
     )
 
 
-# ── Baseline foil for current (alpha, Re) ──────────────────────────────────
+# ── Baseline foil ──────────────────────────────────────────────────────────
 
 @app.route("/api/baseline")
 def baseline():
-    """Return coords + metadata for a foil at given alpha/Re.
-    If foil_name is given (e.g. 'n0012.png'), look it up in the latent CSV.
-    Otherwise fall back to the lookup-table best baseline file.
-    """
     alpha      = float(request.args.get("alpha",     2.0))
     Re         = float(request.args.get("Re",         100_000))
     foil_name  = request.args.get("foil_name", "").strip()
@@ -307,17 +575,14 @@ def baseline():
     import pandas as pd
 
     try:
-        from pipeline.talarai_pipeline import TalarAIPipeline
-        pipeline = TalarAIPipeline()
+        pipeline = _get_pipeline()
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-    # --- Resolve latent vector ---
     z        = None
     filename = foil_name or "?"
 
     if foil_name:
-        # Look up the named foil in the latent CSV
         try:
             df = pd.read_csv(CSV_PATH)
             rows = df[df["filename"] == foil_name]
@@ -332,7 +597,6 @@ def baseline():
         if z is None:
             return jsonify({"error": f"Foil '{foil_name}' not found in latent CSV"}), 404
     else:
-        # Fall back to lookup-table JSON
         bl_path = OUTPUTS_DIR / f"best_baseline_foil_alpha{a_s:.1f}_Re{r_s:.1e}.json"
         if not bl_path.exists():
             return jsonify({"error": f"No baseline for alpha={a_s} Re={r_s}"}), 404
@@ -341,7 +605,6 @@ def baseline():
         z        = np.array(bl["latent"], dtype=float)
         filename = bl.get("filename", "?")
 
-    # --- Decode and evaluate ---
     try:
         out    = pipeline.eval_latent_with_neuralfoil(z, alpha=a_s, Re=r_s)
         coords = out.get("coords")

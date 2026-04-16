@@ -66,15 +66,36 @@ import tensorflow as tf
 
 try:
     from pipeline.talarai_pipeline import TalarAIPipeline
-except ModuleNotFoundError:
-    from talarai_pipeline import TalarAIPipeline
+except (ModuleNotFoundError, ImportError):
+    try:
+        from talarai_pipeline import TalarAIPipeline
+    except (ModuleNotFoundError, ImportError):
+        import importlib.util as _ilu
+        _pip_dir = Path(__file__).resolve().parent.parent / "pipeline"
+        _spec = _ilu.spec_from_file_location("talarai_pipeline", _pip_dir / "talarai_pipeline.py")
+        _module = _ilu.module_from_spec(_spec)
+        _spec.loader.exec_module(_module)
+        TalarAIPipeline = _module.TalarAIPipeline
 
 try:
     from optimization.objective import default_objective
     from optimization.ui_constraints import latent_minmax_bounds, total_penalty
-except ModuleNotFoundError:
-    from objective import default_objective
-    from ui_constraints import latent_minmax_bounds, total_penalty
+except (ModuleNotFoundError, ImportError):
+    try:
+        from objective import default_objective
+        from ui_constraints import latent_minmax_bounds, total_penalty
+    except (ModuleNotFoundError, ImportError):
+        # Last resort: find the optimization directory relative to this file
+        import importlib.util as _ilu
+        _opt_dir = Path(__file__).resolve().parent
+        for _mod, _fname in [('objective', 'objective.py'), ('ui_constraints', 'ui_constraints.py')]:
+            _spec = _ilu.spec_from_file_location(_mod, _opt_dir / _fname)
+            _module = _ilu.module_from_spec(_spec)
+            _spec.loader.exec_module(_module)
+            import sys as _sys
+            _sys.modules[_mod] = _module
+        from objective import default_objective
+        from ui_constraints import latent_minmax_bounds, total_penalty
 
 
 # ===========================================================================
@@ -131,26 +152,22 @@ def _calibrate_constraints_from_baseline(coords: np.ndarray, n_points: int = 40)
       3) Floors = max(SCALE * zone_min, HARDFLOOR).
          SCALE = 0.70 → optimizer has 30% room to thin/de-camber from baseline.
          HARDFLOORs are absolute physics minimums, not manufacturing limits.
-      4) max_camber cap = max(1.30 * baseline_camber, 0.06).
-         Gives 30% headroom above baseline camber so the baseline itself always
+      4) max_camber cap = max(1.15 * baseline_camber, 0.06).
+         Gives 15% headroom above baseline camber so the baseline itself always
          passes, while still preventing wild high-camber shapes.
-      5) max_le_y cap = max(1.50 * |baseline_le_y_avg|, 0.005).
-         The LE y-check fires when the nose drifts too far from the chord line.
-         If the baseline already has a lifted nose (cambered foils do), set the
-         cap from the actual value so iteration 1 never hard-rejects.
 
     RETURNS:
       dict with keys: min_thickness_le, min_thickness_mid, min_thickness_te,
-                      min_max_thickness, min_te_angle_deg, max_camber, max_le_y
+                      min_max_thickness, min_te_angle_deg, max_camber
     """
-    SCALE     = 0.70
-    HARD_LE   = 0.003   # 0.3%c
-    HARD_MID  = 0.003   # 0.3%c
-    HARD_TE   = 0.002   # 0.2%c
-    HARD_PEAK = 0.015   # 1.5%c
-    HARD_ANGL = 3.0     # degrees
-    HARD_CAMB = 0.06    # 6%c absolute minimum cap
-    HARD_LEY  = 0.005   # 0.5%c absolute minimum max_le_y
+    SCALE        = 0.70
+    HARD_LE      = 0.003   # 0.3%c
+    HARD_MID     = 0.003   # 0.3%c
+    HARD_TE      = 0.002   # 0.2%c
+    HARD_PEAK    = 0.015   # 1.5%c
+    HARD_ANGL    = 14.0    # degrees (prof 4/13/26 physical constraint)
+    CAMBER_SCALE = 1.15    # optimizer gets 15% more camber than baseline
+    HARD_CAMBER  = 0.06    # absolute camber floor (never tighter than 6%c)
 
     coords = np.asarray(coords, dtype=float)
     if coords.shape != (80, 2):
@@ -158,7 +175,7 @@ def _calibrate_constraints_from_baseline(coords: np.ndarray, n_points: int = 40)
         return dict(
             min_thickness_le=HARD_LE, min_thickness_mid=HARD_MID,
             min_thickness_te=HARD_TE, min_max_thickness=HARD_PEAK,
-            min_te_angle_deg=HARD_ANGL, max_camber=HARD_CAMB, max_le_y=HARD_LEY,
+            min_te_angle_deg=HARD_ANGL, max_camber=HARD_CAMBER,
         )
 
     upper_te2le = coords[:n_points]
@@ -169,7 +186,6 @@ def _calibrate_constraints_from_baseline(coords: np.ndarray, n_points: int = 40)
     yu        = upper_le2te[:, 1]
     yl        = lower_le2te[:, 1]
     thickness = yu - yl
-    camber    = (yu + yl) / 2.0
 
     le_mask  = (xg >= 0.05) & (xg <= 0.15)
     mid_mask = (xg >  0.15) & (xg <= 0.75)
@@ -191,22 +207,20 @@ def _calibrate_constraints_from_baseline(coords: np.ndarray, n_points: int = 40)
     else:
         te_angle = HARD_ANGL / SCALE
 
-    # Max camber: cap at 30% above baseline, never below 6%c
-    camber_actual = float(np.max(np.abs(camber[int_mask]))) if int_mask.any() else HARD_CAMB
-    max_camber_cal = max(1.30 * camber_actual, HARD_CAMB)
-
-    # max_le_y: 50% above baseline LE midpoint, never below 0.5%c
-    le_y_avg = abs((float(yu[0]) + float(yl[0])) / 2.0)
-    max_le_y_cal = max(1.50 * le_y_avg, HARD_LEY)
+    # Camber: camber line = (upper + lower) / 2, measured over interior [0.05, 0.95]
+    camber_line = (yu + yl) / 2.0
+    if int_mask.any():
+        baseline_camber = float(np.max(np.abs(camber_line[int_mask])))
+    else:
+        baseline_camber = HARD_CAMBER / CAMBER_SCALE
 
     result = dict(
-        min_thickness_le  = max(SCALE * t_le,    HARD_LE),
-        min_thickness_mid = max(SCALE * t_mid,   HARD_MID),
-        min_thickness_te  = max(SCALE * t_te,    HARD_TE),
-        min_max_thickness = max(SCALE * t_max,   HARD_PEAK),
-        min_te_angle_deg  = max(SCALE * te_angle, HARD_ANGL),
-        max_camber        = max_camber_cal,
-        max_le_y          = max_le_y_cal,
+        min_thickness_le  = max(SCALE * t_le,              HARD_LE),
+        min_thickness_mid = max(SCALE * t_mid,             HARD_MID),
+        min_thickness_te  = max(SCALE * t_te,              HARD_TE),
+        min_max_thickness = max(SCALE * t_max,             HARD_PEAK),
+        min_te_angle_deg  = max(SCALE * te_angle,          HARD_ANGL),
+        max_camber        = max(CAMBER_SCALE * baseline_camber, HARD_CAMBER),
     )
 
     print(f"  [auto-constraints] Calibrated from baseline geometry:")
@@ -215,8 +229,7 @@ def _calibrate_constraints_from_baseline(coords: np.ndarray, n_points: int = 40)
     print(f"    t_te_min  = {t_te*100:.2f}%c  → floor {result['min_thickness_te']*100:.2f}%c")
     print(f"    t_max     = {t_max*100:.2f}%c  → peak floor {result['min_max_thickness']*100:.2f}%c")
     print(f"    te_angle  = {te_angle:.1f}°  → floor {result['min_te_angle_deg']:.1f}°")
-    print(f"    camber    = {camber_actual*100:.2f}%c  → cap {result['max_camber']*100:.2f}%c")
-    print(f"    le_y_avg  = {le_y_avg*100:.2f}%c  → max_le_y {result['max_le_y']*100:.2f}%c")
+    print(f"    camber    = {baseline_camber*100:.2f}%c  → cap {result['max_camber']*100:.2f}%c")
 
     return result
 
@@ -704,7 +717,7 @@ def nom_optimize(
     bounds_lam: float = 10.0,
     lam_bounds: float = 1.0,
     lam_geom:   float = 25.0,
-    lam_cl:        float = 50.0,
+    lam_cl:     float = 50.0,
     # Weight for soft thickness penalty — how hard the gradient pushes the
     # foil toward satisfying rod constraints. Higher = stronger push but
     # may conflict with L/D objective. 200 ≈ 2.0 loss per 1%c violation.
@@ -712,33 +725,32 @@ def nom_optimize(
     # Weight for the direct rod quadratic penalty (checked at rod x-station).
     # 500 means a 50% fractional violation adds 500*0.25 = 125 to loss.
     lam_rod: float = 500.0,
-    # THREE-ZONE THICKNESS  (action item 4/6/26 -- see constraints.py for details)
-    # Change these numbers once physical manufacturing constraints are known.
-    # Current defaults are calibrated to NACA 0012 with ~30-40% headroom:
-    #   LE  zone x∈[0.05,0.15]: NACA 0012 has ~7%c here  → floor 2.5%c
-    #   Mid zone x∈(0.15,0.75]: NACA 0012 has ~6-12%c    → floor 3.0%c
-    #   TE  zone x∈(0.75,0.95]: NACA 0012 has ~1.6-6%c   → floor 0.8%c
-    #     (TE zone extended from old 0.90 to 0.95 to prevent razor TE)
-    min_thickness_le:  float = 0.025,
-    min_thickness_mid: float = 0.030,
-    min_thickness_te:  float = 0.008,
+    # THREE-ZONE THICKNESS
+    # DEFAULT = None → AUTO-CALIBRATED from baseline foil geometry.
+    #   When None, each floor is set to max(0.70 * baseline_zone_min, hardfloor)
+    #   where hardfloor is an absolute physics minimum (0.3%c LE/Mid, 0.2%c TE).
+    #
+    # WHY AUTO-CALIBRATE:
+    #   Hardcoded floors work for NACA 0012 but immediately hard-reject thin
+    #   foils like goe451 (4.78% thick) that the lookup table picks as baselines.
+    #   Auto-calibration scales the floors to each baseline so any foil in the
+    #   dataset is a valid starting point without manual tuning.
+    #
+    # TO OVERRIDE: pass explicit floats, e.g. min_thickness_mid=0.030
+    min_thickness_le:  float | None = None,   # LE  zone: x ∈ [0.05, 0.15]
+    min_thickness_mid: float | None = None,   # Mid zone: x ∈ (0.15, 0.75]
+    min_thickness_te:  float | None = None,   # TE  zone: x ∈ (0.75, 0.95]
     max_thickness:     float = 0.157,
     te_gap_max:        float = 0.005,
-    min_max_thickness: float = 0.04,
-    # REVISION (4/1/26): set to 0.06 (6%c).
-    # MUST match DEFAULT_MAX_CAMBER in build_lookup_table.py -- if these
-    # differ, the baseline foil picked by the lookup table may fail the
-    # optimizer's own constraint check on iteration 1, causing pen=1000
-    # every iteration and valid=0. They are kept in sync at 0.06.
-    #
-    # Why 0.06: goe803h (~6-7% camber) is a common high-performing baseline.
-    # 0.05 was too tight and blocked it. 0.10 was too loose (optimizer hit 8.3%).
-    # 0.06 allows the baseline neighborhood while capping exploitation.
-    max_camber:        float = 0.06,
-    # MINIMUM TE WEDGE ANGLE  (action item 4/6/26 -- see constraints.py for details)
-    # NACA 0012 has ~15.5 deg. Floor at 6 deg is very permissive but hard-rejects
-    # true knife edges. Raise to 8-10 if the TE is still too sharp after testing.
-    min_te_angle_deg:  float = 6.0,
+    min_max_thickness: float | None = None,   # peak thickness floor (None = auto)
+    # DEFAULT = None → auto-calibrated to max(1.15 * baseline_max_camber, 0.06).
+    # WHY: e61 and other high-camber foils (>6%c) were hard-rejected on
+    # iteration 1 because 0.06 is below their baseline camber.
+    # To override: pass e.g. max_camber=0.14
+    max_camber:        float | None = None,
+    # DEFAULT = None → auto-calibrated to max(0.70 * baseline_te_angle, 14.0 deg)
+    # HARD_ANGL floor = 14 deg (prof 4/13/26 physical constraint).
+    min_te_angle_deg:  float | None = None,
     cl_min: float = 0.15,
     cl_max: float | None = None,
     csv_path:              str       = "data/airfoil_latent_params_6.csv",
@@ -755,69 +767,36 @@ def nom_optimize(
     #    nom_optimize(foil_name="e63.png")
     #    nom_optimize(foil_name="goe451.png")
     #
-    #  HOW IT WORKS:
-    #    Looks up the foil name in airfoil_latent_params_6.csv and grabs
-    #    the 6 pre-computed latent parameters for that foil. Those 6 numbers
-    #    become z_init — the starting point for the optimizer.
-    #
-    #  WHY the CSV (not the .dat or .png file):
-    #    The optimizer lives entirely in 6D latent space. The decoder already
-    #    maps those 6 numbers → foil shape. Using the CSV means we skip
-    #    re-running the encoder and use the exact same latent vector that was
-    #    used during training. The .dat and .png files are the raw foil data
-    #    BEFORE encoding — they're only useful if you want to add a new foil
-    #    that isn't in the dataset yet (which would require running encoder.py).
-    #
-    #  NACA 0012 latent vector (from airfoil_latent_params_6.csv):
-    #    n0012.png → [-0.0418, 0.0750, -0.0075, -0.0419, 0.1131, -0.0874]
-    #
     #  OPTION B — z_init_csv (resume from a previous run's best result)
     #  ---------------------------------------------------------------
     #  Pass the path to a previous run's best_latent_nom.csv, e.g.:
     #    nom_optimize(z_init_csv="outputs/best_latent_nom.csv")
     #
-    #  USE THIS WHEN:
-    #    You want to continue optimizing from where a previous run ended,
-    #    or re-run the same foil under different constraints (e.g. tighter
-    #    camber limit or different alpha/Re condition).
-    #
     #  OPTION C — lookup_baseline_path or auto-select (default behavior)
-    #  ---------------------------------------------------------------
-    #  Leave foil_name="" and z_init_csv="" and the optimizer will:
-    #    1) Use lookup_baseline_path if provided, OR
-    #    2) Auto-select the best geometry-filtered foil from build_lookup_table
-    #       outputs (outputs/best_baseline_foil_alpha{a}_Re{Re}.json)
     #
     #  PRIORITY ORDER (if multiple are set):
     #    z_init_csv > foil_name > lookup_baseline_path > auto-select
     # =======================================================================
-    foil_name:  str = "",   # e.g. "n0012.png" — looks up latent in csv_path
-    z_init_csv: str = "",   # e.g. "outputs/best_latent_nom.csv" — resume run
+    foil_name:    str = "",        # e.g. "n0012.png" — looks up latent in csv_path
+    z_init_csv:   str = "",        # e.g. "outputs/best_latent_nom.csv" — resume run
+    # z_init_array: pass a 6-element latent vector directly (e.g. from /api/encode).
+    # Bypasses all file I/O. Takes priority over z_init_csv and foil_name.
+    # Used when the user draws a custom foil and the server encodes it on the fly.
+    z_init_array: list | np.ndarray | None = None,
     # -----------------------------------------------------------------------
     # Action Item 1: live display + frame saving
     #   live_display=True   -> opens a matplotlib popup window during training
     #   save_frames=True    -> saves PNG frames to outputs/frames/
-    #                          (use ffmpeg afterwards to make the video:
-    #                           ffmpeg -r 30 -i outputs/frames/frame_%04d.png
-    #                                  -vcodec libx264 nom_optimization.mp4)
     # -----------------------------------------------------------------------
     live_display: bool = False,
     save_frames:  bool = False,
     # =======================================================================
     # ROD CONSTRAINTS  (from UI structural rod circles)
     # =======================================================================
-    # Each rod is a physical metal rod the foil must be thick enough to fit.
-    # rod_x    -- chord-fraction position (0=LE, 1=TE)
-    # rod_diam -- rod diameter as fraction of chord (same units as thickness)
-    #
-    # The rod's x-position is mapped to whichever thickness zone it falls in
-    # (LE: 0.05-0.15, Mid: 0.15-0.75, TE: 0.75-0.95) and that zone's floor
-    # is raised to max(current_floor, rod_diam) so constraints.py enforces it.
-    # =======================================================================
     rod_a_x:    float = 0.50,
-    rod_a_diam: float = 0.08,
+    rod_a_diam: float = 0.0,    # 0 = rod disabled
     rod_b_x:    float = 0.25,
-    rod_b_diam: float = 0.06,
+    rod_b_diam: float = 0.0,    # 0 = rod disabled
 ):
     """
     Run NOM optimization.
@@ -862,6 +841,17 @@ def nom_optimize(
     latent_baseline  = None
     baseline_filename = "?"
 
+    # Priority 0: z_init_array — latent vector passed directly (e.g. from drawn foil)
+    if z_init_array is not None:
+        z = np.array(z_init_array, dtype=float).reshape(-1)
+        if z.shape[0] == 6:
+            latent_baseline   = z
+            baseline_filename = "drawn_foil"
+            print(f"  [start] Using directly supplied latent vector (drawn foil)")
+            print(f"  z_init: {np.round(latent_baseline, 4)}")
+        else:
+            print(f"  WARNING: z_init_array has {z.shape[0]} values (need 6). Ignored.")
+
     # Priority 1: z_init_csv — resume from a previous run's best result
     if z_init_csv:
         p = Path(z_init_csv)
@@ -883,7 +873,6 @@ def nom_optimize(
     if latent_baseline is None and foil_name:
         try:
             df_csv = pd.read_csv(csv_path)
-            # Try exact match first, then case-insensitive match without .png
             rows = df_csv[df_csv["filename"] == foil_name]
             if rows.empty:
                 needle = foil_name.lower().replace(".png", "")
@@ -938,28 +927,37 @@ def nom_optimize(
         bl_coords = None
 
     # ------------------------------------------------------------------
-    # AUTO-CALIBRATE ALL CONSTRAINT FLOORS FROM BASELINE GEOMETRY
+    # AUTO-CALIBRATE CONSTRAINT FLOORS FROM BASELINE GEOMETRY
     # ------------------------------------------------------------------
-    # Every constraint that could hard-reject the baseline on iteration 1
-    # is derived from the baseline foil itself, not NACA-0012-tuned constants.
-    # Explicit float values passed by the caller are used as-is (override).
+    # If the user left any thickness floor as None, derive it from the
+    # baseline foil's actual shape (70% of zone minimum).
+    # Explicit float values passed by the caller are used as-is.
+    # This ensures any foil in the dataset (thick or thin) is a valid
+    # starting point without manual tuning of constraint values.
     # ------------------------------------------------------------------
-    auto = _calibrate_constraints_from_baseline(bl_coords) if bl_coords is not None else {}
-    if not auto:
-        print("  [auto-constraints] No baseline coords — using caller-supplied or defaults.")
+    if (min_thickness_le is None or min_thickness_mid is None or
+            min_thickness_te is None or min_max_thickness is None or
+            min_te_angle_deg is None or max_camber is None):
+        if bl_coords is not None:
+            auto = _calibrate_constraints_from_baseline(bl_coords)
+        else:
+            # No baseline coords available — use conservative hard floors
+            auto = dict(min_thickness_le=0.003, min_thickness_mid=0.003,
+                        min_thickness_te=0.002, min_max_thickness=0.015,
+                        min_te_angle_deg=14.0, max_camber=0.10)
+            print("  [auto-constraints] No baseline coords — using conservative floors.")
 
-    # Override only parameters the caller left at their defaults by using
-    # the auto-calibrated value when the auto dict has a tighter constraint.
-    # Caller always wins if they pass an explicit value via keyword argument.
-    _use = lambda caller_val, key, fallback: caller_val if (caller_val != fallback) else auto.get(key, caller_val)
-
-    min_thickness_le  = auto.get("min_thickness_le",  min_thickness_le)
-    min_thickness_mid = auto.get("min_thickness_mid", min_thickness_mid)
-    min_thickness_te  = auto.get("min_thickness_te",  min_thickness_te)
-    min_max_thickness = auto.get("min_max_thickness", min_max_thickness)
-    min_te_angle_deg  = auto.get("min_te_angle_deg",  min_te_angle_deg)
-    max_camber        = auto.get("max_camber",        max_camber)
-    max_le_y          = auto.get("max_le_y",          0.02)
+        if min_thickness_le  is None: min_thickness_le  = auto["min_thickness_le"]
+        if min_thickness_mid is None: min_thickness_mid = auto["min_thickness_mid"]
+        if min_thickness_te  is None: min_thickness_te  = auto["min_thickness_te"]
+        if min_max_thickness is None: min_max_thickness = auto["min_max_thickness"]
+        if min_te_angle_deg  is None: min_te_angle_deg  = auto["min_te_angle_deg"]
+        if max_camber        is None: max_camber        = auto["max_camber"]
+    else:
+        print(f"  [constraints] Using manually specified floors:")
+        print(f"    LE={min_thickness_le*100:.2f}%c  Mid={min_thickness_mid*100:.2f}%c  "
+              f"TE={min_thickness_te*100:.2f}%c  peak={min_max_thickness*100:.2f}%c  "
+              f"TE_angle={min_te_angle_deg:.1f}°  max_camber={max_camber*100:.2f}%c")
 
     # ------------------------------------------------------------------
     # APPLY ROD CONSTRAINTS
@@ -970,10 +968,6 @@ def nom_optimize(
     def _apply_rod(rod_x: float, rod_diam: float):
         nonlocal min_thickness_le, min_thickness_mid, min_thickness_te
 
-        # Determine zone first so we can clamp to the zone minimum thickness,
-        # not just the local point at rod_x. The zone minimum is what the
-        # constraint check actually enforces — clamping to local_t at rod_x
-        # can still set a floor higher than the zone minimum elsewhere.
         zone = ("LE"  if rod_x <= 0.15 else
                 "Mid" if rod_x <= 0.75 else "TE")
 
@@ -983,7 +977,6 @@ def nom_optimize(
             xg        = upper_le2te[:, 0]
             thickness = upper_le2te[:, 1] - lower_le2te[:, 1]
 
-            # Zone minimum — the thinnest point anywhere in this zone
             zone_masks = {
                 "LE":  (xg >= 0.05) & (xg <= 0.15),
                 "Mid": (xg >  0.15) & (xg <= 0.75),
@@ -992,8 +985,6 @@ def nom_optimize(
             mask = zone_masks[zone]
             zone_t_min = float(np.min(thickness[mask])) if mask.any() else rod_diam
 
-            # Cap at 95% of zone minimum so the baseline itself passes
-            # and the optimizer has a tiny margin to work with.
             cap = zone_t_min * 0.95
             if rod_diam > cap:
                 print(f"  [rod] WARNING: rod diam={rod_diam*100:.1f}%c > 95% zone min ({cap*100:.1f}%c) "
@@ -1009,16 +1000,21 @@ def nom_optimize(
         floor = {'LE':min_thickness_le,'Mid':min_thickness_mid,'TE':min_thickness_te}[zone]
         print(f"  [rod] x={rod_x:.2f} ({zone} zone)  diam={rod_diam*100:.1f}%c  -> floor now {floor*100:.1f}%c")
 
-    _apply_rod(rod_a_x, rod_a_diam)
-    _apply_rod(rod_b_x, rod_b_diam)
-
-    # Build rod list for the constraint function
-    _rods = [
-        {"x": rod_a_x, "diam": rod_a_diam},
-        {"x": rod_b_x, "diam": rod_b_diam},
-    ]
-    print(f"  [rods] A: x={rod_a_x:.2f} diam={rod_a_diam*100:.1f}%c  |  B: x={rod_b_x:.2f} diam={rod_b_diam*100:.1f}%c")
-    print(f"  [rods] lam_rod={lam_rod}  lam_thickness={lam_thickness}")
+    _rods = []
+    if rod_a_diam > 0:
+        _apply_rod(rod_a_x, rod_a_diam)
+        _rods.append({"x": rod_a_x, "diam": rod_a_diam})
+        print(f"  [rod A] x={rod_a_x:.2f} diam={rod_a_diam*100:.1f}%c")
+    else:
+        print(f"  [rod A] disabled")
+    if rod_b_diam > 0:
+        _apply_rod(rod_b_x, rod_b_diam)
+        _rods.append({"x": rod_b_x, "diam": rod_b_diam})
+        print(f"  [rod B] x={rod_b_x:.2f} diam={rod_b_diam*100:.1f}%c")
+    else:
+        print(f"  [rod B] disabled")
+    if _rods:
+        print(f"  [rods] lam_rod={lam_rod}  lam_thickness={lam_thickness}")
 
     penalty_kwargs = dict(
         lam_bounds=lam_bounds, lam_geom=lam_geom, lam_cl=lam_cl,
@@ -1030,7 +1026,7 @@ def nom_optimize(
         max_thickness=max_thickness,
         te_gap_max=te_gap_max, min_max_thickness=min_max_thickness,
         max_camber=max_camber, min_te_angle_deg=min_te_angle_deg,
-        max_le_y=max_le_y,
+        max_le_y=0.02,
         cl_min=cl_min, cl_max=cl_max,
     )
 
@@ -1070,9 +1066,8 @@ def nom_optimize(
             frames_dir=frames_dir,
         )
         if save_frames and not live_display:
-            # Still need the figure for frame saving even if no interactive window
             import matplotlib
-            matplotlib.use("Agg")  # non-interactive backend for headless saving
+            matplotlib.use("Agg")
 
     nom.summary()
     n_train  = sum(int(np.prod(v.shape)) for v in nom.trainable_variables)
@@ -1117,11 +1112,6 @@ def nom_optimize(
 
     best_LD = best["CL"] / best["CD"] if best["CD"] > 0 else 0.0
 
-    # -----------------------------------------------------------------------
-    # FIX: Write nom_summary.json so plot_nom_results.py reads correct values.
-    # Previously this file was never written, causing plot_nom_results.py to
-    # show stale n_improved / n_valid from a prior run's JSON.
-    # -----------------------------------------------------------------------
     summary_data = {
         "baseline_foil_filename":  baseline_filename,
         "baseline_CL":             bl_CL,
@@ -1146,7 +1136,6 @@ def nom_optimize(
         "max_camber":              max_camber,
         "min_te_angle_deg":        min_te_angle_deg,
         "conditions": [{"alpha": alpha, "Re": Re}],
-        # Baseline coords stored so animation can draw it without re-running NF
         "baseline_coords": bl_coords.tolist() if bl_coords is not None else None,
     }
     with open(out_path / "nom_summary.json", "w") as f:
@@ -1180,4 +1169,3 @@ def nom_optimize(
 
 if __name__ == "__main__":
     nom_optimize(foil_name="n0012.png", alpha=2.0, Re=150000)
-    # for example:nom_optimize(foil_name="n0012.png", alpha=2.0, Re=150000)

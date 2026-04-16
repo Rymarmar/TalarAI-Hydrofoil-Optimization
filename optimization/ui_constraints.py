@@ -1,5 +1,5 @@
 """
-optimization/constraints.py
+optimization/nom_driver.py
 
 CLEAN REBUILD based on professor's action items (2/17/26 meeting).
 
@@ -32,7 +32,8 @@ THICKNESS OVERHAUL (4/6/26 meeting action items):
     Computes the full wedge angle at the trailing edge from the last 3
     grid points of each surface. If angle < min_te_angle_deg → reject.
     This directly prevents the sharp TE seen in the 4/6/26 output plot.
-    NACA 0012 has a TE wedge angle of ~15.5 deg; floor is set at 6 deg.
+    NACA 0012 has a TE wedge angle of ~15.5 deg; floor is set at 14 deg
+    per professor's physical constraint (4/13/26).
 
   ✓ x_peak_t (x-location of max thickness) now returned in info dict.
     Useful for reporting where the metal rods would go in the physical rig.
@@ -42,7 +43,7 @@ DEFAULT THRESHOLDS (calibrated to NACA 0012 with ~30-40% headroom):
     x=0.05:  7.1%c   → LE floor: 2.5%c (0.025)
     x=0.75:  6.3%c   → Mid floor: 3.0%c (0.030)
     x=0.95:  1.6%c   → TE floor: 0.8%c (0.008)
-    TE angle: 15.5°   → angle floor: 6°
+    TE angle: 15.5°   → angle floor: 14° (prof 4/13/26 physical constraint)
   Change these numbers once physical manufacturing constraints are known.
 
 PENALTIES:
@@ -201,13 +202,11 @@ def geometry_penalty(coords: np.ndarray,
                      #   estimate the slope of each surface approaching the TE.
                      #   Full wedge angle = arctan(|upper_slope|) + arctan(|lower_slope|)
                      #   For NACA 0012 on a 40-pt grid: ~15.5 degrees.
-                     #   Floor at 6 deg means roughly 40% of NACA 0012's angle.
                      #
-                     # TO ADJUST:
-                     #   Raise this if the TE is still too sharp after testing.
-                     #   A value of 8-10 deg would still easily pass NACA 0012.
+                     # REVISION (4/13/26): raised from 6 → 14 deg based on
+                     #   professor's physical constraint (0.04in wall at c/40 from TE).
                      # ----------------------------------------------------------
-                     min_te_angle_deg: float = 6.0,
+                     min_te_angle_deg: float = 14.0,
                      # ----------------------------------------------------------
                      # THICKNESS SOFT PENALTY WEIGHT
                      # Controls how hard the gradient pushes toward thicker foils
@@ -377,11 +376,8 @@ def geometry_penalty(coords: np.ndarray,
     # Lower surface approaches TE with a positive slope (going up).
     # Full wedge angle = sum of both absolute arctangents.
     #
-    # Why last 3 points: gives a local slope estimate right at the TE, stable
-    # even if the surface is slightly noisy in the mid-chord region.
-    #
-    # NACA 0012 (40-pt grid) gives ~15.5 deg. Floor at 6 deg is very permissive
-    # but still hard-rejects true knife-edges.
+    # NACA 0012 (40-pt grid) gives ~15.5 deg.
+    # Floor raised to 14 deg per professor's physical constraint (4/13/26).
 
     dx_te = float(xu[-1] - xu[-3])   # x spacing over last 3 pts (~0.051)
     if dx_te > 1e-9:
@@ -547,8 +543,8 @@ def total_penalty(*,
                   max_camber:        float = 0.06,
                   max_le_y:          float = 0.02,
 
-                  # TE angle
-                  min_te_angle_deg:  float = 6.0,
+                  # TE angle (raised to 14° per prof 4/13/26 physical constraint)
+                  min_te_angle_deg:  float = 14.0,
 
                   # Thickness soft penalty weight (passed to geometry_penalty)
                   lam_thickness: float = 200.0,
