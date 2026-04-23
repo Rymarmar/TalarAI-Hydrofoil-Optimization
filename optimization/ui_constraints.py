@@ -215,6 +215,10 @@ def geometry_penalty(coords: np.ndarray,
                      # comparable to the CD/CL objective (~0.03).
                      # ----------------------------------------------------------
                      lam_thickness: float = 200.0,
+                     # Maximum absolute y value — dataset 99th percentile is 0.1964.
+                     # Auto-calibrated to max(1.05 * baseline_max_abs_y, 0.1964)
+                     # so drawn foils that decode to thicker shapes still pass.
+                     max_y_abs: float = 0.1964,
                      ) -> tuple[float, dict]:
     """
     Check foil geometry and return (penalty, info_dict).
@@ -248,7 +252,7 @@ def geometry_penalty(coords: np.ndarray,
         return 1000.0, {"reason": "x out of range"}
 
     # Dataset 99th percentile max |y| + 10% buffer
-    if np.any(np.abs(y_all) > 0.1964):
+    if np.any(np.abs(y_all) > max_y_abs):
         return 1000.0, {"reason": "y too large"}
 
     # --- SURFACE SPLITTING ---
@@ -549,6 +553,9 @@ def total_penalty(*,
                   # Thickness soft penalty weight (passed to geometry_penalty)
                   lam_thickness: float = 200.0,
 
+                  # Max absolute y — auto-calibrated from baseline for drawn foils
+                  max_y_abs: float = 0.1964,
+
                   # Rod constraints: list of {'x': float, 'diam': float}
                   rods: list | None = None,
                   lam_rod: float = 500.0,
@@ -582,6 +589,7 @@ def total_penalty(*,
         max_le_y=max_le_y,
         min_te_angle_deg=min_te_angle_deg,
         lam_thickness=lam_thickness,
+        max_y_abs=max_y_abs,
     )
 
     # Hard reject short-circuit

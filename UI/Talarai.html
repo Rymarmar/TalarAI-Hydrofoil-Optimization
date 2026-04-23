@@ -242,8 +242,8 @@ table.log-table { width:100%; border-collapse:collapse; font-family:'DM Mono',mo
           </div>
         </div>
         <div class="field">
-          <label>Baseline override (optional)</label>
-          <input type="text" id="cfg-baseline" placeholder="auto — resolved from α + Re">
+          <label>Baseline foil (optional)</label>
+          <input type="text" id="cfg-baseline" placeholder="e.g. e61  or  n0012  (auto if blank)">
         </div>
         <div class="field">
           <label>Physical chord length</label>
@@ -271,7 +271,7 @@ table.log-table { width:100%; border-collapse:collapse; font-family:'DM Mono',mo
         </div>
         <div class="constraint-item" id="con-cd">
           <div class="cdot cdot-idle" id="cdot-cd"></div>
-          <div class="cname">C_D / C_L (minimize)</div>
+          <div class="cname">C_L / C_D (maximize)</div>
           <div class="cval" id="cval-cd">—</div>
         </div>
       </div>
@@ -454,6 +454,19 @@ table.log-table { width:100%; border-collapse:collapse; font-family:'DM Mono',mo
               </table>
             </div>
           </div>
+          <div style="height:16px"></div>
+          <div class="log-card" id="coords-card" style="display:none">
+            <div class="log-card-header">
+              <div class="log-card-title">Optimized Foil Coordinates (80 pts · Selig format)</div>
+              <div style="display:flex;gap:8px;">
+                <button class="btn-sm" onclick="copyCoords()" id="btn-copy-coords">Copy</button>
+                <button class="btn-sm" onclick="downloadCoords()" id="btn-dl-coords">Download .dat</button>
+              </div>
+            </div>
+            <div style="padding:12px 20px;overflow-x:auto;">
+              <pre id="coords-output" style="font-family:'DM Mono',monospace;font-size:10px;color:var(--ink2);line-height:1.6;margin:0;white-space:pre;"></pre>
+            </div>
+          </div>
         </div>
       </div>
 
@@ -527,7 +540,13 @@ function fallbackContour() {
 function serverCoordsToContour(coords) {
   const upper = coords.slice(0,40).reverse();
   const lower = coords.slice(40);
-  return [...upper.map(p=>({x:p[0],y:p[1]})), ...[...lower].reverse().slice(1).map(p=>({x:p[0],y:p[1]}))];
+  const pts = [...upper.map(p=>({x:p[0],y:p[1]})), ...[...lower].reverse().slice(1).map(p=>({x:p[0],y:p[1]}))];
+  // Normalise x to [0,1] so all foils share the same LE/TE positions
+  // regardless of whether the decoder shifted the coords slightly.
+  const xs = pts.map(p => p.x);
+  const xMin = Math.min(...xs), xMax = Math.max(...xs);
+  const xRange = xMax - xMin || 1;
+  return pts.map(p => ({ x: (p.x - xMin) / xRange, y: p.y }));
 }
 function drawContourSmooth(ctx, pts, toCanvas) {
   if(pts.length < 2) return;
@@ -576,8 +595,8 @@ function drawFoil(alpha=2, coordsOverride=null) {
     const blContour=serverCoordsToContour(baselineCoords);
     foilCtx.save(); foilCtx.beginPath();
     drawContourSmooth(foilCtx, blContour, toCanvas);
-    foilCtx.closePath(); foilCtx.strokeStyle='rgba(26,92,255,0.25)'; foilCtx.lineWidth=1.5;
-    foilCtx.setLineDash([6,4]); foilCtx.stroke(); foilCtx.setLineDash([]); foilCtx.restore();
+    foilCtx.closePath(); foilCtx.strokeStyle='rgba(26,92,255,0.75)'; foilCtx.lineWidth=2.5;
+    foilCtx.setLineDash([8,5]); foilCtx.stroke(); foilCtx.setLineDash([]); foilCtx.restore();
   }
   foilCtx.save();
   drawContourSmooth(foilCtx, contour, toCanvas);
@@ -599,10 +618,17 @@ function startAnim() {
 }
 function fetchBaseline() {
   const alpha=getAlpha(), Re=getRe();
-  fetch(serverUrl()+`/api/baseline?alpha=${alpha}&Re=${Re}&foil_name=n0012.png`)
-    .then(r=>r.ok?r.json():null).then(d=>{ if(!d||d.error) return; baselineCoords=d.coords; baselineName=d.filename||'n0012'; }).catch(()=>{});
+  let foilName = getBaseline().trim();
+  if (foilName && !foilName.toLowerCase().endsWith('.png')) foilName += '.png';
+  if (!foilName) foilName = 'n0012.png';
+  fetch(serverUrl()+`/api/baseline?alpha=${alpha}&Re=${Re}&foil_name=${encodeURIComponent(foilName)}`)
+    .then(r=>r.ok?r.json():null).then(d=>{ if(!d||d.error) return; baselineCoords=d.coords; baselineName=d.filename||foilName; }).catch(()=>{});
 }
 function fetchBaselineDebounced() { clearTimeout(baselineFetchTimer); baselineFetchTimer=setTimeout(fetchBaseline,300); }
+document.addEventListener('DOMContentLoaded', () => {
+  const bl = document.getElementById('cfg-baseline');
+  if (bl) bl.addEventListener('input', fetchBaselineDebounced);
+});
 
 // ═══════════════════════════════════════════════════════════════════════════
 // DRAW CANVAS — FREEHAND
@@ -631,15 +657,17 @@ function drawPhysH() { return drawCanvas.getBoundingClientRect().height || drawC
 
 function canvasToFoil(cx, cy) {
   const pw = drawPhysW(), ph = drawPhysH();
-  const PAD = 60;
-  const fx = (cx - PAD) / (pw - 2 * PAD);
-  const fy = (ph / 2 - cy) / ((ph - 2 * PAD) * 2.0);
-  return [Math.max(0, Math.min(1, fx)), Math.max(-0.35, Math.min(0.35, fy))];
+  const XPAD = 40, YPAD = 10;
+  const fx = (cx - XPAD) / (pw - 2 * XPAD);
+  // Y: nearly full canvas height maps to ±0.20 foil units.
+  // Drawing upper surface ~30% above centre → yu ≈ 0.06 ≈ 6%c (NACA 0012 peak).
+  const fy = (ph / 2 - cy) / ((ph - 2 * YPAD) * 2.5);
+  return [Math.max(-0.05, Math.min(1.05, fx)), Math.max(-0.25, Math.min(0.25, fy))];
 }
 function foilToCanvas(fx, fy) {
   const pw = drawPhysW(), ph = drawPhysH();
-  const PAD = 60;
-  return [PAD + fx * (pw - 2 * PAD), ph / 2 - fy * (ph - 2 * PAD) * 2.0];
+  const XPAD = 40, YPAD = 10;
+  return [XPAD + fx * (pw - 2 * XPAD), ph / 2 - fy * (ph - 2 * YPAD) * 2.5];
 }
 
 function drawCanvasPos(e) {
@@ -748,6 +776,9 @@ function clearDrawing() {
   document.getElementById('encode-status').textContent = '';
   document.getElementById('encode-status').className   = 'encode-status';
   document.getElementById('hdr-source').textContent    = 'demo';
+  // Restore n0012 (or cfg-baseline foil) as the dashed line
+  baselineCoords = null;
+  fetchBaseline();
   updateEncodeButton();
 }
 
@@ -795,6 +826,20 @@ function renderDrawCanvas() {
   drawCtx.fillText('0', chx0 - 4, chy0 + 16);
   drawCtx.fillText('1', chx1 - 4, chy0 + 16);
   drawCtx.fillText('x/c', chx1 - 20, chy0 + 28);
+
+  // Y-axis ticks at ±5%, ±10%, ±15% chord so users can see what thickness they're drawing
+  drawCtx.save();
+  drawCtx.font = '9px "DM Mono",monospace';
+  [0.05, 0.10, 0.15].forEach(yf => {
+    [-yf, yf].forEach(y => {
+      const [, ty] = foilToCanvas(0, y);
+      drawCtx.strokeStyle = 'rgba(122,129,153,.15)'; drawCtx.lineWidth = 1;
+      drawCtx.beginPath(); drawCtx.moveTo(chx0, ty); drawCtx.lineTo(chx1, ty); drawCtx.stroke();
+      drawCtx.fillStyle = 'rgba(122,129,153,.5)';
+      drawCtx.fillText((Math.abs(y)*100).toFixed(0)+'%', chx0 - 26, ty + 3);
+    });
+  });
+  drawCtx.restore();
   if (encodedCoords && !isDrawing) {
     const contour = serverCoordsToContour(encodedCoords);
     drawCtx.save();
@@ -904,6 +949,71 @@ function renderDrawCanvas() {
   );
 }
 
+// Render the drawn foil to a 256x256 grayscale PNG in the browser,
+// matching the training image format exactly:
+//   - White filled silhouette on black background
+//   - x range [-0.05, 1.05], y range [-0.25, 0.25]
+// This image is sent directly to the server encoder, bypassing the
+// server-side PNG renderer entirely.
+function renderFoilToPng(size = 256) {
+  const offscreen = document.createElement('canvas');
+  offscreen.width  = size;
+  offscreen.height = size;
+  const ctx = offscreen.getContext('2d');
+
+  // Black background
+  ctx.fillStyle = '#000';
+  ctx.fillRect(0, 0, size, size);
+
+  const upper = [...drawPts.upper].sort((a, b) => a[0] - b[0]);
+  const lower = [...drawPts.lower].sort((a, b) => a[0] - b[0]);
+  if (upper.length < 2 || lower.length < 2) return null;
+
+  // Map foil coords to pixel coords
+  // Training images use xlim(-0.05, 1.05) and ylim(-0.25, 0.25).
+  // IMPORTANT: negate fy to match the server-side _coords_to_png_array which
+  // applies yc = -yc before rendering. The encoder was trained on these
+  // negated images, so we must match that orientation here.
+  const xMin = -0.05, xMax = 1.05, yMin = -0.25, yMax = 0.25;
+
+  // The encoder consistently decodes to foils ~2-3x thicker than drawn.
+  // Pre-deflate the y-axis of the PNG so the decoded shape comes back
+  // closer to the right thickness. Factor calibrated empirically.
+  const ENCODER_INFLATION = 2.5;
+
+  function toPixel(fx, fy) {
+    const fy_deflated = fy / ENCODER_INFLATION;  // shrink y before encoding
+    const fy_neg = -fy_deflated;                 // match server-side yc = -yc
+    const px =  (fx    - xMin) / (xMax - xMin) * size;
+    const py = (1 - (fy_neg - yMin) / (yMax - yMin)) * size;
+    return [px, py];
+  }
+
+  // Build closed contour: upper LE→TE, then lower reversed (TE→LE)
+  // This traces a closed filled polygon matching the training images
+  ctx.beginPath();
+  const [ux0, uy0] = toPixel(upper[0][0], upper[0][1]);
+  ctx.moveTo(ux0, uy0);
+  for (let i = 1; i < upper.length; i++) {
+    const [px, py] = toPixel(upper[i][0], upper[i][1]);
+    ctx.lineTo(px, py);
+  }
+  // Reverse along lower surface (TE→LE)
+  for (let i = lower.length - 1; i >= 0; i--) {
+    const [px, py] = toPixel(lower[i][0], lower[i][1]);
+    ctx.lineTo(px, py);
+  }
+  ctx.closePath();
+  ctx.fillStyle = '#fff';
+  ctx.fill();
+  // White outline (0.5px, same as training)
+  ctx.strokeStyle = '#fff';
+  ctx.lineWidth = 0.5;
+  ctx.stroke();
+
+  return offscreen.toDataURL('image/png');  // base64 PNG
+}
+
 async function encodeDrawing() {
   const total = drawPts.upper.length + drawPts.lower.length;
   if (total < 6) return;
@@ -911,14 +1021,34 @@ async function encodeDrawing() {
   const status = document.getElementById('encode-status');
   btn.disabled = true;
   btn.textContent = 'Encoding…';
-  status.textContent = 'Sending to server…';
+  status.textContent = 'Rendering foil image…';
   status.className   = 'encode-status busy';
+
+  // Render foil to PNG in the browser (matches training image format)
+  const pngDataUrl = renderFoilToPng(256);
+  if (!pngDataUrl) {
+    status.textContent = 'Need both surfaces drawn';
+    status.className   = 'encode-status err';
+    btn.disabled = false;
+    btn.textContent = 'Encode + use as start';
+    return;
+  }
+
+  // Also build selig coords for display (resampled drawn shape)
   const allPts = [...drawPts.upper, ...drawPts.lower];
+
+  status.textContent = 'Sending to server…';
+
   try {
     const resp = await fetch(serverUrl() + '/api/encode', {
       method:  'POST',
       headers: { 'Content-Type': 'application/json' },
-      body:    JSON.stringify({ coords: allPts, alpha: getAlpha(), Re: getRe() }),
+      body:    JSON.stringify({
+        image:  pngDataUrl,     // base64 PNG — primary encoding path
+        coords: allPts,         // fallback if image encoding fails
+        alpha:  getAlpha(),
+        Re:     getRe(),
+      }),
     });
     if (!resp.ok) {
       const err = await resp.json().catch(() => ({ error: resp.statusText }));
@@ -933,6 +1063,10 @@ async function encodeDrawing() {
     btn.disabled       = false;
     renderDrawCanvas();
     currentCoords = encodedCoords;
+    // Use the drawn shape as the baseline dashed line so the user can
+    // compare the optimized result against what they originally drew.
+    baselineCoords = encodedCoords;
+    baselineName   = 'drawn foil';
     drawFoil(getAlpha(), encodedCoords);
     document.getElementById('hdr-source').textContent = 'drawn foil';
     switchTab('view');
@@ -955,7 +1089,7 @@ function updateConstraints(c) {
   document.getElementById('cdot-cl').className='cdot '+(clOk?'cdot-ok':'cdot-bad');
   document.getElementById('cval-cl').textContent=c.CL!=null?c.CL.toFixed(4):'—';
   const cdClOk=c.valid===true;
-  const cdClVal=c.cd_cl!=null?c.cd_cl.toFixed(4):(c.CL!=null&&c.CD!=null&&c.CL>0?(c.CD/c.CL).toFixed(4):'—');
+  const cdClVal=c.cd_cl!=null?(c.CL>0?( 1/c.cd_cl).toFixed(2):'—'):(c.CL!=null&&c.CD!=null&&c.CD>0?(c.CL/c.CD).toFixed(2):'—');
   document.getElementById('con-cd').className='constraint-item '+(cdClOk?'ok':'bad');
   document.getElementById('cdot-cd').className='cdot '+(cdClOk?'cdot-ok':'cdot-bad');
   document.getElementById('cval-cd').textContent=cdClVal;
@@ -1027,6 +1161,8 @@ async function startRun() {
   document.getElementById('charts-content').style.display='block';
   document.getElementById('charts-content').classList.add('fadein');
   document.getElementById('log-body').innerHTML='';
+  document.getElementById('coords-card').style.display='none';
+  document.getElementById('coords-output').textContent='';
   initCharts();
   startAnim();
 
@@ -1034,11 +1170,16 @@ async function startRun() {
   try {
     const body = {
       alpha: getAlpha(), Re: getRe(), n_iters: getEpochs(), tf_learning_rate: getLR(),
-      fd_eps: 0.01, cl_min: 0.15, lookup_baseline_path: getBaseline(),
+      fd_eps: 0.01, cl_min: 0.15, foil_name_override: getBaseline(),
       rod_a_x:    circles[0].x,    rod_a_diam: circles[0].enabled ? circles[0].minDiam : 0,
       rod_b_x:    circles[1].x,    rod_b_diam: circles[1].enabled ? circles[1].minDiam : 0,
     };
-    if (encodedZ) body.z_init = encodedZ;
+    if (encodedZ) {
+      body.z_init = encodedZ;
+      // Send the drawn selig coords so the server can calibrate constraints
+      // from the actual drawn shape, not the (potentially thick) decoded z
+      if (encodedCoords) body.drawn_coords = encodedCoords;
+    }
     const resp=await fetch(serverUrl()+'/api/optimize/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
     if(!resp.ok){const err=await resp.json().catch(()=>({error:resp.statusText}));throw new Error(err.error||resp.statusText);}
     const data=await resp.json(); jobId=data.job_id; currentJobId=jobId;
@@ -1102,8 +1243,39 @@ function finishRun(d) {
   const bl=d.baseline_LD!=null?` (baseline: ${d.baseline_LD.toFixed(1)})`:'';
   document.getElementById('run-status').textContent=`Done — Best L/D: ${ld}${bl}`;
   document.getElementById('num-4').className='section-num done';
-  if(d.best_coords){currentCoords=d.best_coords;drawFoil(getAlpha(),d.best_coords);}
+  if(d.best_coords){currentCoords=d.best_coords;drawFoil(getAlpha(),d.best_coords);showCoordsOutput(d.best_coords);}
   if(chartLD) chartLD.update(); if(chartPolar) chartPolar.update();
+}
+
+function showCoordsOutput(coords) {
+  if (!coords || coords.length === 0) return;
+  const card = document.getElementById('coords-card');
+  const pre  = document.getElementById('coords-output');
+  // Format as Selig .dat: header line then x y pairs
+  const lines = ['TalarAI Optimized Foil'];
+  coords.forEach(pt => {
+    lines.push(pt[0].toFixed(6) + '   ' + pt[1].toFixed(6));
+  });
+  pre.textContent = lines.join('\n');
+  card.style.display = '';
+}
+
+function copyCoords() {
+  const text = document.getElementById('coords-output').textContent;
+  navigator.clipboard.writeText(text).then(() => {
+    const btn = document.getElementById('btn-copy-coords');
+    btn.textContent = 'Copied!';
+    setTimeout(() => btn.textContent = 'Copy', 1500);
+  });
+}
+
+function downloadCoords() {
+  const text = document.getElementById('coords-output').textContent;
+  const blob = new Blob([text], { type: 'text/plain' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'talarai_optimized.dat';
+  a.click();
 }
 
 function resetRunState() {

@@ -212,18 +212,28 @@ def _coords_to_png_array(coords: "np.ndarray") -> "np.ndarray":
     return arr.reshape(_ENC_IMG_SIZE, _ENC_IMG_SIZE, 1)
 
 
+def _encode_image_array(img_arr: "np.ndarray") -> "np.ndarray":
+    """
+    (256,256,1) float32 array in [0,1] → latent z (6,) via CNN encoder.
+    Primary path: accepts a pre-rendered PNG from the browser.
+    """
+    import numpy as np
+    _load_encoder()
+    z = _encoder_model.predict(
+        img_arr.reshape(1, _ENC_IMG_SIZE, _ENC_IMG_SIZE, 1), verbose=0
+    )[0]
+    return z.astype(np.float64)
+
+
 def _encode_selig(selig: "np.ndarray") -> "np.ndarray":
     """
-    (80,2) Selig coords → latent z (6,) via CNN encoder.
-    Renders to PNG in memory, runs through the loaded encoder model.
+    (80,2) Selig coords → latent z (6,) via server-side PNG render + CNN encoder.
+    Fallback path when no browser PNG is available.
     """
     import numpy as np
     _load_encoder()
     img = _coords_to_png_array(selig)
-    z = _encoder_model.predict(
-        img.reshape(1, _ENC_IMG_SIZE, _ENC_IMG_SIZE, 1), verbose=0
-    )[0]
-    return z.astype(np.float64)
+    return _encode_image_array(img)
 
 
 # ── Encode drawn foil coords → latent z ───────────────────────────────────
@@ -246,12 +256,8 @@ def _encode_selig(selig: "np.ndarray") -> "np.ndarray":
 @app.route("/api/encode", methods=["POST"])
 def encode_foil():
     body   = request.get_json(force=True) or {}
-    coords = body.get("coords")
     alpha  = float(body.get("alpha", 2.0))
     Re     = float(body.get("Re", 100_000))
-
-    if not coords or len(coords) < 6:
-        return jsonify({"error": "coords required (min 6 points)"}), 400
 
     import numpy as np
 
@@ -260,57 +266,97 @@ def encode_foil():
     except Exception as e:
         return jsonify({"error": f"Pipeline load failed: {e}"}), 500
 
-    # --- Step 1: normalise chord ---
-    try:
-        pts = np.array(coords, dtype=float)
-        if pts.ndim != 2 or pts.shape[1] != 2:
-            return jsonify({"error": "coords must be [[x,y], ...]"}), 400
-        x_range = pts[:, 0].max() - pts[:, 0].min()
-        if x_range < 1e-6:
-            return jsonify({"error": "All points have the same x — draw a foil shape"}), 400
-        pts[:, 0] = (pts[:, 0] - pts[:, 0].min()) / x_range
-        pts[:, 1] =  pts[:, 1] / x_range
-    except Exception as e:
-        return jsonify({"error": f"Normalisation failed: {e}"}), 400
+    z = None
 
-    # --- Step 2: resample to 80-point Selig format ---
-    try:
-        selig = _resample_to_selig(pts)    # (80, 2)
-    except Exception as e:
-        return jsonify({"error": f"Resampling failed: {e}"}), 400
+    # ── Primary path: browser-rendered PNG ────────────────────────────────
+    # The browser renders the drawn foil to a 256x256 grayscale PNG matching
+    # the training image format exactly (white fill on black, same axis limits).
+    # This is sent as a base64 data URL and decoded here before encoding.
+    image_b64 = body.get("image", "")
+    if image_b64:
+        try:
+            import base64, io
+            from PIL import Image
 
-    # --- Step 3: encode via CNN → latent z ---
-    try:
-        z = _encode_selig(selig)
-        z = np.array(z, dtype=float).reshape(6)
-    except Exception as e:
-        return jsonify({"error": f"Encoding failed: {e}"}), 500
+            # Strip the data URL header (data:image/png;base64,...)
+            if "," in image_b64:
+                image_b64 = image_b64.split(",", 1)[1]
 
-    # --- Step 4: decode z → NeuralFoil for preview aerodynamics ---
+            img_bytes = base64.b64decode(image_b64)
+            img = Image.open(io.BytesIO(img_bytes)).convert("L")
+            img = img.resize((_ENC_IMG_SIZE, _ENC_IMG_SIZE), Image.LANCZOS)
+            img_arr = np.array(img, dtype=np.float32) / 255.0
+            img_arr = img_arr.reshape(_ENC_IMG_SIZE, _ENC_IMG_SIZE, 1)
+
+            z = _encode_image_array(img_arr)
+            print(f"  [encode] used browser PNG  z={np.round(z, 4)}")
+        except Exception as e:
+            print(f"  [encode] browser PNG failed ({e}), falling back to coords")
+            z = None
+
+    # ── Fallback: server-side PNG render from coords ───────────────────────
+    if z is None:
+        coords = body.get("coords")
+        if not coords or len(coords) < 6:
+            return jsonify({"error": "image or coords required"}), 400
+        try:
+            pts = np.array(coords, dtype=float)
+            if pts.ndim != 2 or pts.shape[1] != 2:
+                return jsonify({"error": "coords must be [[x,y], ...]"}), 400
+            x_range = pts[:, 0].max() - pts[:, 0].min()
+            if x_range < 1e-6:
+                return jsonify({"error": "All points have the same x"}), 400
+            pts[:, 0] = (pts[:, 0] - pts[:, 0].min()) / x_range
+            pts[:, 1] =  pts[:, 1] / x_range
+            selig = _resample_to_selig(pts)
+            z = _encode_selig(selig)
+            print(f"  [encode] used server PNG fallback  z={np.round(z, 4)}")
+        except Exception as e:
+            return jsonify({"error": f"Encoding failed: {e}"}), 500
+
+    z = np.array(z, dtype=float).reshape(6)
+
+    # ── Build display coords from the drawn points ─────────────────────────
+    # Always show the resampled drawn shape in the UI, not the decoder output.
+    coords = body.get("coords", [])
+    if coords:
+        try:
+            pts = np.array(coords, dtype=float)
+            x_range = pts[:, 0].max() - pts[:, 0].min()
+            if x_range > 1e-6:
+                pts[:, 0] = (pts[:, 0] - pts[:, 0].min()) / x_range
+                pts[:, 1] =  pts[:, 1] / x_range
+                display_coords = _resample_to_selig(pts)
+            else:
+                display_coords = None
+        except Exception:
+            display_coords = None
+    else:
+        display_coords = None
+
+    # ── Evaluate aerodynamics at the encoded z ─────────────────────────────
+    CL = CD = LD = 0.0
     try:
         from optimization.ui_nom_driver import snap_condition
         a_s, r_s = snap_condition(alpha, Re)
-        out    = pipeline.eval_latent_with_neuralfoil(z, alpha=a_s, Re=r_s)
-        CL     = float(out["CL"])
-        CD     = float(out["CD"])
-        LD     = CL / CD if CD > 0 else 0.0
-        decoded_coords = out.get("coords")
+        out = pipeline.eval_latent_with_neuralfoil(z, alpha=a_s, Re=r_s)
+        CL  = float(out["CL"])
+        CD  = float(out["CD"])
+        LD  = CL / CD if CD > 0 else 0.0
+        if display_coords is None:
+            decoded = out.get("coords")
+            display_coords = decoded if decoded is not None else None
     except Exception as e:
-        CL = CD = LD = 0.0
-        decoded_coords = selig
-
-    # Return the resampled drawn shape (selig) for display — not the decoded shape.
-    # The decoded shape comes from z passing through the decoder, which may look
-    # different from what was drawn. Showing selig gives the user honest feedback
-    # on what they drew. The z vector is still used as the optimizer starting point.
-    display_coords = selig  # always show the drawn shape, not the decoder output
+        print(f"  [encode] NeuralFoil eval failed: {e}")
 
     return jsonify({
         "z":      z.tolist(),
         "CL":     round(CL, 4),
         "CD":     round(CD, 6),
         "LD":     round(LD, 2),
-        "coords": display_coords.tolist(),
+        "coords": (display_coords.tolist()
+                   if hasattr(display_coords, "tolist") else
+                   (display_coords if display_coords is not None else [])),
     })
 
 
@@ -320,12 +366,13 @@ def _resample_to_selig(pts: "np.ndarray") -> "np.ndarray":
       rows  0-39: upper surface TE→LE  (x decreasing)
       rows 40-79: lower surface LE→TE  (x increasing)
 
-    Upper surface = highest y at each x station (drawn in blue in the UI).
-    Lower surface = lowest  y at each x station (drawn in green).
+    Upper surface = highest y at each x station.
+    Lower surface = lowest  y at each x station.
 
-    Uses a sliding window of ±0.08 chord to find the local max/min y at
-    each of the 40 evenly-spaced x stations, then np.interp fills any gaps.
-    The window width is generous so sparse hand-drawn points are handled well.
+    The draw canvas allows x in [-0.05, 1.05] so users can draw a rounded LE.
+    Points with x < 0 are used to determine the LE y-midpoint and the
+    curvature approaching x=0, giving a smooth rounded nose rather than a
+    flat vertical edge.
     """
     import numpy as np
 
@@ -336,14 +383,22 @@ def _resample_to_selig(pts: "np.ndarray") -> "np.ndarray":
     yu = np.zeros(40)
     yl = np.zeros(40)
     for i, xi in enumerate(xg):
-        mask = np.abs(xs - xi) < 0.08
+        # Use a wider window near LE to capture points that extend to x<0
+        win = 0.10 if xi < 0.15 else 0.08
+        mask = np.abs(xs - xi) < win
         if mask.any():
             yu[i] = ys[mask].max()
             yl[i] = ys[mask].min()
         else:
-            # No points nearby — interpolate from neighbours
             yu[i] = float(np.interp(xi, xs, ys))
             yl[i] = yu[i]
+
+    # At x=0 (LE), force upper and lower to meet at their midpoint so the
+    # foil has zero thickness at the LE — avoids the flat vertical edge
+    # that appears when upper and lower strokes don't quite meet.
+    le_mid = (yu[0] + yl[0]) / 2.0
+    yu[0] = le_mid
+    yl[0] = le_mid
 
     upper_le2te = np.stack([xg, yu], axis=1)
     lower_le2te = np.stack([xg, yl], axis=1)
@@ -368,8 +423,15 @@ def optimize_start():
     n_iters = int(body.get("n_iters",            150))
     lr      = float(body.get("tf_learning_rate", 0.0005))
 
-    bl_override = body.get("lookup_baseline_path", "").strip()
-    bl_path     = bl_override if bl_override else ""
+    # foil_name_override: user typed a foil name in the baseline field (e.g. "e61" or "n0012")
+    # This is passed directly as foil_name to nom_optimize, which looks it up in the
+    # latent CSV by name. Accepts with or without .png extension, case-insensitive.
+    foil_name_override = body.get("foil_name_override", "").strip()
+    # Normalise: add .png if missing, lowercase
+    if foil_name_override and not foil_name_override.lower().endswith(".png"):
+        foil_name_override = foil_name_override.lower() + ".png"
+    elif foil_name_override:
+        foil_name_override = foil_name_override.lower()
 
     # z_init: optional 6-element list from /api/encode (drawn foil)
     z_init_raw = body.get("z_init", None)
@@ -397,13 +459,14 @@ def optimize_start():
     rod_b_x    = float(body.get("rod_b_x",    0.25))
     rod_b_diam = float(body.get("rod_b_diam", 0.0))   # 0 = disabled
 
+    # Priority: drawn foil z_init > named foil override > auto lookup
     kwargs = dict(
         alpha=alpha, Re=Re, n_iters=n_iters, tf_learning_rate=lr,
         csv_path=CSV_PATH,
-        # If z_init supplied (drawn foil), skip foil_name/lookup entirely
-        foil_name="" if (z_init or bl_path) else "n0012.png",
-        lookup_baseline_path=bl_path,
-        z_init_array=z_init,          # None when using normal foil_name path
+        foil_name=foil_name_override if (foil_name_override and not z_init) else (
+                  "" if z_init else "n0012.png"),
+        lookup_baseline_path="",
+        z_init_array=z_init,
         out_path=str(run_dir), live_display=False, save_frames=False,
         rod_a_x=rod_a_x, rod_a_diam=rod_a_diam,
         rod_b_x=rod_b_x, rod_b_diam=rod_b_diam,

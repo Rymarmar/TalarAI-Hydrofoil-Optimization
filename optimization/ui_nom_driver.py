@@ -214,6 +214,19 @@ def _calibrate_constraints_from_baseline(coords: np.ndarray, n_points: int = 40)
     else:
         baseline_camber = HARD_CAMBER / CAMBER_SCALE
 
+    # max_thickness cap: allow at least baseline t_max + 5% headroom,
+    # but never below the hardcoded 0.157 default. This ensures a drawn foil
+    # that decodes to a thick shape (e.g. 31%c) is not immediately rejected.
+    HARD_TMAX = 0.157
+    baseline_tmax = float(t_max)
+    auto_tmax = max(baseline_tmax * 1.05, HARD_TMAX)
+
+    # max_y_abs: allow 5% above baseline max |y|, never below dataset cap 0.1964
+    baseline_max_abs_y = float(np.max(np.abs(
+        np.concatenate([upper_le2te[:, 1], lower_le2te[:, 1]])
+    )))
+    auto_max_y_abs = max(baseline_max_abs_y * 1.05, 0.1964)
+
     result = dict(
         min_thickness_le  = max(SCALE * t_le,              HARD_LE),
         min_thickness_mid = max(SCALE * t_mid,             HARD_MID),
@@ -221,6 +234,8 @@ def _calibrate_constraints_from_baseline(coords: np.ndarray, n_points: int = 40)
         min_max_thickness = max(SCALE * t_max,             HARD_PEAK),
         min_te_angle_deg  = max(SCALE * te_angle,          HARD_ANGL),
         max_camber        = max(CAMBER_SCALE * baseline_camber, HARD_CAMBER),
+        max_thickness     = auto_tmax,
+        max_y_abs         = auto_max_y_abs,
     )
 
     print(f"  [auto-constraints] Calibrated from baseline geometry:")
@@ -228,6 +243,8 @@ def _calibrate_constraints_from_baseline(coords: np.ndarray, n_points: int = 40)
     print(f"    t_mid_min = {t_mid*100:.2f}%c  → floor {result['min_thickness_mid']*100:.2f}%c")
     print(f"    t_te_min  = {t_te*100:.2f}%c  → floor {result['min_thickness_te']*100:.2f}%c")
     print(f"    t_max     = {t_max*100:.2f}%c  → peak floor {result['min_max_thickness']*100:.2f}%c")
+    print(f"    t_max cap = {baseline_tmax*100:.2f}%c  → max_thickness cap {result['max_thickness']*100:.2f}%c")
+    print(f"    max_y_abs = {baseline_max_abs_y:.4f}  → cap {result['max_y_abs']:.4f}")
     print(f"    te_angle  = {te_angle:.1f}°  → floor {result['min_te_angle_deg']:.1f}°")
     print(f"    camber    = {baseline_camber*100:.2f}%c  → cap {result['max_camber']*100:.2f}%c")
 
@@ -740,7 +757,8 @@ def nom_optimize(
     min_thickness_le:  float | None = None,   # LE  zone: x ∈ [0.05, 0.15]
     min_thickness_mid: float | None = None,   # Mid zone: x ∈ (0.15, 0.75]
     min_thickness_te:  float | None = None,   # TE  zone: x ∈ (0.75, 0.95]
-    max_thickness:     float = 0.157,
+    max_thickness:     float | None = None,   # None = auto from baseline (max 0.157 cap)
+    max_y_abs:         float | None = None,   # None = auto from baseline (dataset cap 0.1964)
     te_gap_max:        float = 0.005,
     min_max_thickness: float | None = None,   # peak thickness floor (None = auto)
     # DEFAULT = None → auto-calibrated to max(1.15 * baseline_max_camber, 0.06).
@@ -937,14 +955,18 @@ def nom_optimize(
     # ------------------------------------------------------------------
     if (min_thickness_le is None or min_thickness_mid is None or
             min_thickness_te is None or min_max_thickness is None or
-            min_te_angle_deg is None or max_camber is None):
+            min_te_angle_deg is None or max_camber is None or
+            max_thickness is None or
+            max_y_abs is None):
         if bl_coords is not None:
             auto = _calibrate_constraints_from_baseline(bl_coords)
         else:
             # No baseline coords available — use conservative hard floors
             auto = dict(min_thickness_le=0.003, min_thickness_mid=0.003,
                         min_thickness_te=0.002, min_max_thickness=0.015,
-                        min_te_angle_deg=14.0, max_camber=0.10)
+                        min_te_angle_deg=14.0, max_camber=0.10,
+                        max_thickness=0.157,
+                        max_y_abs=0.1964)
             print("  [auto-constraints] No baseline coords — using conservative floors.")
 
         if min_thickness_le  is None: min_thickness_le  = auto["min_thickness_le"]
@@ -953,6 +975,8 @@ def nom_optimize(
         if min_max_thickness is None: min_max_thickness = auto["min_max_thickness"]
         if min_te_angle_deg  is None: min_te_angle_deg  = auto["min_te_angle_deg"]
         if max_camber        is None: max_camber        = auto["max_camber"]
+        if max_thickness     is None: max_thickness     = auto["max_thickness"]
+        if max_y_abs         is None: max_y_abs         = auto["max_y_abs"]
     else:
         print(f"  [constraints] Using manually specified floors:")
         print(f"    LE={min_thickness_le*100:.2f}%c  Mid={min_thickness_mid*100:.2f}%c  "
@@ -1027,6 +1051,7 @@ def nom_optimize(
         te_gap_max=te_gap_max, min_max_thickness=min_max_thickness,
         max_camber=max_camber, min_te_angle_deg=min_te_angle_deg,
         max_le_y=0.02,
+        max_y_abs=max_y_abs,
         cl_min=cl_min, cl_max=cl_max,
     )
 
