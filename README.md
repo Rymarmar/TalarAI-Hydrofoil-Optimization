@@ -1,63 +1,114 @@
-# TalarAI-Hydrofoil-Optimization
-## Goal: AI optimization of the process of making Hydro Foils
+# TalarAI — AI-Driven Hydrofoil Optimization
 
-# Installation (Implementing UI once finished)
+An end-to-end machine learning pipeline for efficient 2D hydrofoil cross-section design. TalarAI encodes complex airfoil geometries into a compact 6-parameter latent space, enabling rapid aerodynamic optimization without expensive CFD simulations.
 
-In VS Code Terminal (make location of cloned repo accessible):
+> **Senior Design Project** · Stevens Institute of Technology · Software Engineering, Class of 2026
+
+---
+
+## Overview
+
+Traditional hydrofoil design relies on iterative CFD simulations or manual trial-and-error — both slow and computationally expensive. TalarAI replaces that loop with a learned low-dimensional representation of hydrofoil shapes that can be evaluated and optimized in milliseconds.
+
+The result: a fully automated pipeline that generates, evaluates, and optimizes 2D hydrofoil geometries while respecting real-world physical and geometric constraints. Outputs are intended to support downstream physical prototyping (3D printing and towing tank experiments).
+
+---
+
+## Pipeline
+
 ```
+Airfoil Image (PNG)
+       │
+       ▼
+  CNN Encoder  ──►  6-parameter latent vector
+       │
+       ▼
+Neural Decoder  ──►  80-point surface geometry (upper + lower)
+       │
+       ▼
+   NeuralFoil  ──►  CL, CD  (lift & drag coefficients)
+       │
+       ▼
+NOM Optimizer  ──►  minimize CD/CL  subject to geometric constraints
+```
+
+### Components
+
+**1. Latent Parameterization**
+A CNN autoencoder (trained on 1,600+ UIUC airfoil database geometries) compresses each hydrofoil shape into a 6-dimensional latent vector. The encoder maps airfoil PNG images → latent space; the decoder reconstructs 80-point surface coordinates from latent parameters.
+
+**2. Aerodynamic Evaluation**
+Reconstructed geometries are evaluated using [NeuralFoil](https://github.com/peterdsharpe/NeuralFoil) — a physics-informed neural network surrogate for XFOIL that predicts CL and CD at a specified angle of attack and Reynolds number, typically within ~2–3% of XFOIL results in the operating range.
+
+**3. Neural Optimization Machine (NOM)**
+A gradient-based optimizer over the latent space. Objective: minimize CD/CL (equivalently, maximize lift-to-drag ratio L/D). Constraints — minimum thickness at leading edge, mid-chord, and trailing edge; maximum camber; minimum trailing edge angle — are enforced via ReLU-based penalty functions.
+
+---
+
+## Results
+
+On the E61 baseline airfoil at α = 2°, Re = 150,000:
+
+| | CL | CD | L/D |
+|---|---|---|---|
+| XFOIL reference (Re = 200k) | 1.045 | 0.01391 | 75.1 |
+| E61 baseline via NeuralFoil | 1.128 | 0.01417 | 79.6 |
+| NOM optimized | 1.056 | 0.01281 | **82.5** |
+
+Optimization converged in 38 iterations (of 500), achieving a **+3.6% improvement in L/D** over the baseline.
+
+---
+
+## Installation
+
+```bash
 git clone https://github.com/Rymarmar/TalarAI-Hydrofoil-Optimization
-```
-
-Then download all required packages:
-```
+cd TalarAI-Hydrofoil-Optimization
 pip install -r requirements.txt
 ```
-
-## Project Overview
-
-TalarAI is an AI-driven hydrofoil optimization framework designed to assist in the early-stage design of 2D hydrofoil cross-sections. The goal of the project is to reduce the time and computational cost associated with traditional hydrofoil design by using machine learning models to generate, evaluate, and optimize airfoil geometries under aerodynamic and physical constraints.
-
-Rather than relying on repeated CFD simulations or manual trial-and-error design, this project uses a learned low-dimensional representation of hydrofoil shapes. These shapes are rapidly evaluated using a physics-informed surrogate model, allowing optimization to be performed efficiently while still respecting real-world design constraints.
-
-This project is developed as part of a senior design course and is intended to support downstream physical testing (e.g., 3D printing and towing tank experiments).
-
----
-
-## Pipeline Overview
-
-The optimization pipeline consists of the following main components:
-
-1. **Latent Parameterization**  
-   Hydrofoil geometries are represented using a small set of latent parameters (currently 6). Each parameter vector corresponds to a unique 2D hydrofoil shape.
-
-2. **Decoder (Geometry Reconstruction)**  
-   A trained neural network decoder maps the latent parameters to an 80-point hydrofoil surface representation (upper and lower surfaces).
-
-3. **Aerodynamic Evaluation**  
-   The reconstructed hydrofoil geometry is evaluated using NeuralFoil, a physics-informed neural network that predicts aerodynamic coefficients such as lift coefficient (CL) and drag coefficient (CD) at a specified angle of attack and Reynolds number.
-
-4. **Neural Optimization Machine (NOM)**  
-   Optimization is performed over the latent parameter space using a constrained optimization approach. The objective is to minimize CD/CL (equivalently maximize lift-to-drag ratio) while enforcing constraints using ReLU-based penalty functions. Constraints include valid geometry, parameter bounds, and operating conditions.
-
-5. **Output and Analysis**  
-   The pipeline outputs optimized latent parameters, reconstructed hydrofoil geometries, and corresponding aerodynamic performance metrics. These results can be visualized, compared against baseline designs, and prepared for physical prototyping.
-
----
-
-## Scope and Assumptions
-
-- The optimization focuses on **2D hydrofoil cross-sections**; 3D effects such as planform shape and aspect ratio are considered outside the scope of the current pipeline.
-- Angle of attack and Reynolds number are typically held constant during optimization runs to allow fair comparison between designs.
-- The system is designed to be modular, allowing components (e.g., optimizer or evaluator) to be swapped or extended in future work.
 
 ---
 
 ## Repository Structure
 
-- `pipeline/` — Core evaluation pipeline (decoder + NeuralFoil)
-- `optimization/` — Optimization logic and NOM integration
-- `data/` — Latent parameter datasets and baselines
-- `tools/` — Visualization and debugging utilities
-- `experiments/` — Archived or exploratory code not used in the final pipeline
+```
+pipeline/        # Core evaluation pipeline (decoder + NeuralFoil integration)
+optimization/    # NOM optimizer and objective/constraint definitions
+data/            # Latent parameter datasets and baseline geometries
+tools/           # Visualization and debugging utilities
+experiments/     # Exploratory code not used in the final pipeline
+```
 
-## Neural Foil Citation here
+---
+
+## Scope & Assumptions
+
+- Optimization targets **2D hydrofoil cross-sections** only; 3D effects (planform, aspect ratio, tip vortices) are out of scope.
+- Angle of attack and Reynolds number are held constant within each optimization run to enable fair comparison.
+- The pipeline is modular — the optimizer, evaluator, or decoder can each be swapped independently.
+
+---
+
+## Citation
+
+Aerodynamic evaluation powered by **NeuralFoil** (MIT License):
+
+```bibtex
+@misc{neuralfoil,
+  author       = {Peter Sharpe},
+  title        = {{NeuralFoil}: An airfoil aerodynamics analysis tool using physics-informed machine learning},
+  year         = {2023},
+  publisher    = {GitHub},
+  journal      = {GitHub repository},
+  howpublished = {\url{https://github.com/peterdsharpe/NeuralFoil}},
+}
+
+@phdthesis{aerosandbox_phd_thesis,
+  title  = {Accelerating Practical Engineering Design Optimization with Computational Graph Transformations},
+  author = {Sharpe, Peter D.},
+  school = {Massachusetts Institute of Technology},
+  year   = {2024},
+}
+```
+
+Airfoil geometry data sourced from the [UIUC Airfoil Database](https://m-selig.ae.illinois.edu/ads/coord_database.html).
